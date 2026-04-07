@@ -29,6 +29,8 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed=x64compatible
+CloseApplications=force
+CloseApplicationsFilter=SeamAnalytics.exe,SeamUpdater.exe
 LicenseFile=
 ; Estimated installed size (MB): ~450 app + ~780 databases
 ExtraDiskSpaceRequired=838860800

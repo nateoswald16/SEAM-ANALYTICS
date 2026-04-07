@@ -272,10 +272,19 @@ _COMPASS_DIRS = [
 ]
 
 
-def _compass_to_mlb_wind(deg: float) -> str:
-    """Convert meteorological wind direction (degrees) to MLB-style label."""
-    best = min(_COMPASS_DIRS, key=lambda d: min(abs(d[0] - deg),
-                                                  360 - abs(d[0] - deg)))
+def _compass_to_mlb_wind(deg: float, azimuth: float = 0) -> str:
+    """Convert meteorological wind direction (degrees) to MLB-style label.
+
+    Meteorological convention: degrees = direction wind blows FROM.
+    MLB convention: labels describe where the wind GOES (e.g. "Out To CF").
+    So we flip by 180° to get the "toward" direction, then subtract the
+    stadium's *azimuth* (compass bearing from home plate to centre field)
+    to convert from compass-relative to field-relative.
+    """
+    toward = (deg + 180) % 360
+    field_rel = (toward - azimuth) % 360
+    best = min(_COMPASS_DIRS, key=lambda d: min(abs(d[0] - field_rel),
+                                                  360 - abs(d[0] - field_rel)))
     return best[1]
 
 
@@ -329,7 +338,7 @@ def _nws_resolve_grid(lat, lon) -> dict:
         return {}
 
 
-def _fetch_nws(lat, lon, game_utc_iso: str | None = None):
+def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
     """Fetch forecast data from the National Weather Service (api.weather.gov).
 
     Returns the same dict shape as _fetch_open_meteo / _fetch_weatherapi.
@@ -433,7 +442,7 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None):
                         h_ws = 0
                     h_wd_compass = p.get("windDirection", "")
                     h_wd_deg = _NWS_COMPASS.get(h_wd_compass)
-                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
@@ -455,7 +464,7 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None):
 _om_circuit_open = True   # False → Open-Meteo known unreachable, skip calls
 
 
-def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
+def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
     """Fetch forecast data from Open-Meteo.
 
     Always returns precip_pct and pressure_hpa for the current moment.
@@ -562,7 +571,7 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
                     h_temp = temps[gi] if gi < len(temps) else None
                     h_ws = wspeeds[gi] if gi < len(wspeeds) else None
                     h_wd_deg = wdirs[gi] if gi < len(wdirs) else None
-                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
                     if h_ws is not None:
                         h_ws = round(h_ws * 0.621371)  # km/h → mph
                     hourly_conds.append({
@@ -613,7 +622,7 @@ def _load_weatherapi_key() -> str | None:
     return _weatherapi_key
 
 
-def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None):
+def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
     """Fallback: fetch forecast data from WeatherAPI.com.
 
     Returns the same dict shape as _fetch_open_meteo so the caller
@@ -733,7 +742,7 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None):
                     cond_txt = wh.get("condition", {}).get("text", "")
                     pr = wh.get("chance_of_rain")
                     h_wd_deg = wh.get("wind_degree")
-                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
@@ -812,6 +821,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             "lon": coords.get("longitude"),
             "elevation": loc.get("elevation"),
             "roof_type": fi.get("roofType", "Open"),
+            "azimuth": loc.get("azimuthAngle", 0) or 0,
             "temp": weather.get("temp"),
             "condition": weather.get("condition", ""),
             "wind_speed": ws, "wind_dir": wd, "wind_angle": wa,
@@ -833,6 +843,8 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["lon"] = gc.get("longitude")
                 result["elevation"] = gl.get("elevation", result["elevation"])
                 result["roof_type"] = gf.get("roofType", result["roof_type"])
+                if not result["azimuth"]:
+                    result["azimuth"] = gl.get("azimuthAngle", 0) or 0
                 if not result["temp"]:
                     gw = feed.get("gameData", {}).get("weather", {})
                     if gw:
@@ -852,14 +864,15 @@ def fetch_park_weather(date_str: str) -> list[dict]:
 
         # NWS primary → WeatherAPI fallback → Open-Meteo fallback
         if result["lat"] and result["lon"]:
+            _az = result["azimuth"]
             om = _fetch_nws(result["lat"], result["lon"],
-                            game_utc_iso=gd or None)
+                            game_utc_iso=gd or None, azimuth=_az)
             if not om:
                 om = _fetch_weatherapi(result["lat"], result["lon"],
-                                       game_utc_iso=gd or None)
+                                       game_utc_iso=gd or None, azimuth=_az)
             if not om:
                 om = _fetch_open_meteo(result["lat"], result["lon"],
-                                       game_utc_iso=gd or None)
+                                       game_utc_iso=gd or None, azimuth=_az)
             result["precip_pct"] = om.get("precip_pct")
             result["pressure_hpa"] = om.get("pressure_hpa")
 
@@ -872,7 +885,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["wind_speed"] = round(om["forecast_wind_speed"])
                 deg = om.get("forecast_wind_deg")
                 if deg is not None:
-                    mlb_dir = _compass_to_mlb_wind(deg)
+                    mlb_dir = _compass_to_mlb_wind(deg, _az)
                     result["wind_dir"] = mlb_dir
                     result["wind_angle"] = WIND_ANGLES.get(mlb_dir)
             if om.get("forecast_precip") is not None:

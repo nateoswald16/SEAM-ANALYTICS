@@ -676,53 +676,7 @@ class DataManager:
         except Exception:
             return []
 
-    def _build_probable_lineup(self, team_abbr, roster_pids, season=None):
-        """Return probable starters (one per position) based on PA counts.
-
-        Only players whose IDs appear in *roster_pids* (today's boxscore
-        roster, i.e. active game-day players) are considered.  This naturally
-        excludes IL / optioned players who still have high PA totals.
-        """
-        if not team_abbr or not roster_pids:
-            return []
-        conn = self.connect()
-        if not conn:
-            return []
-        cur = conn.cursor()
-        if season is None:
-            season = dt.date.today().year
-
-        cur.execute("""
-            SELECT batter_id, batter_name, position, stand, COUNT(*) AS pa_count
-            FROM plate_appearances
-            WHERE season = ?
-              AND ((batter_is_home = 1 AND home_team = ?)
-                   OR (batter_is_home = 0 AND away_team = ?))
-              AND UPPER(COALESCE(position, '')) != 'P'
-              AND batter_id IS NOT NULL
-            GROUP BY batter_id, position
-            ORDER BY position, pa_count DESC
-        """, (season, team_abbr, team_abbr))
-
-        pos_candidates: dict[str, list] = {}
-        for row in cur.fetchall():
-            bid, name, pos, hand = row[0], row[1] or '', (row[2] or '').upper(), row[3] or ''
-            if pos:
-                pos_candidates.setdefault(pos, []).append((bid, name, hand))
-
-        roster_set = set(roster_pids)
-        assigned: set[int] = set()
-        result = []
-        for pos in ['C', '1B', '2B', '3B', 'SS', 'LF', 'CF', 'RF', 'DH']:
-            for bid, name, hand in pos_candidates.get(pos, []):
-                if bid in roster_set and bid not in assigned:
-                    result.append({'pos': pos, 'name': name, 'hand': hand, 'player_id': bid})
-                    assigned.add(bid)
-                    break
-        return result
-
-    def _format_and_cache_lineup(self, game_id, lineup,
-                                 away_team=None, home_team=None):
+    def _format_and_cache_lineup(self, game_id, lineup):
         """Convert API lineup dict into table rows and cache to disk."""
         cache_file = os.path.join(self.cache_dir, f"{game_id}.json")
         BAT_COLS = ["#","POS","PLAYER","PA","AVG","ISO","K%","BB%","H","1B","2B","3B","HR","R","RBI","TB","Brl%","Pull%","EV","MaxEV","LA"]
@@ -751,26 +705,11 @@ class DataManager:
         away_players = build_players_from_api(lineup.get('away', []))
         home_players = build_players_from_api(lineup.get('home', []))
 
-        # Consider lineup confirmed if both teams have at least 9 non-pitcher starters
-        confirmed = (len(away_players) >= 9 and len(home_players) >= 9)
-
-        # Build probable lineups when not confirmed (PA-leader at each position,
-        # filtered to the active game-day roster from the boxscore).
         cache_data: dict = {
             'cols': BAT_COLS,
             'hi': list(BAT_HI),
             'players': {'away': away_players, 'home': home_players},
-            'confirmed': confirmed,
         }
-        if not confirmed and (away_team or home_team):
-            prob: dict = {}
-            for side, team, roster in [('away', away_team, away_players),
-                                       ('home', home_team, home_players)]:
-                if team:
-                    pids = [p['player_id'] for p in roster if p.get('player_id')]
-                    prob[side] = self._build_probable_lineup(team, pids)
-            if prob:
-                cache_data['probable_players'] = prob
 
         # Write cache
         try:
@@ -789,7 +728,7 @@ class DataManager:
         Always fetches fresh from the API (bypasses engine cache) so updated lineups are picked up."""
         if not self.api or self._shutting_down:
             return
-        def _fetch_one(gid, away_team, home_team):
+        def _fetch_one(gid):
             if self._shutting_down:
                 return
             try:
@@ -797,9 +736,7 @@ class DataManager:
                 if self._shutting_down:
                     return
                 if lineups:
-                    self._format_and_cache_lineup(gid, lineups,
-                                                  away_team=away_team,
-                                                  home_team=home_team)
+                    self._format_and_cache_lineup(gid, lineups)
                     try:
                         if hasattr(self, 'notifier') and self.notifier:
                             self.notifier.lineup_cached.emit(str(gid))
@@ -816,9 +753,7 @@ class DataManager:
                         break
                     gid = g.get('id') or g.get('game_id')
                     if gid:
-                        futures.append(ex.submit(
-                            _fetch_one, int(gid),
-                            g.get('away', ''), g.get('home', '')))
+                        futures.append(ex.submit(_fetch_one, int(gid)))
                 for f in as_completed(futures):
                     if self._shutting_down:
                         ex.shutdown(wait=False, cancel_futures=True)
@@ -830,7 +765,7 @@ class DataManager:
         except Exception:
             log.exception("_fetch_one")
 
-    def refresh_lineup(self, game_id, away_team=None, home_team=None):
+    def refresh_lineup(self, game_id):
         """Fetch a single game's lineup fresh from the API and update the cache."""
         if not self.api or self._shutting_down:
             return
@@ -839,9 +774,7 @@ class DataManager:
             if self._shutting_down:
                 return
             if lineups:
-                self._format_and_cache_lineup(int(game_id), lineups,
-                                              away_team=away_team,
-                                              home_team=home_team)
+                self._format_and_cache_lineup(int(game_id), lineups)
                 try:
                     if hasattr(self, 'notifier') and self.notifier:
                         self.notifier.lineup_cached.emit(str(game_id))
@@ -1223,7 +1156,7 @@ class DataManager:
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     players_block = data.get('players')
-                    if players_block and data.get('confirmed'):
+                    if players_block:
                         conn = self.connect()
                         if not conn:
                             return data.get('cols'), data.get('hi'), data.get('away_rows'), data.get('home_rows')
@@ -1758,16 +1691,13 @@ class DataManager:
             log.exception("_build_runner_br_row")
 
         players = {}
-        probable = {}
         if lineup_data:
             if 'players' in lineup_data:
                 players = lineup_data['players']
-            if 'probable_players' in lineup_data:
-                probable = lineup_data['probable_players']
 
         # Build side data
         def _build_side(side, starter_info):
-            """Return (pit_row, cat_row, lineup_rows) for one side."""
+            """Return (pit_rows, cat_rows, lineup_rows) for one side."""
             lineup_list = players.get(side, [])
 
             # Pitcher row
@@ -1784,25 +1714,16 @@ class DataManager:
                     log.exception("_build_side")
             pit_row = [_build_pitcher_br_row(pit_pid, pit_name, pit_throws)]
 
-            # Find catcher from lineup
-            cat_pid = None
-            cat_name = ''
+            # Collect ALL catchers from the roster (shows multiple when
+            # lineup isn't confirmed yet; narrows to one once it is).
+            cat_rows = []
             for p in lineup_list:
-                if p.get('pos') == 'C':
-                    cat_pid = p.get('player_id')
-                    cat_name = p.get('name', '')
-                    break
-            # Fallback: check probable lineup for catcher
-            if not cat_pid:
-                for p in probable.get(side, []):
-                    if p.get('pos') == 'C':
-                        cat_pid = p.get('player_id')
-                        cat_name = p.get('name', '')
-                        break
+                if p.get('pos', '').upper() == 'C':
+                    cat_rows.append(_build_catcher_br_row(
+                        p.get('player_id'), p.get('name', '')))
             # Fallback: look up from DB
-            if not cat_pid:
+            if not cat_rows:
                 try:
-                    # The catcher is the player with position 'C' in plate_appearances for this game
                     fielding_flag = 0 if side == 'away' else 1
                     cur.execute("""
                         SELECT batter_id, batter_name FROM plate_appearances
@@ -1811,11 +1732,9 @@ class DataManager:
                     """, (game_id, fielding_flag))
                     r = cur.fetchone()
                     if r:
-                        cat_pid = r[0]
-                        cat_name = r[1] or ''
+                        cat_rows.append(_build_catcher_br_row(r[0], r[1] or ''))
                 except Exception:
                     log.exception("_build_side")
-            cat_row = [_build_catcher_br_row(cat_pid, cat_name)]
 
             # Lineup rows
             if lineup_list:
@@ -1838,7 +1757,7 @@ class DataManager:
                 except Exception:
                     br_rows = []
 
-            return pit_row, cat_row, br_rows
+            return pit_row, cat_rows, br_rows
 
         # Away team faces home pitcher; home team faces away pitcher
         away_pit, away_cat, away_br = _build_side('away', away_starter)
@@ -1891,12 +1810,9 @@ class DataManager:
             log.exception("_fmt_ip")
 
         players = {}
-        probable = {}
         if lineup_data:
             if 'players' in lineup_data:
                 players = lineup_data['players']
-            if 'probable_players' in lineup_data:
-                probable = lineup_data['probable_players']
 
         def _get_pitcher_date_filter(pid, window):
             """Return a date SQL clause + params limiting to the pitcher's last N games."""
@@ -2242,8 +2158,7 @@ class DataManager:
 
         eff_window = window or 'all'
 
-        def _build_bvp_side(pitcher_info, lineup, own_lineup=None,
-                            probable_own=None):
+        def _build_bvp_side(pitcher_info, lineup, own_lineup=None):
             """Build all BvP tables for one side.
             pitcher_info: dict with id, name, throws
             lineup: list of player dicts (opposing batting lineup)
@@ -2280,13 +2195,6 @@ class DataManager:
             # Check pitcher's own team lineup for position 'C'
             if own_lineup:
                 for p in own_lineup:
-                    if p.get('pos', '').upper() == 'C':
-                        cat_id = p.get('player_id')
-                        cat_name = p.get('name', '')
-                        break
-            # Fallback: check probable lineup for catcher
-            if not cat_id and probable_own:
-                for p in probable_own:
                     if p.get('pos', '').upper() == 'C':
                         cat_id = p.get('player_id')
                         cat_name = p.get('name', '')
@@ -2347,11 +2255,9 @@ class DataManager:
         home_lineup = players.get('home', [])
 
         # Away pitcher faces home lineup; away pitcher's catcher is in away lineup
-        away_side = _build_bvp_side(away_info, home_lineup, own_lineup=away_lineup,
-                                    probable_own=probable.get('away'))
+        away_side = _build_bvp_side(away_info, home_lineup, own_lineup=away_lineup)
         # Home pitcher faces away lineup; home pitcher's catcher is in home lineup
-        home_side = _build_bvp_side(home_info, away_lineup, own_lineup=home_lineup,
-                                    probable_own=probable.get('home'))
+        home_side = _build_bvp_side(home_info, away_lineup, own_lineup=home_lineup)
 
         return {
             'pit_cols': BVP_PIT_COLS, 'pit_hi': BVP_PIT_HI,
@@ -5419,6 +5325,9 @@ class SeamStatsApp(QMainWindow):
         """)
         self._update_progress.hide()
         hl.addWidget(self._update_progress)
+        self._update_pct_lbl = mk_label("0%", color=C["ora"], size=10, mono=True)
+        self._update_pct_lbl.hide()
+        hl.addWidget(self._update_pct_lbl)
         hl.addSpacing(4)
 
         # ── Update Data button ──
@@ -5499,34 +5408,79 @@ class SeamStatsApp(QMainWindow):
 
         self._update_btn.setEnabled(False)
         self._update_btn.setText("Updating…")
+        self._update_progress.setRange(0, 100)
+        self._update_progress.setValue(0)
         self._update_progress.show()
+        self._update_pct_lbl.setText("0%")
+        self._update_pct_lbl.show()
         self.set_status("Data update in progress…", timeout=0)
 
         class _UpdateWorker(QThread):
-            finished = pyqtSignal(str)   # "" on success, error message on failure
+            finished = pyqtSignal(str, dict)   # error_msg, summary_dict
+            progress = pyqtSignal(int, int, str)  # current, total, phase
 
             def run(self_w):
                 try:
                     import daily_update
-                    daily_update.main([])
-                    self_w.finished.emit("")
+                    summary = daily_update.main([], gui_cb=self_w.progress.emit) or {}
+                    self_w.finished.emit("", summary)
                 except Exception as exc:
-                    self_w.finished.emit(str(exc))
+                    self_w.finished.emit(str(exc), {})
 
         self._update_worker = _UpdateWorker()
+        self._update_worker.progress.connect(self._on_update_progress)
         self._update_worker.finished.connect(self._on_update_done)
         self._update_worker.start()
 
-    def _on_update_done(self, error: str):
+    def _on_update_progress(self, current: int, total: int, phase: str):
+        if total > 0:
+            pct = min(int(current * 100 / total), 100)
+            self._update_progress.setValue(pct)
+            self._update_pct_lbl.setText(f"{pct}%")
+            self._update_btn.setText(f"Updating… {pct}%")
+
+    def _on_update_done(self, error: str, summary: dict):
         self._update_progress.hide()
+        self._update_progress.setRange(0, 0)  # reset to indeterminate for next time
+        self._update_pct_lbl.hide()
         self._update_btn.setEnabled(True)
         self._update_btn.setText("Update Data")
+        from PyQt6.QtWidgets import QMessageBox
         if error:
             self.set_status(f"Update failed: {error}", timeout=10000, error=True)
             log.warning("Manual update failed: %s", error)
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Update Failed")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText(f"Update failed:\n{error}")
+            msg.setStyleSheet(f"QMessageBox {{ background:{C['bg1']}; color:{C['t1']}; }}"
+                              f" QPushButton {{ background:{C['bg3']}; color:{C['t1']}; border:1px solid {C['bdr']};"
+                              f" padding:6px 20px; border-radius:4px; }}")
+            msg.exec()
         else:
-            self.set_status("Data update complete!", timeout=8000)
             log.info("Manual data update completed successfully")
+            if summary.get("up_to_date"):
+                body = "Your database is already up to date.\nNo new games to ingest."
+            else:
+                rng = summary.get("range", "")
+                lines = [f"<b>Range:</b>  {rng}"]
+                lines.append(f"<b>Games:</b>  {summary.get('games', 0)}")
+                lines.append(f"<b>Plate Appearances:</b>  {summary.get('plate_appearances', 0)}")
+                lines.append(f"<b>Pitching Appearances:</b>  {summary.get('pitching_appearances', 0)}")
+                lines.append(f"<b>Stolen-Base Events:</b>  {summary.get('stolen_bases', 0)}")
+                bf = summary.get("statcast_backfill", 0)
+                if bf:
+                    lines.append(f"<b>Statcast Backfill:</b>  {bf} date(s)")
+                body = "<br>".join(lines)
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Update Complete")
+            msg.setIcon(QMessageBox.Icon.Information)
+            msg.setText(body)
+            msg.setStyleSheet(f"QMessageBox {{ background:{C['bg1']}; color:{C['t1']}; }}"
+                              f" QPushButton {{ background:{C['bg3']}; color:{C['t1']}; border:1px solid {C['bdr']};"
+                              f" padding:6px 20px; border-radius:4px; }}")
+            msg.exec()
+            self.set_status("Data update complete!", timeout=8000)
 
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
@@ -5805,12 +5759,11 @@ class SeamStatsApp(QMainWindow):
             # … then refresh this game's lineup in the background (picks up new postings)
             gid = game.get('game_id') or game.get('id')
             if gid:
-                _bg_pool.submit(_DM.refresh_lineup, gid,
-                                game.get('away', ''), game.get('home', ''))
-            # Highlight MATCHUP in main nav — game detail is part of matchup
+                _bg_pool.submit(_DM.refresh_lineup, gid)
+            # Highlight LINEUPS in main nav — game detail is part of lineups
             for i, b in enumerate(self._main_btns):
-                b.setChecked(i == self.IDX_MATCHUP)
-                b.setStyleSheet(_nav_btn_style(i == self.IDX_MATCHUP))
+                b.setChecked(i == self.IDX_LINEUP)
+                b.setStyleSheet(_nav_btn_style(i == self.IDX_LINEUP))
         except RuntimeError:
             pass  # C++ object deleted
  

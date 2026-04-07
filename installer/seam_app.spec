@@ -59,7 +59,7 @@ a = Analysis(
     runtime_hooks=[],
     excludes=[
         # Heavy packages the GUI app does NOT need
-        'tkinter', 'matplotlib', 'scipy', 'IPython', 'notebook',
+        'tkinter', 'scipy', 'IPython', 'notebook',
         'pytest', 'setuptools', 'wheel', 'pip',
     ],
     noarchive=False,

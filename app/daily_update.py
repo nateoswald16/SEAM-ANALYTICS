@@ -9,11 +9,26 @@ to be invoked by scheduler once per day; it can also be run manually.
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import sys
 from datetime import date, timedelta
 import sqlite3
 from tqdm import tqdm
+
+# Frozen windowed apps (PyInstaller --noconsole) set stdout/stderr to None.
+# Even when present, Windows console streams may use cp1252 which chokes on
+# tqdm's Unicode bar characters. Force UTF-8 with error replacement everywhere.
+import io as _io
+for _attr in ("stdout", "stderr"):
+    _stream = getattr(sys, _attr, None)
+    if _stream is None:
+        setattr(sys, _attr, open(os.devnull, "w", encoding="utf-8", errors="replace"))
+    elif hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            setattr(sys, _attr, open(os.devnull, "w", encoding="utf-8", errors="replace"))
 
 # Ensure the `app` package path is importable when running from repo root
 ROOT = os.path.dirname(__file__)
@@ -26,12 +41,17 @@ import build_calculated_db
 
 
 class ProgressTracker:
-    """Drives a single tqdm bar across raw ingestion + calculated stats phases."""
+    """Drives a single tqdm bar across raw ingestion + calculated stats phases.
 
-    def __init__(self):
+    If *gui_cb* is provided it is called as ``gui_cb(current, total, phase)``
+    after every step so the Qt UI can show a determinate progress bar.
+    """
+
+    def __init__(self, gui_cb=None):
         self.bar: tqdm | None = None
         self._phase = ''
         self._raw_total = 0
+        self._gui_cb = gui_cb
 
     def start(self, n_games: int):
         """Initialize the bar. Total = games + 1 (statcast) + calc players (set later)."""
@@ -45,12 +65,21 @@ class ProgressTracker:
         self._phase = phase
         if self.bar:
             self.bar.set_description(phase)
+        self._emit()
+
+    def _emit(self):
+        if self._gui_cb and self.bar:
+            try:
+                self._gui_cb(self.bar.n, self.bar.total, self._phase)
+            except Exception:
+                pass
 
     def on_raw(self, stage, current, total, info):
         if stage == 'raw_game':
             self._set_phase(f'Game {current+1}/{total}')
             if current > 0:
                 self.bar.update(1)
+                self._emit()
         elif stage == 'statcast':
             if current == 0:
                 # Finish last game step if needed
@@ -59,6 +88,7 @@ class ProgressTracker:
                 self._set_phase('Statcast enrichment')
             elif current == 1:
                 self.bar.update(1)
+                self._emit()
 
     def on_calc(self, stage, current, total, info):
         if stage == 'calc_player':
@@ -71,6 +101,7 @@ class ProgressTracker:
             # Update by 1 per player
             if current > 0:
                 self.bar.update(1)
+                self._emit()
 
     def finish(self):
         if self.bar:
@@ -81,8 +112,8 @@ class ProgressTracker:
             self.bar.close()
 
 
-def run_daily(start: str, end: str, season: int, calc_seasons: list[int]):
-    tracker = ProgressTracker()
+def run_daily(start: str, end: str, season: int, calc_seasons: list[int], gui_cb=None):
+    tracker = ProgressTracker(gui_cb=gui_cb)
 
     # Pre-fetch schedule to know game count before starting the bar
     games = build_raw_db.fetch_schedule(start, end, only_completed=False)
@@ -118,6 +149,14 @@ def run_daily(start: str, end: str, season: int, calc_seasons: list[int]):
     print(f"  Stolen-base events:   {steals_count}")
     print(f"  Pitchers w/ hand:     {pitchers_w_hand}")
 
+    return {
+        "range": f"{start} → {end}",
+        "games": games_count,
+        "plate_appearances": pa_count,
+        "pitching_appearances": pitches_count,
+        "stolen_bases": steals_count,
+    }
+
 
 def _parse_args(argv: list[str] | None = None):
     p = argparse.ArgumentParser(description='Daily update: ingest raw data and build calculated DB')
@@ -129,7 +168,7 @@ def _parse_args(argv: list[str] | None = None):
     return p.parse_args(argv)
 
 
-def main(argv: list[str] | None = None):
+def main(argv: list[str] | None = None, gui_cb=None):
     args = _parse_args(argv)
 
     DB_PATH = _app_paths.RAW_DB
@@ -189,8 +228,7 @@ def main(argv: list[str] | None = None):
             calc_seasons = args.calc_seasons
         else:
             calc_seasons = [season, season - 1]
-        run_daily(start, end, season, calc_seasons)
-        return
+        return run_daily(start, end, season, calc_seasons, gui_cb=gui_cb)
 
     # Default behavior: determine missing range from DB and fetch all missing games
     yesterday = date.today() - timedelta(days=1)
@@ -222,7 +260,7 @@ def main(argv: list[str] | None = None):
             seg_start = cur_start if y == start_dt.year else date(y, 1, 1)
             seg_end = cur_end if y == end_dt.year else date(y, 12, 31)
 
-            tracker = ProgressTracker()
+            tracker = ProgressTracker(gui_cb=gui_cb)
             games = build_raw_db.fetch_schedule(seg_start.isoformat(), seg_end.isoformat(), only_completed=False)
             tracker.start(len(games))
 
@@ -295,7 +333,9 @@ def main(argv: list[str] | None = None):
     else:
         print("Nothing to do.")
         conn.close()
-        return
+        return {"range": None, "games": 0, "plate_appearances": 0,
+                "pitching_appearances": 0, "stolen_bases": 0,
+                "statcast_backfill": 0, "up_to_date": True}
     cur.execute("SELECT COUNT(*) FROM games WHERE game_date BETWEEN ? AND ?", (s, e))
     games_count = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM plate_appearances WHERE game_date BETWEEN ? AND ?", (s, e))
@@ -304,8 +344,6 @@ def main(argv: list[str] | None = None):
     pitches_count = cur.fetchone()[0]
     cur.execute("SELECT COUNT(*) FROM stolen_bases WHERE game_date BETWEEN ? AND ?", (s, e))
     steals_count = cur.fetchone()[0]
-    cur.execute("SELECT COUNT(DISTINCT pitcher_id) FROM pitchers WHERE p_throws IS NOT NULL")
-    pitchers_w_hand = cur.fetchone()[0]
     conn.close()
 
     print(f"\n── Summary ({s} → {e}) ──")
@@ -313,7 +351,15 @@ def main(argv: list[str] | None = None):
     print(f"  Plate appearances:    {pa_count}")
     print(f"  Pitching appearances: {pitches_count}")
     print(f"  Stolen-base events:   {steals_count}")
-    print(f"  Pitchers w/ hand:     {pitchers_w_hand}")
+
+    return {
+        "range": f"{s} → {e}",
+        "games": games_count,
+        "plate_appearances": pa_count,
+        "pitching_appearances": pitches_count,
+        "stolen_bases": steals_count,
+        "statcast_backfill": len(missing_dates) if missing_dates else 0,
+    }
 
 
 if __name__ == '__main__':
