@@ -37,7 +37,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "scheduledupdate"; Description: "Schedule daily data updates (recommended)"; GroupDescription: "Automatic Updates:"
+Name: "scheduledupdate"; Description: "Schedule daily data updates (recommended)"; GroupDescription: "Automatic Updates:"; Flags: checkedonce
 
 [Files]
 ; ── Main application (onedir bundle) ──────────────────────────────────
@@ -65,13 +65,6 @@ Name: "{autodesktop}\{#MyAppName}";     Filename: "{app}\SeamAnalytics\{#MyAppEx
 ; Launch app after install
 Filename: "{app}\SeamAnalytics\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-; Register scheduled task (only if user selected it)
-Filename: "schtasks.exe"; \
-  Parameters: "/Create /F /TN ""SeamAnalytics\DailyUpdate"" /TR """"""{app}\SeamUpdater\{#MyUpdaterExe}"""""" /SC DAILY /ST 06:00 /RL LIMITED"; \
-  StatusMsg: "Creating scheduled update task..."; \
-  Flags: runhidden; \
-  Tasks: scheduledupdate
-
 [UninstallRun]
 ; Remove scheduled task on uninstall
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""SeamAnalytics\DailyUpdate"""; Flags: runhidden; RunOnceId: "RemoveTask"
@@ -89,4 +82,123 @@ Type: files;          Name: "{localappdata}\SeamAnalytics\processed_dates.pkl"
 function ShouldInstallDB(DBName: String): Boolean;
 begin
   Result := not FileExists(ExpandConstant('{localappdata}\SeamAnalytics\') + DBName);
+end;
+
+// ── Custom time-picker page for scheduled updates ──
+var
+  TimePage: TWizardPage;
+  HourCombo: TNewComboBox;
+  MinuteCombo: TNewComboBox;
+  AmPmCombo: TNewComboBox;
+
+procedure InitializeWizard;
+var
+  Lbl: TNewStaticText;
+  i: Integer;
+begin
+  TimePage := CreateCustomPage(wpSelectTasks,
+    'Daily Update Time',
+    'Choose what time the automatic data update should run each day.');
+
+  Lbl := TNewStaticText.Create(TimePage);
+  Lbl.Parent := TimePage.Surface;
+  Lbl.Caption := 'Update time:';
+  Lbl.Top := 24;
+  Lbl.Left := 0;
+
+  HourCombo := TNewComboBox.Create(TimePage);
+  HourCombo.Parent := TimePage.Surface;
+  HourCombo.Style := csDropDownList;
+  HourCombo.Top := 20;
+  HourCombo.Left := 90;
+  HourCombo.Width := 55;
+  for i := 1 to 12 do
+    HourCombo.Items.Add(IntToStr(i));
+  HourCombo.ItemIndex := 5;  // default = 6
+
+  Lbl := TNewStaticText.Create(TimePage);
+  Lbl.Parent := TimePage.Surface;
+  Lbl.Caption := ':';
+  Lbl.Top := 24;
+  Lbl.Left := 150;
+
+  MinuteCombo := TNewComboBox.Create(TimePage);
+  MinuteCombo.Parent := TimePage.Surface;
+  MinuteCombo.Style := csDropDownList;
+  MinuteCombo.Top := 20;
+  MinuteCombo.Left := 160;
+  MinuteCombo.Width := 55;
+  MinuteCombo.Items.Add('00');
+  MinuteCombo.Items.Add('15');
+  MinuteCombo.Items.Add('30');
+  MinuteCombo.Items.Add('45');
+  MinuteCombo.ItemIndex := 0;  // default = :00
+
+  AmPmCombo := TNewComboBox.Create(TimePage);
+  AmPmCombo.Parent := TimePage.Surface;
+  AmPmCombo.Style := csDropDownList;
+  AmPmCombo.Top := 20;
+  AmPmCombo.Left := 225;
+  AmPmCombo.Width := 55;
+  AmPmCombo.Items.Add('AM');
+  AmPmCombo.Items.Add('PM');
+  AmPmCombo.ItemIndex := 0;  // default = AM
+
+  Lbl := TNewStaticText.Create(TimePage);
+  Lbl.Parent := TimePage.Surface;
+  Lbl.Caption := 'Tip: Choose a time when your PC is usually on but you are not using the app.';
+  Lbl.Top := 56;
+  Lbl.Left := 0;
+end;
+
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := False;
+  if (PageID = TimePage.ID) and (not WizardIsTaskSelected('scheduledupdate')) then
+    Result := True;
+end;
+
+function GetScheduleTime(Param: String): String;
+var
+  Hour24, Hour12, MinIdx: Integer;
+begin
+  Hour12 := StrToInt(HourCombo.Items[HourCombo.ItemIndex]);
+  MinIdx := MinuteCombo.ItemIndex;
+
+  // Convert 12-hour to 24-hour
+  if AmPmCombo.ItemIndex = 0 then  // AM
+  begin
+    if Hour12 = 12 then
+      Hour24 := 0
+    else
+      Hour24 := Hour12;
+  end
+  else  // PM
+  begin
+    if Hour12 = 12 then
+      Hour24 := 12
+    else
+      Hour24 := Hour12 + 12;
+  end;
+
+  Result := Format('%.2d:%s', [Hour24, MinuteCombo.Items[MinIdx]]);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
+  TimeStr: String;
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('scheduledupdate') then
+    begin
+      TimeStr := GetScheduleTime('');
+      Exec('schtasks.exe',
+        '/Create /F /TN "SeamAnalytics\DailyUpdate"' +
+        ' /TR "' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '"' +
+        ' /SC DAILY /ST ' + TimeStr + ' /RL LIMITED',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    end;
+  end;
 end;

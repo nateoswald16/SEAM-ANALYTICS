@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread
 from PyQt6 import sip
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath,
@@ -5281,6 +5281,22 @@ class SeamStatsApp(QMainWindow):
         hl.addWidget(mk_label("/", color=C["t3"], size=12, mono=True))
         hl.addWidget(mk_label("MLB · 2026 · ©SA", color=C["t3"], size=12, mono=True))
         hl.addStretch()
+
+        # ── Update Data button ──
+        self._update_btn = QPushButton("⟳  Update Data")
+        self._update_btn.setFixedHeight(28)
+        self._update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._update_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 10px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['ora']}; border-color:{C['ora']}; }}
+            QPushButton:disabled {{ color:{C['t3']}; border-color:{C['bdr']}; opacity:0.5; }}
+        """)
+        self._update_btn.clicked.connect(self._run_manual_update)
+        hl.addWidget(self._update_btn)
+        hl.addSpacing(6)
+
         ver_lbl = mk_label(f"v{_app_paths.APP_VERSION}", color=C["t3"], size=10, mono=True)
         hl.addWidget(ver_lbl)
         about_btn = QPushButton("ⓘ")
@@ -5294,6 +5310,48 @@ class SeamStatsApp(QMainWindow):
         about_btn.clicked.connect(self._show_about)
         hl.addWidget(about_btn)
         return bar
+
+    # ── Manual data update ──
+    def _run_manual_update(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Update Data",
+            "Download and process the latest game data?\n\n"
+            "This may take a few minutes depending on how many\n"
+            "days need to be fetched.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self._update_btn.setEnabled(False)
+        self._update_btn.setText("⟳  Updating…")
+        self.set_status("Data update in progress…", timeout=0)
+
+        class _UpdateWorker(QThread):
+            finished = pyqtSignal(str)   # "" on success, error message on failure
+
+            def run(self_w):
+                try:
+                    import daily_update
+                    daily_update.main([])
+                    self_w.finished.emit("")
+                except Exception as exc:
+                    self_w.finished.emit(str(exc))
+
+        self._update_worker = _UpdateWorker()
+        self._update_worker.finished.connect(self._on_update_done)
+        self._update_worker.start()
+
+    def _on_update_done(self, error: str):
+        self._update_btn.setEnabled(True)
+        self._update_btn.setText("⟳  Update Data")
+        if error:
+            self.set_status(f"Update failed: {error}", timeout=10000, error=True)
+            log.warning("Manual update failed: %s", error)
+        else:
+            self.set_status("Data update complete!", timeout=8000)
+            log.info("Manual data update completed successfully")
 
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
