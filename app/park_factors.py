@@ -34,7 +34,7 @@ from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
     QScrollArea, QGridLayout, QPushButton, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QPixmap, QImage,
 )
@@ -279,6 +279,179 @@ def _compass_to_mlb_wind(deg: float) -> str:
     return best[1]
 
 
+# ── NWS (National Weather Service) — primary provider ───────────────────────
+_nws_circuit_open = True   # False → NWS known unreachable, skip calls
+_nws_grid_cache: dict[str, dict] = {}   # "(lat,lon)" → {"hourly_url": ..., "stations_url": ...}
+_nws_grid_lock = threading.Lock()
+
+_NWS_HEADERS = {"User-Agent": "SeamAnalytics/1.0 (mlb-park-weather)", "Accept": "application/geo+json"}
+
+_NWS_COMPASS = {
+    "N": 0, "NNE": 22.5, "NE": 45, "ENE": 67.5, "E": 90, "ESE": 112.5,
+    "SE": 135, "SSE": 157.5, "S": 180, "SSW": 202.5, "SW": 225,
+    "WSW": 247.5, "W": 270, "WNW": 292.5, "NW": 315, "NNW": 337.5,
+}
+
+_NWS_COND_SCORE = {
+    "rain": 90, "drizzle": 80, "shower": 85, "thunder": 95, "storm": 95,
+    "snow": 70, "overcast": 40, "cloudy": 30, "mostly cloudy": 35,
+    "partly": 20, "mist": 25, "fog": 25, "haze": 20,
+    "clear": 10, "sunny": 10, "fair": 10,
+}
+
+
+def _nws_cond_score(txt: str) -> int:
+    t = txt.lower()
+    for kw, sc in _NWS_COND_SCORE.items():
+        if kw in t:
+            return sc
+    return 15
+
+
+def _nws_resolve_grid(lat, lon) -> dict:
+    """Resolve lat/lon to NWS grid point URLs.  Cached per coordinate pair."""
+    key = f"{round(lat, 3)},{round(lon, 3)}"
+    with _nws_grid_lock:
+        if key in _nws_grid_cache:
+            return _nws_grid_cache[key]
+    try:
+        r = _http_om.get(f"https://api.weather.gov/points/{lat},{lon}",
+                         headers=_NWS_HEADERS, timeout=5)
+        r.raise_for_status()
+        props = r.json().get("properties", {})
+        info = {
+            "hourly_url": props.get("forecastHourly", ""),
+        }
+        with _nws_grid_lock:
+            _nws_grid_cache[key] = info
+        return info
+    except Exception:
+        return {}
+
+
+def _fetch_nws(lat, lon, game_utc_iso: str | None = None):
+    """Fetch forecast data from the National Weather Service (api.weather.gov).
+
+    Returns the same dict shape as _fetch_open_meteo / _fetch_weatherapi.
+    NWS hourly gives temp, precip %, wind, and condition.
+    Pressure is NOT included — use _fetch_pressure_weatherapi() separately.
+    """
+    global _nws_circuit_open
+    if not _nws_circuit_open:
+        return {}
+    try:
+        grid = _nws_resolve_grid(lat, lon)
+        hourly_url = grid.get("hourly_url")
+        if not hourly_url:
+            return {}
+
+        # ── Hourly forecast ──────────────────────────────────────────────
+        hr = _http_om.get(hourly_url, headers=_NWS_HEADERS, timeout=5)
+        hr.raise_for_status()
+        periods = hr.json().get("properties", {}).get("periods", [])
+        if not periods:
+            return {}
+
+        result: dict = {"precip_pct": None, "pressure_hpa": None}
+
+        # Current-hour precip: use the first period (closest to now)
+        first = periods[0]
+        result["precip_pct"] = (
+            first.get("probabilityOfPrecipitation", {}).get("value") or 0)
+
+        # ── Game-window hourly forecast ──────────────────────────────────
+        if game_utc_iso:
+            try:
+                game_dt = datetime.fromisoformat(
+                    game_utc_iso.replace("Z", "+00:00"))
+                game_local = game_dt.astimezone()
+
+                # Build periods keyed by their start hour
+                def _period_dt(p):
+                    return datetime.fromisoformat(p["startTime"])
+
+                # Find the 4 periods covering the game window
+                window = []
+                for p in periods:
+                    pdt = _period_dt(p)
+                    diff = (pdt - game_local).total_seconds()
+                    if -1800 <= diff < 4 * 3600:  # 30 min before → 4h after
+                        window.append(p)
+                    if len(window) >= 4:
+                        break
+
+                if not window:
+                    # Fallback: pick closest period
+                    closest = min(periods,
+                                  key=lambda p: abs((_period_dt(p) - game_local).total_seconds()))
+                    window = [closest]
+
+                first_pitch = window[0]
+
+                # Temperature
+                result["forecast_temp"] = first_pitch.get("temperature")
+
+                # Wind — NWS gives "5 mph" or "5 to 10 mph" string + compass dir
+                ws_str = first_pitch.get("windSpeed", "0")
+                try:
+                    ws_parts = ws_str.replace(" mph", "").split(" to ")
+                    result["forecast_wind_speed"] = int(ws_parts[-1])
+                except Exception:
+                    result["forecast_wind_speed"] = 0
+                wd_str = first_pitch.get("windDirection", "")
+                result["forecast_wind_deg"] = _NWS_COMPASS.get(wd_str)
+
+                # Pressure from observation (already set above)
+                result["forecast_pressure"] = result.get("pressure_hpa")
+
+                # Precip: max across game window
+                window_precip = [
+                    p.get("probabilityOfPrecipitation", {}).get("value") or 0
+                    for p in window
+                ]
+                result["forecast_precip"] = max(window_precip) if window_precip else None
+
+                # Condition: worst weather in the window
+                worst_cond = max(
+                    (p.get("shortForecast", "") for p in window),
+                    key=_nws_cond_score,
+                )
+                result["forecast_condition"] = worst_cond
+
+                # Per-hour conditions for animated icon cycling
+                hourly_conds = []
+                for p in window:
+                    pdt = _period_dt(p)
+                    h_lbl = pdt.strftime("%I %p").lstrip("0")
+                    cond_txt = p.get("shortForecast", "")
+                    pr = p.get("probabilityOfPrecipitation", {}).get("value") or 0
+                    # Parse wind speed from NWS string like "5 mph" or "5 to 10 mph"
+                    h_ws_str = p.get("windSpeed", "0")
+                    try:
+                        h_ws = int(h_ws_str.replace(" mph", "").split(" to ")[-1])
+                    except Exception:
+                        h_ws = 0
+                    h_wd_compass = p.get("windDirection", "")
+                    h_wd_deg = _NWS_COMPASS.get(h_wd_compass)
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    hourly_conds.append({
+                        "hour": h_lbl, "condition": cond_txt,
+                        "precip": pr,
+                        "night": not p.get("isDaytime", True),
+                        "temp": p.get("temperature"),
+                        "wind_speed": h_ws,
+                        "wind_dir": h_wd_mlb,
+                    })
+                result["hourly_conditions"] = hourly_conds
+            except Exception:
+                pass
+
+        return result
+    except Exception:
+        _nws_circuit_open = False
+        return {}
+
+
 _om_circuit_open = True   # False → Open-Meteo known unreachable, skip calls
 
 
@@ -313,49 +486,269 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
             "pressure_hpa": round(cur.get("surface_pressure", 0) or 0, 1),
         }
 
-        # Pick the hourly slot closest to game time
+        # Pick hourly slots covering the game window (start → +3 h)
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
         if game_utc_iso and times:
-            # Open-Meteo returns local-timezone times; parse game UTC → local
             try:
                 game_dt = datetime.fromisoformat(
                     game_utc_iso.replace("Z", "+00:00"))
-                # Find the tz offset from the first hourly timestamp
-                tz_str = data.get("timezone", "")
-                # Convert game_dt to the same local tz by matching hour strings
                 game_local = game_dt.astimezone()
                 game_hour = game_local.strftime("%Y-%m-%dT%H:00")
-                # Find exact or nearest hour
+                # Find start index
                 if game_hour in times:
                     idx = times.index(game_hour)
                 else:
-                    # nearest by string sort distance
                     idx = min(range(len(times)),
                               key=lambda i: abs(
                                   datetime.fromisoformat(times[i]).hour
                                   - game_local.hour
                                   + (0 if times[i][:10] == game_hour[:10]
                                      else 24)))
+                # Collect indices for the ~4-hour game window
+                game_idxs = [i for i in range(idx, min(idx + 4, len(times)))]
+                if not game_idxs:
+                    game_idxs = [idx]
+
+                # First-pitch hour for temp / wind / pressure / condition
                 result["forecast_temp"] = hourly.get(
                     "temperature_2m", [None]*(idx+1))[idx]
                 result["forecast_wind_speed"] = hourly.get(
                     "wind_speed_10m", [None]*(idx+1))[idx]
                 result["forecast_wind_deg"] = hourly.get(
                     "wind_direction_10m", [None]*(idx+1))[idx]
-                result["forecast_precip"] = hourly.get(
-                    "precipitation_probability", [None]*(idx+1))[idx]
                 result["forecast_pressure"] = hourly.get(
                     "surface_pressure", [None]*(idx+1))[idx]
-                wcode = hourly.get("weather_code", [None]*(idx+1))[idx]
-                result["forecast_condition"] = _WMO_CONDITIONS.get(
-                    wcode, "Clear") if wcode is not None else ""
+
+                # Precip: max chance across the game window
+                precip_vals = hourly.get("precipitation_probability", [])
+                window_precip = [precip_vals[i] for i in game_idxs
+                                 if i < len(precip_vals)
+                                 and precip_vals[i] is not None]
+                result["forecast_precip"] = (
+                    max(window_precip) if window_precip else None)
+
+                # Condition: worst (rainiest) weather code in the window
+                wcodes = hourly.get("weather_code", [])
+                window_codes = [wcodes[i] for i in game_idxs
+                                if i < len(wcodes)
+                                and wcodes[i] is not None]
+                if window_codes:
+                    worst = max(window_codes)  # higher WMO = worse weather
+                    result["forecast_condition"] = _WMO_CONDITIONS.get(
+                        worst, "Clear")
+                else:
+                    wcode = wcodes[idx] if idx < len(wcodes) else None
+                    result["forecast_condition"] = _WMO_CONDITIONS.get(
+                        wcode, "Clear") if wcode is not None else ""
+
+                # Per-hour conditions for animated icon cycling
+                hourly_conds = []
+                temps = hourly.get("temperature_2m", [])
+                wspeeds = hourly.get("wind_speed_10m", [])
+                wdirs = hourly.get("wind_direction_10m", [])
+                for gi in game_idxs:
+                    t_str = times[gi] if gi < len(times) else ""
+                    try:
+                        h_dt = datetime.fromisoformat(t_str)
+                        h_lbl = h_dt.strftime("%I %p").lstrip("0")
+                        is_night = h_dt.hour >= 19 or h_dt.hour < 6
+                    except Exception:
+                        h_lbl = ""
+                        is_night = False
+                    wc = wcodes[gi] if gi < len(wcodes) else None
+                    cond_txt = _WMO_CONDITIONS.get(wc, "Clear") if wc is not None else ""
+                    pr = precip_vals[gi] if gi < len(precip_vals) else None
+                    h_temp = temps[gi] if gi < len(temps) else None
+                    h_ws = wspeeds[gi] if gi < len(wspeeds) else None
+                    h_wd_deg = wdirs[gi] if gi < len(wdirs) else None
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    if h_ws is not None:
+                        h_ws = round(h_ws * 0.621371)  # km/h → mph
+                    hourly_conds.append({
+                        "hour": h_lbl, "condition": cond_txt,
+                        "precip": pr,
+                        "night": is_night,
+                        "temp": round(h_temp * 9/5 + 32) if h_temp is not None else None,
+                        "wind_speed": h_ws,
+                        "wind_dir": h_wd_mlb,
+                    })
+                result["hourly_conditions"] = hourly_conds
             except Exception:
                 pass
 
         return result
     except Exception:
         _om_circuit_open = False   # trip circuit — skip remaining calls
+        return {}
+
+
+# ── WeatherAPI.com fallback ──────────────────────────────────────────────────
+_weatherapi_key: str | None = None
+_weatherapi_key_loaded = False
+_wa_circuit_open = True  # False → WeatherAPI known unreachable, skip calls
+
+
+def _load_weatherapi_key() -> str | None:
+    """Load WeatherAPI.com key from disk file or environment variable (cached)."""
+    global _weatherapi_key, _weatherapi_key_loaded
+    if _weatherapi_key_loaded:
+        return _weatherapi_key
+    _weatherapi_key_loaded = True
+    # Try the key file first
+    try:
+        kf = _app_paths.WEATHERAPI_KEY_FILE
+        if os.path.isfile(kf):
+            with open(kf, "r", encoding="utf-8") as f:
+                key = f.read().strip()
+            if key:
+                _weatherapi_key = key
+                return _weatherapi_key
+    except Exception:
+        pass
+    # Fall back to environment variable
+    key = os.environ.get("WEATHERAPI_KEY", "").strip()
+    if key:
+        _weatherapi_key = key
+    return _weatherapi_key
+
+
+def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None):
+    """Fallback: fetch forecast data from WeatherAPI.com.
+
+    Returns the same dict shape as _fetch_open_meteo so the caller
+    doesn't need to know which provider answered.
+    """
+    global _wa_circuit_open
+    if not _wa_circuit_open:
+        return {}
+    key = _load_weatherapi_key()
+    if not key:
+        return {}
+    try:
+        url = (
+            f"https://api.weatherapi.com/v1/forecast.json"
+            f"?key={key}&q={lat},{lon}&days=2&aqi=no&alerts=no"
+        )
+        r = _http_om.get(url, timeout=5)
+        r.raise_for_status()
+        data = r.json()
+
+        cur = data.get("current", {})
+        result = {
+            "precip_pct": None,
+            "pressure_hpa": round(cur.get("pressure_mb", 0) or 0, 1),
+        }
+
+        # Build a flat list of all hourly slots across forecast days
+        all_hours = []
+        for day in data.get("forecast", {}).get("forecastday", []):
+            all_hours.extend(day.get("hour", []))
+
+        if not all_hours:
+            return result
+
+        # Current-hour precipitation: find the slot closest to now
+        now = datetime.now()
+        now_str = now.strftime("%Y-%m-%d %H:00")
+        cur_hour = None
+        for h in all_hours:
+            if h.get("time", "")[:13] == now_str[:13]:
+                cur_hour = h
+                break
+        if cur_hour:
+            result["precip_pct"] = cur_hour.get("chance_of_rain", 0) or 0
+
+        # Hourly forecast across the game window (start → +3 h)
+        if game_utc_iso and all_hours:
+            try:
+                game_dt = datetime.fromisoformat(
+                    game_utc_iso.replace("Z", "+00:00"))
+                game_local = game_dt.astimezone()
+                game_hour_str = game_local.strftime("%Y-%m-%d %H:00")
+
+                # Find starting hour index
+                start_idx = None
+                for i, h in enumerate(all_hours):
+                    if h.get("time", "")[:13] == game_hour_str[:13]:
+                        start_idx = i
+                        break
+                if start_idx is None:
+                    start_idx = min(
+                        range(len(all_hours)),
+                        key=lambda i: abs(
+                            datetime.fromisoformat(
+                                all_hours[i]["time"]).hour - game_local.hour
+                            + (0 if all_hours[i]["time"][:10] == game_hour_str[:10]
+                               else 24)),
+                    )
+
+                # Collect hours for the ~4-hour game window
+                window = [all_hours[i] for i in range(
+                    start_idx, min(start_idx + 4, len(all_hours)))]
+                if not window:
+                    window = [all_hours[start_idx]]
+
+                match = window[0]  # first-pitch hour
+                result["forecast_temp"] = match.get("temp_f")
+                result["forecast_wind_speed"] = match.get("wind_mph")
+                result["forecast_wind_deg"] = match.get("wind_degree")
+                result["forecast_pressure"] = match.get("pressure_mb")
+
+                # Precip: max chance across the game window
+                window_precip = [h.get("chance_of_rain") for h in window
+                                 if h.get("chance_of_rain") is not None]
+                result["forecast_precip"] = (
+                    max(window_precip) if window_precip else None)
+
+                # Condition: worst weather in the window
+                cond_priority = {
+                    "rain": 90, "drizzle": 80, "shower": 85,
+                    "thunder": 95, "snow": 70, "overcast": 40,
+                    "cloudy": 30, "partly": 20, "mist": 25,
+                    "fog": 25, "clear": 10, "sunny": 10,
+                }
+                def _cond_score(txt):
+                    t = txt.lower()
+                    for kw, sc in cond_priority.items():
+                        if kw in t:
+                            return sc
+                    return 15
+
+                worst_cond = max(
+                    (h.get("condition", {}).get("text", "") for h in window),
+                    key=_cond_score,
+                )
+                result["forecast_condition"] = worst_cond
+
+                # Per-hour conditions for animated icon cycling
+                hourly_conds = []
+                for wh in window:
+                    t_str = wh.get("time", "")
+                    try:
+                        h_dt = datetime.fromisoformat(t_str)
+                        h_lbl = h_dt.strftime("%I %p").lstrip("0")
+                    except Exception:
+                        h_lbl = ""
+                    cond_txt = wh.get("condition", {}).get("text", "")
+                    pr = wh.get("chance_of_rain")
+                    h_wd_deg = wh.get("wind_degree")
+                    h_wd_mlb = _compass_to_mlb_wind(h_wd_deg) if h_wd_deg is not None else ""
+                    hourly_conds.append({
+                        "hour": h_lbl, "condition": cond_txt,
+                        "precip": pr,
+                        "night": not wh.get("is_day", 1),
+                        "temp": wh.get("temp_f"),
+                        "wind_speed": wh.get("wind_mph"),
+                        "wind_dir": h_wd_mlb,
+                    })
+                result["hourly_conditions"] = hourly_conds
+            except Exception:
+                pass
+
+        return result
+    except Exception:
+        _wa_circuit_open = False  # trip circuit — skip remaining calls
         return {}
 
 
@@ -367,8 +760,10 @@ def fetch_park_weather(date_str: str) -> list[dict]:
     venue_id, lat, lon, elevation, roof_type, temp, condition,
     wind_speed, wind_dir, wind_angle, precip_pct, pressure_hpa.
     """
-    global _om_circuit_open
-    _om_circuit_open = True   # reset circuit breaker for each fetch cycle
+    global _nws_circuit_open, _wa_circuit_open, _om_circuit_open
+    _nws_circuit_open = True   # reset circuit breakers for each fetch cycle
+    _wa_circuit_open = True
+    _om_circuit_open = True
     try:
         url = (
             "https://statsapi.mlb.com/api/v1/schedule"
@@ -455,10 +850,16 @@ def fetch_park_weather(date_str: str) -> list[dict]:
         if result["roof_type"] == "Retractable" and result["condition"].lower() in ("dome", ""):
             result["condition"] = ""
 
-        # Open-Meteo for precip + pressure + forecast fallback
+        # NWS primary → WeatherAPI fallback → Open-Meteo fallback
         if result["lat"] and result["lon"]:
-            om = _fetch_open_meteo(result["lat"], result["lon"],
-                                   game_utc_iso=gd or None)
+            om = _fetch_nws(result["lat"], result["lon"],
+                            game_utc_iso=gd or None)
+            if not om:
+                om = _fetch_weatherapi(result["lat"], result["lon"],
+                                       game_utc_iso=gd or None)
+            if not om:
+                om = _fetch_open_meteo(result["lat"], result["lon"],
+                                       game_utc_iso=gd or None)
             result["precip_pct"] = om.get("precip_pct")
             result["pressure_hpa"] = om.get("pressure_hpa")
 
@@ -478,6 +879,25 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["precip_pct"] = om["forecast_precip"]
             if om.get("forecast_pressure") is not None:
                 result["pressure_hpa"] = round(om["forecast_pressure"], 1)
+            if om.get("hourly_conditions"):
+                result["hourly_conditions"] = om["hourly_conditions"]
+
+            # Pressure: grab from WeatherAPI current conditions if still missing
+            if result["pressure_hpa"] is None:
+                try:
+                    wa_key = _load_weatherapi_key()
+                    if wa_key:
+                        pr = _http_om.get(
+                            f"https://api.weatherapi.com/v1/current.json"
+                            f"?key={wa_key}&q={result['lat']},{result['lon']}&aqi=no",
+                            timeout=3,
+                        )
+                        pr.raise_for_status()
+                        mb = pr.json().get("current", {}).get("pressure_mb")
+                        if mb:
+                            result["pressure_hpa"] = round(mb, 1)
+                except Exception:
+                    pass
 
         return result
 
@@ -524,6 +944,20 @@ def _paint_sun(p: QPainter, cx: float, cy: float, sz: float = 22):
         p.drawLine(QPointF(x1, y1), QPointF(x2, y2))
 
 
+def _paint_moon(p: QPainter, cx: float, cy: float, sz: float = 22):
+    """Crescent moon for nighttime clear conditions."""
+    r = sz * 0.38
+    p.setPen(Qt.PenStyle.NoPen)
+    # Full circle in pale yellow
+    p.setBrush(QBrush(QColor("#e8d44d")))
+    p.drawEllipse(QPointF(cx, cy), r, r)
+    # Cutout circle shifted right to create crescent
+    p.setBrush(QBrush(QColor(0, 0, 0, 0)))
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+    p.drawEllipse(QPointF(cx + r * 0.6, cy - r * 0.25), r * 0.85, r * 0.85)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+
+
 def _paint_cloud(p: QPainter, cx: float, cy: float, sz: float = 24,
                  color: str = "#78909c"):
     """Simple cloud blob."""
@@ -548,26 +982,121 @@ def _paint_rain_drops(p: QPainter, cx: float, cy: float, sz: float = 24):
 
 
 def _paint_condition(p: QPainter, cx: float, cy: float, cond: str,
-                     sz: float = 26):
+                     sz: float = 26, *, night: bool = False):
     """Dispatch to the appropriate icon painter based on MLB condition text."""
-    cl = cond.lower()
-    if "rain" in cl or "drizzle" in cl or "shower" in cl:
+    _clear_icon = _paint_moon if night else _paint_sun
+    cl = cond.strip().lower()
+    if "rain" in cl or "drizzle" in cl or "shower" in cl or "thunder" in cl:
         _paint_cloud(p, cx, cy, sz, "#607d8b")
         _paint_rain_drops(p, cx, cy, sz)
-    elif cl in ("sunny", "clear"):
-        _paint_sun(p, cx, cy, sz)
-    elif "partly" in cl:
-        _paint_sun(p, cx - sz * 0.15, cy - sz * 0.1, sz * 0.75)
+    elif cl in ("sunny", "clear") or "mostly clear" in cl or cl == "":
+        _clear_icon(p, cx, cy, sz)
+    elif "partly" in cl or "patchy" in cl:
+        _clear_icon(p, cx - sz * 0.15, cy - sz * 0.1, sz * 0.75)
         _paint_cloud(p, cx + sz * 0.15, cy + sz * 0.15, sz * 0.8)
-    elif "cloud" in cl or "overcast" in cl:
+    elif "cloud" in cl or "overcast" in cl or "mist" in cl or "fog" in cl or "haze" in cl:
         _paint_cloud(p, cx, cy, sz)
-    elif "snow" in cl:
+    elif "snow" in cl or "sleet" in cl or "ice" in cl:
         _paint_cloud(p, cx, cy, sz, "#b0bec5")
-    else:
-        # Dome / unknown — faint dash
+    elif cl == "dome":
+        # Dome — faint dash
         p.setPen(QPen(QColor(C["t3"]), 1))
         p.drawText(QRectF(cx - 12, cy - 6, 24, 12),
                     Qt.AlignmentFlag.AlignCenter, "—")
+    else:
+        # Unknown condition — try to show something reasonable
+        _clear_icon(p, cx - sz * 0.15, cy - sz * 0.1, sz * 0.75)
+        _paint_cloud(p, cx + sz * 0.15, cy + sz * 0.15, sz * 0.8)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Animated weather-condition overlay (cycles through game-window hours)
+# ═══════════════════════════════════════════════════════════════════════════════
+class _WeatherCycleOverlay(QWidget):
+    """Paints a weather icon + hour label that cross-fades between slots."""
+
+    indexChanged = pyqtSignal(int)    # emitted when visible slot changes
+
+    FADE_MS   = 600          # fade-transition duration
+    HOLD_MS   = 3000         # how long each hour is displayed
+    TICK_MS   = 30           # repaint interval during fades (~33 fps)
+
+    def __init__(self, conditions: list[dict], w: int, h: int, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(w, h)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._conds = conditions if conditions else []
+        self._idx = 0
+        self._opacity = 1.0        # current frame opacity
+        self._fading_out = False
+        self._frames: list[QPixmap] = []
+
+        # Pre-render a pixmap for each hourly condition
+        for slot in self._conds:
+            pm = QPixmap(w, h)
+            pm.fill(QColor(0, 0, 0, 0))
+            p = QPainter(pm)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            # icon centred in top portion
+            _paint_condition(p, w / 2, h * 0.28, slot.get("condition", ""), 28,
+                             night=slot.get("night", False))
+            # hour label below icon
+            p.setFont(QFont("Segoe UI", 8))
+            p.setPen(QColor(C["t2"]))
+            lbl = slot.get("hour", "")
+            p.drawText(QRectF(0, h * 0.54, w, 14),
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       lbl)
+            # precip line
+            pr = slot.get("precip")
+            if pr is not None and pr > 0:
+                p.drawText(QRectF(0, h * 0.72, w, 14),
+                           Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                           f"Precip {pr}%")
+            p.end()
+            self._frames.append(pm)
+
+        if len(self._frames) > 1:
+            self._timer = QTimer(self)
+            self._timer.timeout.connect(self._tick)
+            # Start with a hold period, then begin cycling
+            self._hold_timer = QTimer(self)
+            self._hold_timer.setSingleShot(True)
+            self._hold_timer.timeout.connect(self._start_fade_out)
+            self._hold_timer.start(self.HOLD_MS)
+
+    # ── animation machinery ──────────────────────────────────────────────
+    def _start_fade_out(self):
+        self._fading_out = True
+        self._opacity = 1.0
+        self._timer.start(self.TICK_MS)
+
+    def _tick(self):
+        step = self.TICK_MS / self.FADE_MS
+        if self._fading_out:
+            self._opacity = max(0.0, self._opacity - step)
+            if self._opacity <= 0.0:
+                # Switch to next frame and fade in
+                self._idx = (self._idx + 1) % len(self._frames)
+                self.indexChanged.emit(self._idx)
+                self._fading_out = False
+                self._opacity = 0.0
+        else:
+            self._opacity = min(1.0, self._opacity + step)
+            if self._opacity >= 1.0:
+                # Hold on this frame
+                self._timer.stop()
+                self._hold_timer.start(self.HOLD_MS)
+        self.update()
+
+    # ── painting ─────────────────────────────────────────────────────────
+    def paintEvent(self, _):
+        if not self._frames:
+            return
+        p = QPainter(self)
+        p.setOpacity(self._opacity)
+        p.drawPixmap(0, 0, self._frames[self._idx])
+        p.end()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -584,10 +1113,22 @@ class MiniParkWidget(QWidget):
         self.setFixedSize(self.W, self.H)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self._cached_pm: QPixmap | None = None
+        self._has_cycle = False
+
+        # Animated weather icon overlay (cycles hourly conditions)
+        hourly = data.get("hourly_conditions", [])
+        if len(hourly) > 1:
+            # Place overlay centred above the outfield
+            ow, oh = 90, 68
+            ox = self.CX - ow // 2
+            oy = 2
+            self._weather_overlay = _WeatherCycleOverlay(hourly, ow, oh, self)
+            self._weather_overlay.move(ox, oy)
+            self._has_cycle = True
 
     # ── geometry constants (computed once) ──
     CX, CY_HOME = 130, 195         # home-plate position
-    FIELD_R = 135                   # outfield arc radius
+    FIELD_R = 120                   # outfield arc radius
     # Three arrow positions (% of radius from home, angle from vertical)
     _ARROW_ZONES = [
         (0.55, -32),   # LF zone
@@ -683,7 +1224,9 @@ class MiniParkWidget(QWidget):
                     Qt.AlignmentFlag.AlignCenter, "RF")
 
         # ── 5) weather icon (centred above outfield) ──
-        _paint_condition(p, cx, cy - R - 2, self.d.get("condition", ""), 28)
+        # If we have the animated hourly overlay, skip the static icon
+        if not self._has_cycle:
+            _paint_condition(p, cx, cy - R - 2, self.d.get("condition", ""), 28)
 
         # ── 6) top-left: wind speed ──
         p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
@@ -817,20 +1360,17 @@ class ParkWeatherCard(QFrame):
         pw.addStretch()
         vl.addLayout(pw)
 
-        # ── detail row: temp + wind summary ──
-        temp = self.d.get("temp")
-        roof = self.d.get("roof_type", "Open")
-        parts = []
-        if temp:
-            parts.append(f"{temp}°")
-        if roof == "Dome":
-            parts.append("Dome")
-        else:
-            ws = self.d.get("wind_speed", 0)
-            wd = self.d.get("wind_dir", "Calm")
-            parts.append(f"{ws}mph {wd}" if ws else "Calm")
-        vl.addWidget(_mk("  ·  ".join(parts), color=C["t2"], size=11,
-                          align=Qt.AlignmentFlag.AlignCenter))
+        # ── detail row: temp + wind summary (cycles with weather overlay) ──
+        hourly = self.d.get("hourly_conditions", [])
+        self._detail_lbl = _mk("", color=C["t2"], size=11,
+                                align=Qt.AlignmentFlag.AlignCenter)
+        self._hourly = hourly
+        self._detail_lbl.setText(self._detail_text(0))
+        vl.addWidget(self._detail_lbl)
+
+        # Connect to MiniParkWidget's overlay for synced cycling
+        if hasattr(park, '_weather_overlay') and park._has_cycle:
+            park._weather_overlay.indexChanged.connect(self._on_hour_change)
 
         # ── park factor badge ──
         venue_id = self.d.get("venue_id")
@@ -867,6 +1407,30 @@ class ParkWeatherCard(QFrame):
             return get_team_pixmap(abbr, size)
         except Exception:
             return None
+
+    def _detail_text(self, idx: int) -> str:
+        """Build the temp · wind summary string for hour *idx*."""
+        roof = self.d.get("roof_type", "Open")
+        if self._hourly and 0 <= idx < len(self._hourly):
+            slot = self._hourly[idx]
+            t = slot.get("temp")
+            ws = slot.get("wind_speed", 0) or 0
+            wd = slot.get("wind_dir", "")
+        else:
+            t = self.d.get("temp")
+            ws = self.d.get("wind_speed", 0) or 0
+            wd = self.d.get("wind_dir", "Calm")
+        parts = []
+        if t is not None:
+            parts.append(f"{int(t)}°")
+        if roof == "Dome":
+            parts.append("Dome")
+        else:
+            parts.append(f"{ws}mph {wd}" if ws else "Calm")
+        return "  ·  ".join(parts)
+
+    def _on_hour_change(self, idx: int):
+        self._detail_lbl.setText(self._detail_text(idx))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -937,14 +1501,17 @@ def prefetch_weather(date_str: str | None = None):
     import datetime as _dt
     date_str = date_str or _dt.date.today().isoformat()
 
-    # Seed from disk so the page can render instantly
+    # Delete today's stale disk cache so we always get fresh weather on launch
+    try:
+        stale = _weather_cache_path(date_str)
+        if os.path.isfile(stale):
+            os.remove(stale)
+    except Exception:
+        pass
     with _weather_lock:
-        if date_str not in _weather_cache:
-            disk = _load_weather_from_disk(date_str)
-            if disk is not None:
-                _weather_cache[date_str] = disk
+        _weather_cache.pop(date_str, None)
 
-    # Always fetch fresh data and update cache + disk
+    # Fetch fresh data and update cache + disk
     data = fetch_park_weather(date_str)
     with _weather_lock:
         _weather_cache[date_str] = data

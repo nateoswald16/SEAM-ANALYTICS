@@ -9,7 +9,7 @@ Frozen    – read-only assets come from the PyInstaller bundle;
 import os
 import sys
 
-APP_VERSION = "1.0.0-beta"
+APP_VERSION = "1.0.1-beta"
 
 _frozen = getattr(sys, "frozen", False)
 
@@ -53,3 +53,4 @@ STATCAST_CACHE_DIR    = os.path.join(DATA_DIR, "statcast_cache")
 PLAYER_IDS_CACHE      = os.path.join(DATA_DIR, "player_ids_cache.pkl")
 TEMP_LINEUP_CACHE     = os.path.join(DATA_DIR, "temp_lineups_cache.json")
 PROCESSED_DATES_CACHE = os.path.join(DATA_DIR, "processed_dates.pkl")
+WEATHERAPI_KEY_FILE   = os.path.join(DATA_DIR, "weatherapi_key.txt")

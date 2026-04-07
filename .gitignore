@@ -42,3 +42,6 @@ nul
 .idea/
 *.swp
 *.swo
+
+# ── API keys ──────────────────────────────────────────────────
+app/weatherapi_key.txt

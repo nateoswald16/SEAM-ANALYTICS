@@ -4,6 +4,33 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.0.1-beta — 2026-04-07
+
+### Weather System Overhaul
+
+**Weather Providers**
+- NWS (api.weather.gov) as primary weather provider — free, no API key, most accurate forecasts
+- WeatherAPI.com for barometric pressure + first weather fallback
+- Open-Meteo as second weather fallback
+- 4-hour game window for all providers (covers full game duration)
+- Separate pressure fetch via WeatherAPI `current.json` endpoint
+
+**Animated Weather Overlay**
+- Hourly weather icon cycling with cross-fade animation (600ms fade, 3s hold)
+- Night-aware icons: crescent moon for clear nighttime conditions using QPainter composition mode
+- Broadened condition matching for NWS/WeatherAPI condition strings (partly, patchy, mostly clear)
+- Per-hour precip % displayed on separate line below time label
+
+**Hourly Data Cycling**
+- Temperature and wind direction text below field updates in sync with weather icon transitions
+- Wind direction converted to MLB-style labels (Out To CF, L To R, etc.) per hour
+
+**Weather Cache**
+- Fresh weather data fetched on every app launch (stale cache cleared on startup)
+- Disk cache retained for mid-session use; old cache files cleaned up after 3 days
+
+---
+
 ## v1.0.0-beta — 2026-04-07
 
 ### Initial Beta Release
