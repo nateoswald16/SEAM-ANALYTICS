@@ -1,0 +1,410 @@
+{
+  "pitch_type": {
+    "mapped_to": "pitching_appearances.pitch_type"
+  },
+  "game_date": {
+    "mapped_to": "plate_appearances.game_date"
+  },
+  "release_speed": {
+    "mapped_to": "plate_appearances.release_speed"
+  },
+  "release_pos_x": {
+    "mapped_to": "pitching_appearances.release_pos_x"
+  },
+  "release_pos_z": {
+    "mapped_to": "pitching_appearances.release_pos_z"
+  },
+  "player_name": {
+    "mapped_to": "players_metadata.player_name"
+  },
+  "batter": {
+    "mapped_to": "plate_appearances.batter_id"
+  },
+  "pitcher": {
+    "mapped_to": "plate_appearances.pitcher_id"
+  },
+  "events": {
+    "mapped_to": "plate_appearances.events"
+  },
+  "description": {
+    "mapped_to": "plate_appearances.description"
+  },
+  "spin_dir": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.spin_dir"
+  },
+  "spin_rate_deprecated": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.spin_rate_deprecated"
+  },
+  "break_angle_deprecated": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.break_angle_deprecated"
+  },
+  "break_length_deprecated": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.break_length_deprecated"
+  },
+  "zone": {
+    "mapped_to": "plate_appearances.zone"
+  },
+  "des": {
+    "mapped_to": "plate_appearances.description"
+  },
+  "game_type": {
+    "mapped_to": "plate_appearances.game_type"
+  },
+  "stand": {
+    "mapped_to": "plate_appearances.stand"
+  },
+  "p_throws": {
+    "mapped_to": "plate_appearances.p_throws"
+  },
+  "home_team": {
+    "mapped_to": "plate_appearances.home_team"
+  },
+  "away_team": {
+    "mapped_to": "plate_appearances.away_team"
+  },
+  "type": {
+    "mapped_to": "plate_appearances.game_type"
+  },
+  "hit_location": {
+    "mapped_to": "plate_appearances.hit_location"
+  },
+  "bb_type": {
+    "mapped_to": "plate_appearances.bb_type"
+  },
+  "balls": {
+    "mapped_to": "plate_appearances.balls"
+  },
+  "strikes": {
+    "mapped_to": "plate_appearances.strikes"
+  },
+  "game_year": {
+    "mapped_to": "plate_appearances.game_year"
+  },
+  "pfx_x": {
+    "mapped_to": "pitching_appearances.pfx_x"
+  },
+  "pfx_z": {
+    "mapped_to": "pitching_appearances.pfx_z"
+  },
+  "plate_x": {
+    "mapped_to": "pitching_appearances.plate_x"
+  },
+  "plate_z": {
+    "mapped_to": "pitching_appearances.plate_z"
+  },
+  "on_3b": {
+    "mapped_to": "plate_appearances.on_3b"
+  },
+  "on_2b": {
+    "mapped_to": "plate_appearances.on_2b"
+  },
+  "on_1b": {
+    "mapped_to": "plate_appearances.on_1b"
+  },
+  "outs_when_up": {
+    "mapped_to": "plate_appearances.outs_when_up"
+  },
+  "inning": {
+    "mapped_to": "plate_appearances.inning"
+  },
+  "inning_topbot": {
+    "mapped_to": "plate_appearances.inning"
+  },
+  "hc_x": {
+    "mapped_to": "plate_appearances.hc_x"
+  },
+  "hc_y": {
+    "mapped_to": "plate_appearances.hc_y"
+  },
+  "tfs_deprecated": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.tfs_deprecated"
+  },
+  "tfs_zulu_deprecated": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.tfs_zulu_deprecated"
+  },
+  "umpire": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.umpire"
+  },
+  "sv_id": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.sv_id"
+  },
+  "vx0": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.vx0"
+  },
+  "vy0": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.vy0"
+  },
+  "vz0": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.vz0"
+  },
+  "ax": {
+    "mapped_to": "plate_appearances.spin_axis"
+  },
+  "ay": {
+    "mapped_to": "games.away_score"
+  },
+  "az": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.az"
+  },
+  "sz_top": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.sz_top"
+  },
+  "sz_bot": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.sz_bot"
+  },
+  "hit_distance_sc": {
+    "mapped_to": "plate_appearances.hit_distance_sc"
+  },
+  "launch_speed": {
+    "mapped_to": "plate_appearances.launch_speed"
+  },
+  "launch_angle": {
+    "mapped_to": "plate_appearances.launch_angle"
+  },
+  "effective_speed": {
+    "mapped_to": "plate_appearances.effective_speed"
+  },
+  "release_spin_rate": {
+    "mapped_to": "plate_appearances.release_spin_rate"
+  },
+  "release_extension": {
+    "mapped_to": "plate_appearances.release_extension"
+  },
+  "game_pk": {
+    "mapped_to": "plate_appearances.game_id"
+  },
+  "fielder_2": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_2"
+  },
+  "fielder_3": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_3"
+  },
+  "fielder_4": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_4"
+  },
+  "fielder_5": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_5"
+  },
+  "fielder_6": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_6"
+  },
+  "fielder_7": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_7"
+  },
+  "fielder_8": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_8"
+  },
+  "fielder_9": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fielder_9"
+  },
+  "release_pos_y": {
+    "mapped_to": "pitching_appearances.release_pos_y"
+  },
+  "estimated_ba_using_speedangle": {
+    "mapped_to": "plate_appearances.estimated_ba_using_speedangle"
+  },
+  "estimated_woba_using_speedangle": {
+    "mapped_to": "plate_appearances.estimated_woba_using_speedangle"
+  },
+  "woba_value": {
+    "mapped_to": "plate_appearances.woba_value"
+  },
+  "woba_denom": {
+    "mapped_to": "plate_appearances.woba_denom"
+  },
+  "babip_value": {
+    "mapped_to": "plate_appearances.babip_value"
+  },
+  "iso_value": {
+    "mapped_to": "plate_appearances.iso_value"
+  },
+  "launch_speed_angle": {
+    "mapped_to": "plate_appearances.launch_speed_angle"
+  },
+  "at_bat_number": {
+    "mapped_to": "plate_appearances.statcast_at_bat_number"
+  },
+  "pitch_number": {
+    "mapped_to": "pitching_appearances.pitch_number"
+  },
+  "pitch_name": {
+    "mapped_to": "pitching_appearances.pitch_name"
+  },
+  "home_score": {
+    "mapped_to": "games.home_score"
+  },
+  "away_score": {
+    "mapped_to": "games.away_score"
+  },
+  "bat_score": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.bat_score"
+  },
+  "fld_score": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.fld_score"
+  },
+  "post_away_score": {
+    "mapped_to": "games.away_score"
+  },
+  "post_home_score": {
+    "mapped_to": "games.home_score"
+  },
+  "post_bat_score": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.post_bat_score"
+  },
+  "post_fld_score": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.post_fld_score"
+  },
+  "if_fielding_alignment": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.if_fielding_alignment"
+  },
+  "of_fielding_alignment": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.of_fielding_alignment"
+  },
+  "spin_axis": {
+    "mapped_to": "plate_appearances.spin_axis"
+  },
+  "delta_home_win_exp": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.delta_home_win_exp"
+  },
+  "delta_run_exp": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.delta_run_exp"
+  },
+  "bat_speed": {
+    "mapped_to": "plate_appearances.bat_speed"
+  },
+  "swing_length": {
+    "mapped_to": "plate_appearances.swing"
+  },
+  "estimated_slg_using_speedangle": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.estimated_slg_using_speedangle"
+  },
+  "delta_pitcher_run_exp": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.delta_pitcher_run_exp"
+  },
+  "hyper_speed": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.hyper_speed"
+  },
+  "home_score_diff": {
+    "mapped_to": "games.home_score"
+  },
+  "bat_score_diff": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.bat_score_diff"
+  },
+  "home_win_exp": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.home_win_exp"
+  },
+  "bat_win_exp": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.bat_win_exp"
+  },
+  "age_pit_legacy": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.age_pit_legacy"
+  },
+  "age_bat_legacy": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.age_bat_legacy"
+  },
+  "age_pit": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.age_pit"
+  },
+  "age_bat": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.age_bat"
+  },
+  "n_thruorder_pitcher": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.n_thruorder_pitcher"
+  },
+  "n_priorpa_thisgame_player_at_bat": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.n_priorpa_thisgame_player_at_bat"
+  },
+  "pitcher_days_since_prev_game": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.pitcher_days_since_prev_game"
+  },
+  "batter_days_since_prev_game": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.batter_days_since_prev_game"
+  },
+  "pitcher_days_until_next_game": {
+    "mapped_to": null,
+    "suggested_add": "pitching_appearances.pitcher_days_until_next_game"
+  },
+  "batter_days_until_next_game": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.batter_days_until_next_game"
+  },
+  "api_break_z_with_gravity": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.api_break_z_with_gravity"
+  },
+  "api_break_x_arm": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.api_break_x_arm"
+  },
+  "api_break_x_batter_in": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.api_break_x_batter_in"
+  },
+  "arm_angle": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.arm_angle"
+  },
+  "attack_angle": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.attack_angle"
+  },
+  "attack_direction": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.attack_direction"
+  },
+  "swing_path_tilt": {
+    "mapped_to": "plate_appearances.swing"
+  },
+  "intercept_ball_minus_batter_pos_x_inches": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.intercept_ball_minus_batter_pos_x_inches"
+  },
+  "intercept_ball_minus_batter_pos_y_inches": {
+    "mapped_to": null,
+    "suggested_add": "plate_appearances.intercept_ball_minus_batter_pos_y_inches"
+  }
+}

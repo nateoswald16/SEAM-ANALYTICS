@@ -1,0 +1,44 @@
+# ═══════════════════════════════════════════════════════════════
+# Seam Analytics — .gitignore
+# ═══════════════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+*.egg
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+venv_backup*/
+
+# ── Databases (too large for Git — ship via installer) ────────
+*.db
+
+# ── Caches & runtime data ────────────────────────────────────
+*.pkl
+*.log
+app/temp_lineups_cache.json
+app/assets/lineup_cache/
+app/assets/weather_cache/
+app/assets/logos/
+app/statcast_cache/
+
+# ── Installer build artifacts ─────────────────────────────────
+installer/build/
+installer/dist/
+installer/output/
+
+# ── OS junk ───────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+nul
+
+# ── IDE ───────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
