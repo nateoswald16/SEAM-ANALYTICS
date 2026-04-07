@@ -464,6 +464,61 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
 _om_circuit_open = True   # False → Open-Meteo known unreachable, skip calls
 
 
+def _fetch_pressure_open_meteo(lat, lon) -> float | None:
+    """Lightweight Open-Meteo query for current surface pressure only.
+
+    No circuit breaker — pressure is needed for every card and Open-Meteo
+    is the only free provider that reliably supplies it.
+    """
+    try:
+        r = _http_om.get(
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lat}&longitude={lon}&current=surface_pressure",
+            timeout=6,
+        )
+        r.raise_for_status()
+        sp = r.json().get("current", {}).get("surface_pressure")
+        if sp:
+            return round(sp, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _fetch_pressure_batch(games: list[dict]) -> None:
+    """Fetch surface pressure for multiple games in a single Open-Meteo call.
+
+    Open-Meteo supports comma-separated lat/lon for multi-location queries,
+    returning all results in one request (~0.5–1 s total).
+    """
+    need = [g for g in games
+            if g.get("pressure_hpa") is None and g.get("lat") and g.get("lon")]
+    if not need:
+        return
+    lats = ",".join(str(g["lat"]) for g in need)
+    lons = ",".join(str(g["lon"]) for g in need)
+    try:
+        r = _http_om.get(
+            f"https://api.open-meteo.com/v1/forecast?"
+            f"latitude={lats}&longitude={lons}&current=surface_pressure",
+            timeout=8,
+        )
+        r.raise_for_status()
+        data = r.json()
+        # Single location returns a dict; multiple returns a list
+        if isinstance(data, dict):
+            data = [data]
+        for g, d in zip(need, data):
+            sp = d.get("current", {}).get("surface_pressure")
+            if sp:
+                g["pressure_hpa"] = round(sp, 1)
+    except Exception:
+        # Fall back to individual calls if batch fails
+        for g in need:
+            if g.get("pressure_hpa") is None:
+                g["pressure_hpa"] = _fetch_pressure_open_meteo(g["lat"], g["lon"])
+
+
 def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
     """Fetch forecast data from Open-Meteo.
 
@@ -873,6 +928,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             if not om:
                 om = _fetch_open_meteo(result["lat"], result["lon"],
                                        game_utc_iso=gd or None, azimuth=_az)
+
             result["precip_pct"] = om.get("precip_pct")
             result["pressure_hpa"] = om.get("pressure_hpa")
 
@@ -894,23 +950,6 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["pressure_hpa"] = round(om["forecast_pressure"], 1)
             if om.get("hourly_conditions"):
                 result["hourly_conditions"] = om["hourly_conditions"]
-
-            # Pressure: grab from WeatherAPI current conditions if still missing
-            if result["pressure_hpa"] is None:
-                try:
-                    wa_key = _load_weatherapi_key()
-                    if wa_key:
-                        pr = _http_om.get(
-                            f"https://api.weatherapi.com/v1/current.json"
-                            f"?key={wa_key}&q={result['lat']},{result['lon']}&aqi=no",
-                            timeout=3,
-                        )
-                        pr.raise_for_status()
-                        mb = pr.json().get("current", {}).get("pressure_mb")
-                        if mb:
-                            result["pressure_hpa"] = round(mb, 1)
-                except Exception:
-                    pass
 
         return result
 
@@ -935,6 +974,10 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                         pass
 
     results.sort(key=lambda x: x.get("time", "TBD"))
+
+    # ── Pressure fill — single batched Open-Meteo call for all games ──
+    _fetch_pressure_batch(results)
+
     return results
 
 
