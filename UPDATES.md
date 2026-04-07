@@ -6,6 +6,21 @@ All notable changes to Seam Analytics are documented here.
 
 ## v1.0.1-beta — 2026-04-07
 
+### Navigation & Game Tracker
+
+**Navbar Restructure**
+- Renamed "Game Schedule" to "Game Tracker" in main navbar and page header
+- Added new "Lineups" tab in main navbar — loads the first available game on click
+- Removed click-through navigation from Game Tracker schedule cards
+- Sidebar remains the primary way to select individual games
+
+**Schedule Card Improvements**
+- Box score with "-" placeholders now displayed on all cards, including pre-game
+- "▸ Play Log" expand button shown on all cards regardless of game state
+- Expanding play log on a scheduled game shows "No play-by-play info yet"
+- Live/final games still show "Loading plays…" until data arrives
+- Simplified card resize logic — all cards use dynamic content-based sizing
+
 ### Weather System Overhaul
 
 **Weather Providers**

@@ -3442,6 +3442,7 @@ class ScheduleGameCard(QFrame):
                 grid.setColumnStretch(0, 1)
                 grid.setColumnMinimumWidth(1, 60)
                 root.addLayout(grid)
+                root.addStretch()
             else:
                 # ── Scheduled games ──
                 root.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml))
@@ -3455,18 +3456,60 @@ class ScheduleGameCard(QFrame):
                     div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
                 root.addLayout(div)
                 root.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml))
-            root.addStretch()
+
+                root.addSpacing(14)
+
+                # ── Empty box score with "-" placeholders ──
+                inn_w = QWidget()
+                inn_w.setStyleSheet("background:transparent;")
+                inn_grid = QGridLayout(inn_w)
+                inn_grid.setContentsMargins(0, 0, 0, 0)
+                inn_grid.setHorizontalSpacing(0)
+                inn_grid.setVerticalSpacing(1)
+                away_name = mk_label(g["away"], color=C["t2"], size=9, mono=True)
+                away_name.setFixedWidth(32)
+                inn_grid.addWidget(away_name, 1, 0)
+                home_name = mk_label(g["home"], color=C["t2"], size=9, mono=True)
+                home_name.setFixedWidth(32)
+                inn_grid.addWidget(home_name, 2, 0)
+                for i in range(9):
+                    lbl = mk_label(str(i + 1), color=C["t3"], size=9, mono=True,
+                                   align=Qt.AlignmentFlag.AlignCenter)
+                    lbl.setFixedWidth(20)
+                    inn_grid.addWidget(lbl, 0, i + 1)
+                    for row in (1, 2):
+                        d = mk_label("-", color=C["t3"], size=9, mono=True,
+                                     align=Qt.AlignmentFlag.AlignCenter)
+                        d.setFixedWidth(20)
+                        inn_grid.addWidget(d, row, i + 1)
+                rhe_w = QWidget()
+                rhe_w.setStyleSheet("background:transparent;")
+                rhe_grid = QGridLayout(rhe_w)
+                rhe_grid.setContentsMargins(0, 0, 0, 0)
+                rhe_grid.setHorizontalSpacing(0)
+                rhe_grid.setVerticalSpacing(1)
+                for j, hdr in enumerate(["R", "H", "E"]):
+                    lbl = mk_label(hdr, color=C["t3"], size=9, mono=True, bold=True,
+                                   align=Qt.AlignmentFlag.AlignCenter)
+                    lbl.setFixedWidth(24)
+                    rhe_grid.addWidget(lbl, 0, j)
+                    for row in (1, 2):
+                        d = mk_label("-", color=C["t3"], size=9, mono=True,
+                                     align=Qt.AlignmentFlag.AlignCenter)
+                        d.setFixedWidth(24)
+                        rhe_grid.addWidget(d, row, j)
+                box_hl = QHBoxLayout()
+                box_hl.setContentsMargins(0, 0, 0, 0)
+                box_hl.setSpacing(0)
+                box_hl.addWidget(inn_w, 1)
+                box_hl.addWidget(rhe_w)
+                root.addLayout(box_hl)
+                # Size to content instead of fixed height
+                self.setMinimumHeight(0)
+                self.setMaximumHeight(16777215)
 
     def _build_play_section(self, outer):
         """Build the persistent play-log section (not rebuilt on score refresh)."""
-        g = self.game
-        st = (g.get('status') or '').lower()
-        is_final = (g.get('time', '').upper() == 'FINAL'
-                    or st.startswith('final') or st.startswith('game over')
-                    or st.startswith('completed'))
-        is_live = g.get('live') or g.get('time', '').upper() == 'LIVE' or st.startswith('in progress')
-        show_plays = is_live or is_final
-
         self._play_section = QWidget()
         self._play_section.setStyleSheet("background:transparent;")
         ps_layout = QVBoxLayout(self._play_section)
@@ -3483,52 +3526,51 @@ class ScheduleGameCard(QFrame):
             self._update_last_event()
         ps_layout.addWidget(self._last_event_lbl)
 
-        if show_plays:
-            self._toggle_btn = QPushButton("▸ Play Log")
-            self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            self._toggle_btn.setStyleSheet(f"""
-                QPushButton {{ background:transparent; color:{C['t3']}; border:none;
-                    font-family:'Segoe UI','Inter',sans-serif; font-size:10px; padding:2px 0; }}
-                QPushButton:hover {{ color:{C['t1']}; }}
-            """)
-            self._toggle_btn.setFixedHeight(18)
-            self._toggle_btn.clicked.connect(self._toggle_play_log)
-            ps_layout.addWidget(self._toggle_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        self._toggle_btn = QPushButton("▸ Play Log")
+        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:none;
+                font-family:'Segoe UI','Inter',sans-serif; font-size:10px; padding:2px 0; }}
+            QPushButton:hover {{ color:{C['t1']}; }}
+        """)
+        self._toggle_btn.setFixedHeight(18)
+        self._toggle_btn.clicked.connect(self._toggle_play_log)
+        ps_layout.addWidget(self._toggle_btn, 0, Qt.AlignmentFlag.AlignLeft)
 
-            # Play log container (hidden by default)
-            self._play_log = QWidget()
-            self._play_log.setStyleSheet("background:transparent;")
-            self._play_log.setVisible(False)
-            pl_vl = QVBoxLayout(self._play_log)
-            pl_vl.setContentsMargins(0, 4, 0, 0)
-            pl_vl.setSpacing(0)
-            self._play_scroll = SmoothScrollArea()
-            self._play_scroll.setWidgetResizable(True)
-            self._play_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            self._play_scroll.setFixedHeight(180)
-            self._play_scroll.setStyleSheet(
-                f"QScrollArea {{ background:transparent; border:none; }}"
-                f"QScrollBar:vertical {{ width:4px; background:transparent; }}"
-                f"QScrollBar::handle:vertical {{ background:{C['t3']}; border-radius:2px; }}"
-                f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}"
-            )
-            self._play_content = QWidget()
-            self._play_content.setStyleSheet("background:transparent;")
-            self._play_layout = QVBoxLayout(self._play_content)
-            self._play_layout.setContentsMargins(0, 0, 0, 0)
-            self._play_layout.setSpacing(1)
-            self._play_layout.addStretch()
-            self._play_scroll.setWidget(self._play_content)
-            pl_vl.addWidget(self._play_scroll)
-            ps_layout.addWidget(self._play_log)
+        # Play log container (hidden by default)
+        self._play_log = QWidget()
+        self._play_log.setStyleSheet("background:transparent;")
+        self._play_log.setVisible(False)
+        pl_vl = QVBoxLayout(self._play_log)
+        pl_vl.setContentsMargins(0, 4, 0, 0)
+        pl_vl.setSpacing(0)
+        self._play_scroll = SmoothScrollArea()
+        self._play_scroll.setWidgetResizable(True)
+        self._play_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._play_scroll.setFixedHeight(180)
+        self._play_scroll.setStyleSheet(
+            f"QScrollArea {{ background:transparent; border:none; }}"
+            f"QScrollBar:vertical {{ width:4px; background:transparent; }}"
+            f"QScrollBar::handle:vertical {{ background:{C['t3']}; border-radius:2px; }}"
+            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}"
+        )
+        self._play_content = QWidget()
+        self._play_content.setStyleSheet("background:transparent;")
+        self._play_layout = QVBoxLayout(self._play_content)
+        self._play_layout.setContentsMargins(0, 0, 0, 0)
+        self._play_layout.setSpacing(1)
+        self._play_layout.addStretch()
+        self._play_scroll.setWidget(self._play_content)
+        pl_vl.addWidget(self._play_scroll)
+        ps_layout.addWidget(self._play_log)
 
-            # Populate if we already have plays
-            if self._plays:
-                self._render_plays()
-            if self._expanded:
-                self._play_log.setVisible(True)
-                self._toggle_btn.setText("▾ Play Log")
-                self._resize_for_expansion()
+        # Populate if we already have plays
+        if self._plays:
+            self._render_plays()
+        if self._expanded:
+            self._play_log.setVisible(True)
+            self._toggle_btn.setText("▾ Play Log")
+            self._resize_for_expansion()
 
         outer.addWidget(self._play_section)
 
@@ -3542,38 +3584,29 @@ class ScheduleGameCard(QFrame):
         if self._expanded and self._plays:
             self._render_plays()
         elif self._expanded and not self._plays and self._play_layout:
-            # Show placeholder until first fetch arrives
+            # Show placeholder message
             while self._play_layout.count():
                 item = self._play_layout.takeAt(0)
                 w = item.widget()
                 if w:
                     w.deleteLater()
+            st = (self.game.get('status') or '').lower()
+            is_live = (self.game.get('live') or self.game.get('time', '').upper() == 'LIVE'
+                       or st.startswith('in progress'))
+            is_final = ('final' in st or 'game over' in st or 'completed' in st
+                        or self.game.get('time', '').upper() == 'FINAL')
+            msg = "  Loading plays\u2026" if (is_live or is_final) else "  No play-by-play info yet"
             self._play_layout.addWidget(
-                mk_label("  Loading plays\u2026", color=C["t3"], size=11))
+                mk_label(msg, color=C["t3"], size=11))
             self._play_layout.addStretch()
         self._resize_for_expansion()
 
     def _resize_for_expansion(self):
         """Adjust card size for expand/collapse state."""
-        if self._expanded:
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-            self.adjustSize()
-            self.setFixedHeight(self.sizeHint().height())
-        else:
-            # Force layout to recalculate without the hidden play log
-            self.adjustSize()
-            inn = self.game.get('innings_detail', [])
-            st = (self.game.get('status') or '').lower()
-            is_final = ('final' in st or 'game over' in st or 'completed' in st
-                        or self.game.get('time', '').upper() == 'FINAL')
-            is_live = self.game.get('live') or st.startswith('in progress')
-            if (is_live or is_final) and len(inn) > 0:
-                self.setMinimumHeight(0)
-                self.setMaximumHeight(16777215)
-                self.setFixedHeight(self.sizeHint().height())
-            else:
-                self.setFixedHeight(142)
+        self.setMinimumHeight(0)
+        self.setMaximumHeight(16777215)
+        self.adjustSize()
+        self.setFixedHeight(self.sizeHint().height())
 
     def _update_last_event(self):
         """Set the always-visible preview to the last play."""
@@ -5093,7 +5126,7 @@ def build_matchup_page(games=None, odds=None, on_click=None):
     hvl = QVBoxLayout(hdr)
     hvl.setContentsMargins(24, 20, 24, 12)
     hvl.setSpacing(0)
-    hvl.addWidget(mk_label("Game Schedule", color=C["t1"], size=22, bold=True))
+    hvl.addWidget(mk_label("Game Tracker", color=C["t1"], size=22, bold=True))
     try:
         friendly = dt.datetime.now().strftime("%A, %B %d")
     except Exception:
@@ -5193,8 +5226,9 @@ class SeamStatsApp(QMainWindow):
     IDX_PITCH   = 2
     IDX_BR      = 3
     IDX_MATCHUP = 4
-    IDX_PARK    = 5
-    IDX_GAME    = 6
+    IDX_LINEUP  = 5
+    IDX_PARK    = 6
+    IDX_GAME    = 7
  
     def __init__(self):
         super().__init__()
@@ -5220,7 +5254,8 @@ class SeamStatsApp(QMainWindow):
         main_nav, self._main_btns = build_navbar(
             50,
             [("[ 01 ]","HOME"),("[ 02 ]","HITTING"),
-             ("[ 03 ]","PITCHING"),("[ 04 ]","BASE RUNNING"),("[ 05 ]","GAME SCHEDULE"),("[ 06 ]","PARK FACTORS")],
+             ("[ 03 ]","PITCHING"),("[ 04 ]","BASE RUNNING"),("[ 05 ]","GAME TRACKER"),
+             ("[ 06 ]","LINEUPS"),("[ 07 ]","PARK FACTORS")],
             self._on_main_nav)
         root.addWidget(main_nav)
  
@@ -5522,7 +5557,8 @@ class SeamStatsApp(QMainWindow):
         self._stack.addWidget(build_matchup_page(
             games=self._games if hasattr(self, '_games') else GAMES,
             odds=None,
-            on_click=self._on_game_clicked))
+            on_click=None))
+        self._stack.addWidget(QWidget())  # Lineups placeholder (actual view is IDX_GAME)
         self._stack.addWidget(ParkFactorsPage())
 
         # Fetch leaderboard data in background thread
@@ -5621,6 +5657,14 @@ class SeamStatsApp(QMainWindow):
             if not self._lb_fetched and idx in (self.IDX_HIT, self.IDX_PITCH, self.IDX_BR):
                 self._lb_fetched = True
                 _bg_pool.submit(self._fetch_lb)
+            # Lineups tab → load first game and show game detail
+            if idx == self.IDX_LINEUP:
+                if (hasattr(self, '_games') and self._games) or GAMES:
+                    self._on_game_clicked(0)
+                    for i, b in enumerate(self._main_btns):
+                        b.setChecked(i == self.IDX_LINEUP)
+                        b.setStyleSheet(_nav_btn_style(i == self.IDX_LINEUP))
+                return
             _fade_switch(self._stack, idx)
             if idx != self.IDX_GAME:
                 self._deselect_cards()
@@ -5965,7 +6009,7 @@ class SeamStatsApp(QMainWindow):
         try:
             games = self._games if hasattr(self, '_games') else GAMES
             new_page = build_matchup_page(games=games, odds=odds,
-                                          on_click=self._on_game_clicked)
+                                          on_click=None)
             cur = self._stack.currentIndex()
             old = self._stack.widget(self.IDX_MATCHUP)
             self._stack.removeWidget(old)
