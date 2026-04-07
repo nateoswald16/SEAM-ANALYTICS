@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread, QSize
 from PyQt6 import sip
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath,
@@ -348,7 +348,7 @@ class DataManager:
         conn = getattr(_thread_local, 'raw_conn', None)
         if conn is None:
             try:
-                conn = sqlite3.connect(self.db_path)
+                conn = sqlite3.connect(self.db_path, timeout=30)
                 conn.row_factory = sqlite3.Row
                 _thread_local.raw_conn = conn
                 self._thread_conns.append(conn)
@@ -378,7 +378,7 @@ class DataManager:
             if not os.path.exists(self.calc_db_path):
                 return None
             try:
-                conn = sqlite3.connect(self.calc_db_path)
+                conn = sqlite3.connect(self.calc_db_path, timeout=30)
                 _thread_local.calc_conn = conn
                 self._thread_conns.append(conn)
             except Exception:
@@ -5282,8 +5282,22 @@ class SeamStatsApp(QMainWindow):
         hl.addWidget(mk_label("MLB · 2026 · ©SA", color=C["t3"], size=12, mono=True))
         hl.addStretch()
 
+        # ── Update progress bar (hidden until update runs) ──
+        from PyQt6.QtWidgets import QProgressBar
+        self._update_progress = QProgressBar()
+        self._update_progress.setFixedSize(100, 6)
+        self._update_progress.setRange(0, 0)  # indeterminate
+        self._update_progress.setTextVisible(False)
+        self._update_progress.setStyleSheet(f"""
+            QProgressBar {{ background:{C['bg3']}; border:none; border-radius:3px; }}
+            QProgressBar::chunk {{ background:{C['ora']}; border-radius:3px; }}
+        """)
+        self._update_progress.hide()
+        hl.addWidget(self._update_progress)
+        hl.addSpacing(4)
+
         # ── Update Data button ──
-        self._update_btn = QPushButton("⟳  Update Data")
+        self._update_btn = QPushButton("Update Data")
         self._update_btn.setFixedHeight(28)
         self._update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_btn.setStyleSheet(f"""
@@ -5299,14 +5313,48 @@ class SeamStatsApp(QMainWindow):
 
         ver_lbl = mk_label(f"v{_app_paths.APP_VERSION}", color=C["t3"], size=10, mono=True)
         hl.addWidget(ver_lbl)
-        about_btn = QPushButton("ⓘ")
+        _info_svg = os.path.join(_app_paths.APP_DIR, "assets", "info-svgrepo-com.svg")
+        about_btn = QPushButton()
+        try:
+            from PyQt6.QtSvg import QSvgRenderer
+            from PyQt6.QtCore import QByteArray
+            with open(_info_svg, "r", encoding="utf-8") as f:
+                svg_data = f.read()
+            # Normal state icon (theme subdued color)
+            svg_normal = svg_data.replace('fill="#000000"', f'fill="{C["t3"]}"')
+            pm_normal = QPixmap(18, 18)
+            pm_normal.fill(QColor(0, 0, 0, 0))
+            rn = QSvgRenderer(QByteArray(svg_normal.encode()))
+            pn = QPainter(pm_normal)
+            rn.render(pn)
+            pn.end()
+            # Hover state icon (accent color)
+            svg_hover = svg_data.replace('fill="#000000"', f'fill="{C["ora"]}"')
+            pm_hover = QPixmap(18, 18)
+            pm_hover.fill(QColor(0, 0, 0, 0))
+            rh = QSvgRenderer(QByteArray(svg_hover.encode()))
+            ph = QPainter(pm_hover)
+            rh.render(ph)
+            ph.end()
+            _icon_normal = QIcon(pm_normal)
+            _icon_hover = QIcon(pm_hover)
+            about_btn.setIcon(_icon_normal)
+            about_btn._icon_normal = _icon_normal
+            about_btn._icon_hover = _icon_hover
+            _orig_enter = about_btn.enterEvent
+            _orig_leave = about_btn.leaveEvent
+            def _enter(e, b=about_btn, oe=_orig_enter):
+                b.setIcon(b._icon_hover); oe(e)
+            def _leave(e, b=about_btn, ol=_orig_leave):
+                b.setIcon(b._icon_normal); ol(e)
+            about_btn.enterEvent = _enter
+            about_btn.leaveEvent = _leave
+        except Exception:
+            about_btn.setIcon(QIcon(_info_svg))
+        about_btn.setIconSize(QSize(18, 18))
         about_btn.setFixedSize(28, 28)
         about_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        about_btn.setStyleSheet(f"""
-            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
-                           border-radius:14px; font-size:14px; }}
-            QPushButton:hover {{ color:{C['ora']}; border-color:{C['ora']}; }}
-        """)
+        about_btn.setStyleSheet("QPushButton { background:transparent; border:none; }")
         about_btn.clicked.connect(self._show_about)
         hl.addWidget(about_btn)
         return bar
@@ -5325,7 +5373,8 @@ class SeamStatsApp(QMainWindow):
             return
 
         self._update_btn.setEnabled(False)
-        self._update_btn.setText("⟳  Updating…")
+        self._update_btn.setText("Updating…")
+        self._update_progress.show()
         self.set_status("Data update in progress…", timeout=0)
 
         class _UpdateWorker(QThread):
@@ -5344,8 +5393,9 @@ class SeamStatsApp(QMainWindow):
         self._update_worker.start()
 
     def _on_update_done(self, error: str):
+        self._update_progress.hide()
         self._update_btn.setEnabled(True)
-        self._update_btn.setText("⟳  Update Data")
+        self._update_btn.setText("Update Data")
         if error:
             self.set_status(f"Update failed: {error}", timeout=10000, error=True)
             log.warning("Manual update failed: %s", error)

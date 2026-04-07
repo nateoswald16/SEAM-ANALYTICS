@@ -89,7 +89,7 @@ def run_daily(start: str, end: str, season: int, calc_seasons: list[int]):
     tracker.start(len(games))
 
     print(f"Running ingestion for {start} → {end} (season {season})")
-    build_raw_db.run_pipeline(start, end, season, only_completed=False, progress_cb=tracker.on_raw)
+    build_raw_db.run_pipeline(start, end, season, only_completed=False, progress_cb=tracker.on_raw, games=games)
 
     # After raw ingest, incrementally rebuild calculated stats for affected players only
     build_calculated_db.build_calculated_db_incremental(season, start, end, progress_cb=tracker.on_calc)
@@ -227,7 +227,7 @@ def main(argv: list[str] | None = None):
             tracker.start(len(games))
 
             print(f"Running ingestion for {seg_start.isoformat()} → {seg_end.isoformat()} (season {y})")
-            build_raw_db.run_pipeline(seg_start.isoformat(), seg_end.isoformat(), y, only_completed=False, progress_cb=tracker.on_raw)
+            build_raw_db.run_pipeline(seg_start.isoformat(), seg_end.isoformat(), y, only_completed=False, progress_cb=tracker.on_raw, games=games)
 
             # Incremental calc rebuild — only players from newly ingested dates
             if args.calc_seasons:

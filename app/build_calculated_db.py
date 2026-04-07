@@ -1121,9 +1121,9 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
 
     Much faster than a full rebuild — only touches players from newly ingested games.
     """
-    conn_raw = sqlite3.connect(RAW_DB)
+    conn_raw = sqlite3.connect(RAW_DB, timeout=30)
     cur_raw = conn_raw.cursor()
-    conn_calc = sqlite3.connect(CALC_DB)
+    conn_calc = sqlite3.connect(CALC_DB, timeout=30)
     ensure_calc_schema(conn_calc)
 
     # Identify affected player IDs from the date range
@@ -1247,7 +1247,7 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
 
 
 def build_calculated_db(seasons: Optional[List[int]] = None):
-    conn_raw = sqlite3.connect(RAW_DB)
+    conn_raw = sqlite3.connect(RAW_DB, timeout=30)
     cur_raw = conn_raw.cursor()
 
     # decide seasons
@@ -1266,7 +1266,7 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
 
     print('Seasons to process:', seasons)
 
-    conn_calc = sqlite3.connect(CALC_DB)
+    conn_calc = sqlite3.connect(CALC_DB, timeout=30)
     ensure_calc_schema(conn_calc)
 
     for season in seasons:

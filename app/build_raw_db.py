@@ -16,6 +16,7 @@ Usage:
 """
 import argparse
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import json
 import os
@@ -60,8 +61,10 @@ def create_db(db_path: str = DB_PATH):
     stmts = extract_sql_statements(txt)
     # Pre-drop any existing views so CREATE VIEW will replace them
     view_names = re.findall(r"CREATE VIEW IF NOT EXISTS\s+([a-zA-Z0-9_]+)\s+AS", txt, flags=re.S | re.I)
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30)
     cur = conn.cursor()
+    # WAL mode allows concurrent readers during writes
+    cur.execute('PRAGMA journal_mode=WAL')
     for v in view_names:
         try:
             cur.execute(f"DROP VIEW IF EXISTS {v}")
@@ -172,7 +175,7 @@ def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
     return [row[1] for row in cur.fetchall()]
 
 
-def insert_rows(conn: sqlite3.Connection, table: str, rows: List[Dict[str, Any]]):
+def insert_rows(conn: sqlite3.Connection, table: str, rows: List[Dict[str, Any]], commit: bool = True):
     if not rows:
         return
     cols = get_table_columns(conn, table)
@@ -184,10 +187,11 @@ def insert_rows(conn: sqlite3.Connection, table: str, rows: List[Dict[str, Any]]
         vals.append([r.get(c) for c in cols])
     cur = conn.cursor()
     cur.executemany(sql, vals)
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def update_row_by_pa_id(conn: sqlite3.Connection, pa_id: str, updates: Dict[str, Any]):
+def update_row_by_pa_id(conn: sqlite3.Connection, pa_id: str, updates: Dict[str, Any], commit: bool = True):
     if not updates:
         return
     cols = list(updates.keys())
@@ -195,7 +199,8 @@ def update_row_by_pa_id(conn: sqlite3.Connection, pa_id: str, updates: Dict[str,
     sql = f"UPDATE plate_appearances SET {assignments} WHERE pa_id = ?"
     cur = conn.cursor()
     cur.execute(sql, [updates[c] for c in cols] + [pa_id])
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]]:
@@ -633,6 +638,15 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
         mapping = {}
 
     pitch_inserts = []
+    _uncommitted = 0
+    _BATCH_SIZE = 500
+
+    def _maybe_commit():
+        nonlocal _uncommitted
+        _uncommitted += 1
+        if _uncommitted >= _BATCH_SIZE:
+            conn.commit()
+            _uncommitted = 0
 
     def resolve_player_name(game_id, player_id, role='pitcher'):
         if player_id is None:
@@ -724,7 +738,8 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             # Try exact pa_id first
             cur = conn.execute("SELECT 1 FROM plate_appearances WHERE pa_id = ? LIMIT 1", (pa_id,))
             if cur.fetchone():
-                update_row_by_pa_id(conn, pa_id, pa_update)
+                update_row_by_pa_id(conn, pa_id, pa_update, commit=False)
+                _maybe_commit()
             else:
                 matched = False
                 # Statcast `at_bat_number` is 1-based; convert to 0-based index for DB matching
@@ -744,7 +759,8 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                             )
                             r = cur.fetchone()
                             if r:
-                                update_row_by_pa_id(conn, r[0], pa_update)
+                                update_row_by_pa_id(conn, r[0], pa_update, commit=False)
+                                _maybe_commit()
                                 matched = True
                                 break
                         except Exception:
@@ -761,7 +777,8 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                             )
                             r = cur.fetchone()
                             if r:
-                                update_row_by_pa_id(conn, r[0], pa_update)
+                                update_row_by_pa_id(conn, r[0], pa_update, commit=False)
+                                _maybe_commit()
                                 matched = True
                     except Exception:
                         pass
@@ -778,7 +795,8 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                             )
                             r = cur.fetchone()
                             if r:
-                                update_row_by_pa_id(conn, r[0], pa_update)
+                                update_row_by_pa_id(conn, r[0], pa_update, commit=False)
+                                _maybe_commit()
                                 matched = True
                         except Exception:
                             pass
@@ -800,6 +818,9 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                 if 'batter_name' not in pitch_row or not pitch_row.get('batter_name'):
                     pitch_row['batter_name'] = resolve_player_name(game_pk, pitch_row.get('batter_id'), role='batter')
                 pitch_inserts.append(pitch_row)
+
+    # Final commit for any remaining uncommitted updates
+    conn.commit()
 
     if pitch_inserts:
         insert_rows(conn, 'pitching_appearances', pitch_inserts)
@@ -870,58 +891,101 @@ def fetch_sprint_speeds(season: int, conn: sqlite3.Connection):
         return 0
 
 
-def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bool = False, progress_cb=None):
+def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bool = False, progress_cb=None, games=None):
+    """Ingest game feeds and enrich with statcast.
+
+    Parameters
+    ----------
+    games : list, optional
+        Pre-fetched schedule games list. When provided the internal
+        ``fetch_schedule`` call is skipped, avoiding a duplicate API hit.
+    """
     create_db()
-    conn = sqlite3.connect(DB_PATH)
-    games = fetch_schedule(start_date, end_date, only_completed=only_completed)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+
+    if games is None:
+        games = fetch_schedule(start_date, end_date, only_completed=only_completed)
 
     # Populate the games table with schedule-level metadata
     _insert_games(conn, games, season)
 
-    total = len(games)
-    for i, g in enumerate(games):
-        game_pk = g.get('gamePk')
-        if progress_cb:
-            progress_cb('raw_game', i, total, game_pk)
-        try:
-            feed = fetch_game_feed(game_pk)
-        except Exception as e:
-            print('Warning: failed to fetch feed for', game_pk, e)
-            continue
-        pas = parse_plays_to_pas(feed, season)
-        if pas:
-            insert_rows(conn, 'plate_appearances', pas)
-            # Update pitchers reference table with throwing hand information
-            try:
-                cur = conn.cursor()
-                pitchers_map = {}
-                for r in pas:
-                    pid = r.get('pitcher_id')
-                    if pid is None:
-                        continue
-                    p_throws = r.get('p_throws')
-                    pname = r.get('pitcher_name')
-                    # prefer first observed non-empty p_throws for a pitcher in this batch
-                    if p_throws and pid not in pitchers_map:
-                        pitchers_map[pid] = (pname or '', p_throws)
+    # ── Determine which games actually need ingestion ──
+    existing_game_ids: set = set()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT game_id FROM plate_appearances")
+        existing_game_ids = {r[0] for r in cur.fetchall()}
+    except Exception:
+        pass
 
-                for pid, (pname, p_throws) in pitchers_map.items():
-                    cur.execute('SELECT p_throws FROM pitchers WHERE pitcher_id = ?', (pid,))
-                    ex = cur.fetchone()
-                    if not ex:
-                        cur.execute('INSERT OR REPLACE INTO pitchers (pitcher_id, pitcher_name, p_throws) VALUES (?, ?, ?)', (pid, pname, p_throws))
-                    else:
-                        # only update if existing value is empty/NULL and we have a new value
-                        if (ex[0] is None or ex[0] == '') and p_throws:
-                            cur.execute('UPDATE pitchers SET p_throws = ?, pitcher_name = ? WHERE pitcher_id = ?', (p_throws, pname, pid))
-                conn.commit()
-            except Exception:
-                pass
-        # parse and insert stolen-base events (stolen_bases table)
-        steals = parse_stolen_events(feed, season)
-        if steals:
-            insert_rows(conn, 'stolen_bases', steals)
-        time.sleep(0.5)
+    games_to_fetch = []
+    for g in games:
+        game_pk = g.get('gamePk')
+        if str(game_pk) not in existing_game_ids:
+            games_to_fetch.append(g)
+        else:
+            print(f'  Skipping game {game_pk} (already ingested)')
+
+    total = len(games_to_fetch)
+    if total == 0:
+        print('All games already ingested — skipping feed fetches.')
+    else:
+        # ── Fetch game feeds in parallel ──
+        feeds: dict = {}  # game_pk → feed json
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            future_to_pk = {
+                pool.submit(fetch_game_feed, g.get('gamePk')): g.get('gamePk')
+                for g in games_to_fetch
+            }
+            for fut in as_completed(future_to_pk):
+                gpk = future_to_pk[fut]
+                try:
+                    feeds[gpk] = fut.result()
+                except Exception as e:
+                    print(f'Warning: failed to fetch feed for {gpk}: {e}')
+
+        # ── Process feeds sequentially (DB writes) ──
+        for i, g in enumerate(games_to_fetch):
+            game_pk = g.get('gamePk')
+            if progress_cb:
+                progress_cb('raw_game', i, total, game_pk)
+
+            feed = feeds.get(game_pk)
+            if feed is None:
+                continue
+
+            pas = parse_plays_to_pas(feed, season)
+            if pas:
+                insert_rows(conn, 'plate_appearances', pas, commit=False)
+                # Update pitchers reference table with throwing hand information
+                try:
+                    cur = conn.cursor()
+                    pitchers_map = {}
+                    for r in pas:
+                        pid = r.get('pitcher_id')
+                        if pid is None:
+                            continue
+                        p_throws = r.get('p_throws')
+                        pname = r.get('pitcher_name')
+                        if p_throws and pid not in pitchers_map:
+                            pitchers_map[pid] = (pname or '', p_throws)
+
+                    for pid, (pname, p_throws) in pitchers_map.items():
+                        cur.execute('SELECT p_throws FROM pitchers WHERE pitcher_id = ?', (pid,))
+                        ex = cur.fetchone()
+                        if not ex:
+                            cur.execute('INSERT OR REPLACE INTO pitchers (pitcher_id, pitcher_name, p_throws) VALUES (?, ?, ?)', (pid, pname, p_throws))
+                        else:
+                            if (ex[0] is None or ex[0] == '') and p_throws:
+                                cur.execute('UPDATE pitchers SET p_throws = ?, pitcher_name = ? WHERE pitcher_id = ?', (p_throws, pname, pid))
+                except Exception:
+                    pass
+            steals = parse_stolen_events(feed, season)
+            if steals:
+                insert_rows(conn, 'stolen_bases', steals, commit=False)
+
+        # Single commit for all game data
+        conn.commit()
 
     if progress_cb:
         progress_cb('statcast', 0, 1, None)
