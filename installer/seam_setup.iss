@@ -27,6 +27,7 @@ SetupIconFile=..\app\assets\Logo.ico
 UninstallDisplayIcon={app}\SeamAnalytics\{#MyAppExeName}
 WizardStyle=modern
 PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed=x64compatible
 LicenseFile=
 ; Estimated installed size (MB): ~450 app + ~780 databases
@@ -47,8 +48,8 @@ Source: "dist\SeamAnalytics\*"; DestDir: "{app}\SeamAnalytics"; Flags: ignorever
 Source: "dist\SeamUpdater\*"; DestDir: "{app}\SeamUpdater"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ── Pre-loaded databases → user data dir ──────────────────────────────
-Source: "..\app\mlb_raw.db";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion; Check: ShouldInstallDB('mlb_raw.db')
-Source: "..\app\mlb_calculated.db"; DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion; Check: ShouldInstallDB('mlb_calculated.db')
+Source: "..\app\mlb_raw.db";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallDB('mlb_raw.db')
+Source: "..\app\mlb_calculated.db"; DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallDB('mlb_calculated.db')
 
 [Dirs]
 Name: "{localappdata}\SeamAnalytics"
@@ -78,10 +79,22 @@ Type: files;          Name: "{localappdata}\SeamAnalytics\temp_lineups_cache.jso
 Type: files;          Name: "{localappdata}\SeamAnalytics\processed_dates.pkl"
 
 [Code]
-// Only install a DB if it doesn't already exist (don't overwrite user data on upgrade)
+// Only install a DB if it doesn't already exist with real data (don't overwrite user data on upgrade)
 function ShouldInstallDB(DBName: String): Boolean;
+var
+  Path: String;
+  FindRec: TFindRec;
 begin
-  Result := not FileExists(ExpandConstant('{localappdata}\SeamAnalytics\') + DBName);
+  Path := ExpandConstant('{localappdata}\SeamAnalytics\') + DBName;
+  if FindFirst(Path, FindRec) then
+  begin
+    // File exists — install only if it's a 0-byte stub from a failed run
+    Result := (FindRec.SizeHigh = 0) and (FindRec.SizeLow = 0);
+    FindClose(FindRec);
+  end
+  else
+    // File doesn't exist — install it
+    Result := True;
 end;
 
 // ── Custom time-picker page for scheduled updates ──

@@ -5492,8 +5492,9 @@ class SeamStatsApp(QMainWindow):
 
         # start background prefetch of lineups and weather (best-effort)
         try:
-            _bg_pool.submit(_DM.prefetch_lineups, self._games)
+            self._lineup_prefetch_future = _bg_pool.submit(_DM.prefetch_lineups, self._games)
         except Exception:
+            self._lineup_prefetch_future = None
             log.exception("_sidebar")
         try:
             _bg_pool.submit(prefetch_weather)
@@ -5533,6 +5534,12 @@ class SeamStatsApp(QMainWindow):
         def _fetch_lb():
             hit_lbs, pit_lbs, br_lbs = [], [], []
             try:
+                # Wait for lineup prefetch to finish so cache files are available
+                if getattr(self, '_lineup_prefetch_future', None):
+                    try:
+                        self._lineup_prefetch_future.result(timeout=60)
+                    except Exception:
+                        pass
                 pt = _DM.get_todays_player_info(self._games)
                 if pt:
                     _fmt_avg = lambda v: f"{v:.3f}" if isinstance(v, float) else str(v)
@@ -5979,6 +5986,10 @@ class SeamStatsApp(QMainWindow):
         """Replace placeholder leaderboard pages with real data."""
         try:
             hit_lbs, pit_lbs, br_lbs = result
+            # If all empty, allow retry on next tab visit
+            if not hit_lbs and not pit_lbs and not br_lbs:
+                self._lb_fetched = False
+                return
             replacements = [
                 (self.IDX_HIT,   "Top Stats - Hitting",
                  "2026 season · all qualified hitters", hit_lbs),
