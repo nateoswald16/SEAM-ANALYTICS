@@ -21,6 +21,13 @@ All notable changes to Seam Analytics are documented here.
 - Live/final games still show "Loading plays…" until data arrives
 - Simplified card resize logic — all cards use dynamic content-based sizing
 
+**Probable Lineup Logic**
+- When confirmed lineups are unavailable, probable starters are inferred from season PA counts per position
+- Only active game-day roster players (from boxscore) are considered — IL/optioned players are skipped
+- Falls back to next-highest PA player if the leader is inactive
+- Probable catcher is used by Base Running and BvP tabs for accurate defensive matchup data
+- Batting tab continues to display all active roster players until lineups are confirmed
+
 ### Weather System Overhaul
 
 **Weather Providers**
