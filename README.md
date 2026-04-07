@@ -44,8 +44,8 @@
 **Prerequisites:** Python 3.13+ and Git
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SeamAnalytics.git
-cd SeamAnalytics
+git clone https://github.com/nateoswald16/SEAM-ANALYTICS.git
+cd SEAM-ANALYTICS
 python -m venv .venv
 .venv\Scripts\activate        # Windows
 pip install -r app/requirements.txt
