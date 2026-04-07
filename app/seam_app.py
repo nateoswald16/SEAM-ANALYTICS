@@ -5304,10 +5304,12 @@ class SeamStatsApp(QMainWindow):
             f"<h3>Seam Analytics</h3>"
             f"<p>Version {_app_paths.APP_VERSION}</p>"
         )
+        from PyQt6.QtCore import QLibraryInfo
+        qt_ver = QLibraryInfo.version().toString()
         msg.setInformativeText(
             f"MLB Stats Desktop App\n\n"
             f"Python {sys.version.split()[0]}\n"
-            f"PyQt6 {Qt.qVersion()}\n\n"
+            f"PyQt6 {qt_ver}\n\n"
             f"Data: MLB Stats API · Baseball Savant\n"
             f"© 2026 Seam Analytics"
         )

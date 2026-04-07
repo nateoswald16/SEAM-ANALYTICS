@@ -20,10 +20,15 @@ from datetime import datetime, timezone
 from urllib3.util.retry import Retry
 
 # Shared session with automatic retries on transient failures
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[502, 503, 504, 429])
+_retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504, 429])
 _http = requests.Session()
 _http.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
 _http.mount("http://", requests.adapters.HTTPAdapter(max_retries=_retry))
+
+# Separate fast session for Open-Meteo (no retries — fail fast if down)
+_http_om = requests.Session()
+_http_om.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
+_http_om.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
 
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
@@ -274,6 +279,9 @@ def _compass_to_mlb_wind(deg: float) -> str:
     return best[1]
 
 
+_om_circuit_open = True   # False → Open-Meteo known unreachable, skip calls
+
+
 def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
     """Fetch forecast data from Open-Meteo.
 
@@ -282,6 +290,9 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
     (forecast_temp, forecast_wind_speed, forecast_wind_deg,
     forecast_condition) for the hour closest to game time.
     """
+    global _om_circuit_open
+    if not _om_circuit_open:
+        return {}
     try:
         url = (
             f"https://api.open-meteo.com/v1/forecast?"
@@ -292,7 +303,7 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
             f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
             f"&forecast_days=2&timezone=auto"
         )
-        r = _http.get(url, timeout=8)
+        r = _http_om.get(url, timeout=3)
         r.raise_for_status()
         data = r.json()
 
@@ -344,6 +355,7 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None):
 
         return result
     except Exception:
+        _om_circuit_open = False   # trip circuit — skip remaining calls
         return {}
 
 
@@ -355,11 +367,13 @@ def fetch_park_weather(date_str: str) -> list[dict]:
     venue_id, lat, lon, elevation, roof_type, temp, condition,
     wind_speed, wind_dir, wind_angle, precip_pct, pressure_hpa.
     """
+    global _om_circuit_open
+    _om_circuit_open = True   # reset circuit breaker for each fetch cycle
     try:
         url = (
             "https://statsapi.mlb.com/api/v1/schedule"
             f"?sportId=1&date={date_str}"
-            "&hydrate=probablePitcher,venue,weather,team"
+            "&hydrate=probablePitcher,venue(location,fieldInfo),weather,team"
         )
         r = _http.get(url, timeout=10)
         r.raise_for_status()
@@ -470,11 +484,22 @@ def fetch_park_weather(date_str: str) -> list[dict]:
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=6) as pool:
         futs = {pool.submit(_process, g): g for g in raw_games}
-        for f in as_completed(futs, timeout=30):
-            try:
-                results.append(f.result())
-            except Exception:
-                pass
+        try:
+            for f in as_completed(futs, timeout=20):
+                try:
+                    results.append(f.result())
+                except Exception:
+                    pass
+        except TimeoutError:
+            # Return whatever games finished in time
+            for f in futs:
+                if f.done() and not f.exception():
+                    try:
+                        r = f.result()
+                        if r not in results:
+                            results.append(r)
+                    except Exception:
+                        pass
 
     results.sort(key=lambda x: x.get("time", "TBD"))
     return results
