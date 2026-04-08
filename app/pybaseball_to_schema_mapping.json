@@ -303,7 +303,8 @@
     "mapped_to": "plate_appearances.bat_speed"
   },
   "swing_length": {
-    "mapped_to": "plate_appearances.swing"
+    "mapped_to": null,
+    "note": "bat tracking metric, not a boolean swing flag"
   },
   "estimated_slg_using_speedangle": {
     "mapped_to": null,
@@ -397,7 +398,8 @@
     "suggested_add": "plate_appearances.attack_direction"
   },
   "swing_path_tilt": {
-    "mapped_to": "plate_appearances.swing"
+    "mapped_to": null,
+    "note": "bat tracking metric, not a boolean swing flag"
   },
   "intercept_ball_minus_batter_pos_x_inches": {
     "mapped_to": null,

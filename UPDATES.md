@@ -6,12 +6,41 @@ All notable changes to Seam Analytics are documented here.
 
 ## v1.0.3-beta — 2026-04-08
 
+### Game Detail
+
+**BvP Contact% & Whiff% Fix**
+- Fixed Contact% and Whiff% showing 0% / blank on all BvP pages
+- Root cause: `plate_appearances.swing` was incorrectly mapped to `swing_length` (a bat-tracking float like 73.4) instead of actual swing counts; `contact` was never populated
+- Corrected field mapping — `swing_length` and `swing_path_tilt` are now unmapped from plate appearances
+- Added per-PA swing and contact aggregation from Statcast pitch descriptions during enrichment
+- Backfilled swing/contact counts for ~960K existing plate appearances across 2021–2026
+
+**Team Toggle Fix**
+- Fixed home/away toggle not switching tables on Base Runners and BvP subpages
+- Only the currently visible subpage's stack is fade-animated; non-visible stacks switch instantly via direct index change
+- Newly built tabs now sync with the current toggle state immediately after construction
+
+**Game Switching Crash Fix**
+- Fixed `RuntimeError: wrapped C/C++ object of type QStackedWidget has been deleted` crash when loading 3+ games in a row
+- Added generation counter (`_load_gen`) to reject stale background data signals from previous game loads
+- All stack widget references are nullified before `deleteLater()` to prevent dangling pointer access
+- Signal handler and tab builder wrapped in RuntimeError/SystemError guards
+
+**Corrupt Cache Handling**
+- Lineup cache files with invalid JSON are now detected, deleted, and re-fetched instead of crashing
+
 ### Park & Weather
 
 **Open-Meteo Double Conversion Fix**
 - Fixed hourly temperature and wind speed being double-converted when served by Open-Meteo (fallback provider)
 - The API request already specifies `temperature_unit=fahrenheit` and `wind_speed_unit=mph`, but the hourly slot code was still applying C→F and km/h→mph conversions on top
 - Most visible at non-US venues (e.g. Toronto) where NWS is unavailable and Open-Meteo is the primary source — 40°F was displayed as 104°F
+
+### Data Pipeline
+
+**Historical Statcast Data**
+- Downloaded complete Statcast pitch-level data for 2021–2025 seasons (~3.5M pitches, ~4GB)
+- Rebuilt calculated pitching database with advanced stats (barrel%, zone%, whiff%, velo) for 2025
 
 ---
 

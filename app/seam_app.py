@@ -1880,8 +1880,14 @@ class DataManager:
             if os.path.exists(cache_file):
                 with open(cache_file, 'r', encoding='utf-8') as f:
                     lineup_data = json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            log.warning("Corrupt lineup cache %s — deleting", cache_file)
+            try:
+                os.remove(cache_file)
+            except OSError:
+                pass
         except Exception:
-            log.exception("_fmt_ip")
+            log.exception("get_bvp_data: lineup cache")
 
         players = {}
         if lineup_data:
@@ -1947,8 +1953,8 @@ class DataManager:
                   SUM(COALESCE(is_triple,0)) as triples,
                   SUM(COALESCE(is_home_run,0)) as hrs,
                   SUM(COALESCE(earned_runs,0)) as er,
-                  SUM(CASE WHEN swing=1 AND contact=0 THEN 1 ELSE 0 END) as whiffs,
-                  SUM(CASE WHEN swing=1 THEN 1 ELSE 0 END) as swings,
+                  SUM(COALESCE(swing, 0)) - SUM(COALESCE(contact, 0)) as whiffs,
+                  SUM(COALESCE(swing, 0)) as swings,
                   SUM(COALESCE(is_ab,0)) as ab,
                   SUM(COALESCE(total_bases,0)) as tb,
                   SUM(COALESCE(is_sac_fly,0)) as sf,
@@ -3958,13 +3964,26 @@ class GameDetailPanel(QWidget):
         self._game_data_notifier.data_ready.connect(self._on_game_data_ready)
         self._pending_data = None  # holds fetched data dict for lazy tab builds
         self._built_tabs = set()   # indices of tabs whose widgets have been built
+        self._load_gen = 0          # incremented every load_game; stale signals ignored
  
     def load_game(self, game: dict):
+        self._load_gen += 1
         # remember current game for async updates
         try:
             self._current_game = game
         except Exception:
             self._current_game = None
+        # Nullify references to old stacks before deleting widgets so stale
+        # signal handlers never touch already-deleted C++ objects.
+        self._inner_stack = None
+        self._pending_data = None
+        self._built_tabs = set()
+        for attr in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack',
+                      '_br_tables', '_bvp_tables'):
+            try:
+                setattr(self, attr, None)
+            except Exception:
+                pass
         while self._vl.count():
             item = self._vl.takeAt(0)
             if item.widget():
@@ -4016,11 +4035,10 @@ class GameDetailPanel(QWidget):
 
         self._vl.addWidget(inner, 1)
         self._current_subnav_idx = 0
-        self._built_tabs = set()
-        self._pending_data = None
 
         # Fetch data in background thread
         notifier = self._game_data_notifier
+        gen = self._load_gen
         def _fetch():
             data = {'game': game, 'away': away, 'home': home,
                     'away_p': away_p, 'home_p': home_p,
@@ -4121,7 +4139,7 @@ class GameDetailPanel(QWidget):
             except Exception:
                 data['seasons'] = []
 
-            notifier.data_ready.emit(data)
+            notifier.data_ready.emit({'_gen': gen, **data})
 
         _bg_pool.submit(_fetch)
 
@@ -4191,50 +4209,55 @@ class GameDetailPanel(QWidget):
 
     def _on_game_data_ready(self, data):
         """Slot: called on main thread when background data fetch completes."""
-        # Discard stale results if user clicked a different game
-        cur = getattr(self, '_current_game', None)
-        if not cur or cur.get('game_id') != data.get('game', {}).get('game_id'):
-            return
+        try:
+            if _is_deleted(self):
+                return
+            # Reject stale results from a previous load_game call
+            if data.get('_gen') != self._load_gen:
+                return
+            inner = getattr(self, '_inner_stack', None)
+            if not inner or _is_deleted(inner):
+                return
 
-        self._pending_data = data
-        away = data['away']
-        home = data['home']
-        away_p = data['away_p']
-        home_p = data['home_p']
-        away_p_throws = data['away_p_throws']
-        home_p_throws = data['home_p_throws']
+            self._pending_data = data
+            away = data['away']
+            home = data['home']
+            away_p = data['away_p']
+            home_p = data['home_p']
+            away_p_throws = data['away_p_throws']
+            home_p_throws = data['home_p_throws']
 
-        def _sp_tag(name, hand):
-            h = f" {hand}" if hand else ""
-            return f"{name}{h}"
-        self._away_title = f"{away}  vs  {_sp_tag(home_p, home_p_throws)}"
-        self._home_title = f"{home}  vs  {_sp_tag(away_p, away_p_throws)}"
-        self._bat_away = away
-        self._bat_home = home
-        self._pit_away_name = away
-        self._pit_home_name = home
-        self._br_away_name = away
-        self._br_home_name = home
-        self._bvp_away_name = away
-        self._bvp_home_name = home
-        self._bvp_away_p = away_p
-        self._bvp_home_p = home_p
+            def _sp_tag(name, hand):
+                h = f" {hand}" if hand else ""
+                return f"{name}{h}"
+            self._away_title = f"{away}  vs  {_sp_tag(home_p, home_p_throws)}"
+            self._home_title = f"{home}  vs  {_sp_tag(away_p, away_p_throws)}"
+            self._bat_away = away
+            self._bat_home = home
+            self._pit_away_name = away
+            self._pit_home_name = home
+            self._br_away_name = away
+            self._br_home_name = home
+            self._bvp_away_name = away
+            self._bvp_home_name = home
+            self._bvp_away_p = away_p
+            self._bvp_home_p = home_p
 
-        inner = self._inner_stack
+            # Update season combobox if DB returned additional seasons
+            seasons = data.get('seasons', [])
+            if seasons and hasattr(self, 'season_cb'):
+                cur_items = [self.season_cb.itemText(i) for i in range(self.season_cb.count())]
+                if cur_items != seasons:
+                    self.season_cb.blockSignals(True)
+                    self.season_cb.clear()
+                    for s in seasons:
+                        self.season_cb.addItem(s)
+                    self.season_cb.blockSignals(False)
 
-        # Update season combobox if DB returned additional seasons
-        seasons = data.get('seasons', [])
-        if seasons and hasattr(self, 'season_cb'):
-            cur_items = [self.season_cb.itemText(i) for i in range(self.season_cb.count())]
-            if cur_items != seasons:
-                self.season_cb.blockSignals(True)
-                self.season_cb.clear()
-                for s in seasons:
-                    self.season_cb.addItem(s)
-                self.season_cb.blockSignals(False)
-
-        # Build the currently visible tab (0 = batting by default)
-        self._build_tab(self._current_subnav_idx)
+            # Build the currently visible tab (0 = batting by default)
+            self._build_tab(self._current_subnav_idx)
+        except (RuntimeError, SystemError):
+            pass  # C++ object deleted during signal dispatch
 
     def _scroll_page(self, widget):
         sa = SmoothScrollArea()
@@ -4250,9 +4273,10 @@ class GameDetailPanel(QWidget):
                 return
             if idx in self._built_tabs or not self._pending_data:
                 return
-            if _is_deleted(self._inner_stack):
+            inner = getattr(self, '_inner_stack', None)
+            if not inner or _is_deleted(inner):
                 return
-        except RuntimeError:
+        except (RuntimeError, SystemError):
             return
         self._built_tabs.add(idx)
         data = self._pending_data
@@ -4448,6 +4472,12 @@ class GameDetailPanel(QWidget):
             old.deleteLater()
         if not _is_deleted(inner):
             inner.setCurrentIndex(self._current_subnav_idx)
+        # Sync newly-built stack with current team toggle state
+        toggle_idx = 1 if getattr(self, '_home_btn', None) and self._home_btn.isChecked() else 0
+        for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack'):
+            stack = getattr(self, stack_name, None)
+            if stack and not _is_deleted(stack) and stack.currentIndex() != toggle_idx:
+                stack.setCurrentIndex(toggle_idx)
 
     def _on_filters_changed(self, *args):
         """Unified handler for filter change events — refresh only the active tab."""
@@ -4540,15 +4570,20 @@ class GameDetailPanel(QWidget):
             idx = 0 if which == 'away' else 1
             self._away_btn.setChecked(which == 'away')
             self._home_btn.setChecked(which == 'home')
+            subnav = getattr(self, '_current_subnav_idx', 0)
+            _stack_map = {0: '_team_stack', 1: '_pit_stack', 2: '_br_stack', 3: '_bvp_stack'}
+            visible_name = _stack_map.get(subnav)
             for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack'):
                 stack = getattr(self, stack_name, None)
                 if stack and not _is_deleted(stack):
-                    _fade_switch(stack, idx)
-                    # Defer resize until after the fade completes
-                    QTimer.singleShot(160, lambda s=stack: (
-                        s.setFixedHeight(s.currentWidget().sizeHint().height())
-                        if not _is_deleted(s) and s.currentWidget() else None,
-                        s.updateGeometry() if not _is_deleted(s) else None))
+                    if stack_name == visible_name:
+                        _fade_switch(stack, idx)
+                        QTimer.singleShot(320, lambda s=stack: (
+                            s.setFixedHeight(s.currentWidget().sizeHint().height())
+                            if not _is_deleted(s) and s.currentWidget() else None,
+                            s.updateGeometry() if not _is_deleted(s) else None))
+                    else:
+                        stack.setCurrentIndex(idx)
             self._update_team_toggle_style()
         except (RuntimeError, SystemError):
             pass  # C++ object deleted
@@ -4599,7 +4634,9 @@ class GameDetailPanel(QWidget):
             # Recycle existing table widgets if columns match
             away_w = stack.widget(0) if stack.count() > 0 else None
             home_w = stack.widget(1) if stack.count() > 1 else None
-            if away_w and hasattr(away_w, '_table') and away_w._table._cols == new_cols:
+            if (away_w and home_w and
+                    hasattr(away_w, '_table') and hasattr(home_w, '_table') and
+                    away_w._table._cols == new_cols):
                 away_w._table.set_data(new_away)
                 home_w._table.set_data(new_home)
             else:
@@ -4659,7 +4696,9 @@ class GameDetailPanel(QWidget):
             cur_idx = stack.currentIndex()
             away_w = stack.widget(0) if stack.count() > 0 else None
             home_w = stack.widget(1) if stack.count() > 1 else None
-            if away_w and hasattr(away_w, '_table') and away_w._table._cols == new_cols:
+            if (away_w and home_w and
+                    hasattr(away_w, '_table') and hasattr(home_w, '_table') and
+                    away_w._table._cols == new_cols):
                 away_w._table.set_data(new_away)
                 home_w._table.set_data(new_home)
             else:

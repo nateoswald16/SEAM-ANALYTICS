@@ -901,6 +901,41 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
 
     if pitch_inserts:
         insert_rows(conn, 'pitching_appearances', pitch_inserts)
+
+    # ── Per-PA swing/contact count aggregation ──────────────────────────────
+    # swing  = total pitches where the batter swung (foul, whiff, in-play)
+    # contact = total pitches where the batter made contact (foul, in-play)
+    _swing_descs = frozenset(['swinging_strike', 'swinging_strike_blocked',
+                              'foul_tip', 'foul', 'foul_bunt',
+                              'hit_into_play', 'hit_into_play_score',
+                              'hit_into_play_no_out', 'missed_bunt'])
+    _contact_descs = frozenset(['foul', 'foul_bunt', 'foul_tip',
+                                'hit_into_play', 'hit_into_play_score',
+                                'hit_into_play_no_out'])
+    if 'description' in df.columns:
+        _sw = df['description'].isin(_swing_descs).astype(int)
+        _ct = df['description'].isin(_contact_descs).astype(int)
+        _agg = df.assign(_sw=_sw, _ct=_ct).groupby(
+            ['game_pk', 'batter', 'at_bat_number'], as_index=False
+        ).agg(swing=('_sw', 'sum'), contact=('_ct', 'sum'))
+        _uncommitted = 0
+        for _, row in _agg.iterrows():
+            try:
+                gp, bat, abn = int(row['game_pk']), int(row['batter']), int(row['at_bat_number'])
+                pa_index = abn - 1 if abn > 0 else abn
+                pa_id = f"{gp}_{bat}_{pa_index}"
+            except Exception:
+                continue
+            update_row_by_pa_id(conn, pa_id, {
+                'swing': int(row['swing']),
+                'contact': int(row['contact'])
+            }, commit=False)
+            _uncommitted += 1
+            if _uncommitted >= 500:
+                conn.commit()
+                _uncommitted = 0
+        conn.commit()
+
     print('Enrichment complete')
 
 
