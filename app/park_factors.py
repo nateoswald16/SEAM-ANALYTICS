@@ -680,14 +680,12 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     h_ws = wspeeds[gi] if gi < len(wspeeds) else None
                     h_wd_deg = wdirs[gi] if gi < len(wdirs) else None
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
-                    if h_ws is not None:
-                        h_ws = round(h_ws * 0.621371)  # km/h → mph
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
                         "night": is_night,
-                        "temp": round(h_temp * 9/5 + 32) if h_temp is not None else None,
-                        "wind_speed": h_ws,
+                        "temp": round(h_temp) if h_temp is not None else None,
+                        "wind_speed": round(h_ws) if h_ws is not None else None,
                         "wind_dir": h_wd_mlb,
                     })
                 result["hourly_conditions"] = hourly_conds

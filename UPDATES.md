@@ -4,6 +4,17 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.0.3-beta — 2026-04-08
+
+### Park & Weather
+
+**Open-Meteo Double Conversion Fix**
+- Fixed hourly temperature and wind speed being double-converted when served by Open-Meteo (fallback provider)
+- The API request already specifies `temperature_unit=fahrenheit` and `wind_speed_unit=mph`, but the hourly slot code was still applying C→F and km/h→mph conversions on top
+- Most visible at non-US venues (e.g. Toronto) where NWS is unavailable and Open-Meteo is the primary source — 40°F was displayed as 104°F
+
+---
+
 ## v1.0.2-beta — 2026-04-07
 
 > **Database refresh recommended.** This release includes significant changes to database calculations and structure (barrel heuristic, foul ball exclusion, hitData extraction, historical re-enrichment). When running the installer, check **"Replace local databases with the latest bundled data"** to get the corrected datasets. You can also use the in-app Update Data button after installing.
