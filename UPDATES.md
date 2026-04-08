@@ -4,6 +4,36 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.0.2-beta — 2026-04-07
+
+### Game Tracker
+
+**Live Card Stability**
+- Fixed cards reverting to pre-game state (all dashes) during inning transitions or API hiccups
+- New `_merge_game()` preserves `status` and `innings_detail` when the MLB API temporarily returns empty data for a live game
+- Applied to both sidebar cards and schedule page cards
+
+**Live Detection Overhaul**
+- Added `abstractGameState` from the MLB API (`Preview`, `Live`, `Final`) as the primary live-game signal
+- Centralized all live checks into a shared `_is_game_live()` helper — replaces 8+ scattered inline checks
+- Now correctly detects live games during manager challenges, umpire reviews, and other non-"In Progress" states
+- Fixed `live` flag in `fetch_live_games()` which was always `False` (checked time string instead of API status)
+
+**Uniform Card Sizing**
+- All schedule cards (pre-game, live, final) now share a consistent fixed height
+- Class-level collapsed height tracker ensures every card matches the tallest layout
+- Removed per-state height overrides — all cards sized via a single `_resize_for_expansion()` path
+- Cards still resize dynamically when the play log is expanded
+
+### Park & Weather
+
+**Wind Arrow Cycling**
+- Mini-ballpark wind arrows now update when the hourly weather overlay cycles to a new hour
+- Arrow direction, color (hitter/pitcher friendly), and wind speed all refresh in sync with the cycling weather icon and detail text
+- Fixed sea-level venues (e.g. Oracle Park) showing "--" for altitude instead of "0 ft"
+
+---
+
 ## v1.0.1-beta — 2026-04-07
 
 ### Navigation & Game Tracker

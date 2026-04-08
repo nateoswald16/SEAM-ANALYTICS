@@ -16,7 +16,7 @@ import threading
 import requests
 import requests.adapters
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib3.util.retry import Retry
 
 # Shared session with automatic retries on transient failures
@@ -431,7 +431,7 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
                 hourly_conds = []
                 for p in window:
                     pdt = _period_dt(p)
-                    h_lbl = pdt.strftime("%I %p").lstrip("0")
+                    h_lbl = pdt.astimezone().strftime("%I %p").lstrip("0")
                     cond_txt = p.get("shortForecast", "")
                     pr = p.get("probabilityOfPrecipitation", {}).get("value") or 0
                     # Parse wind speed from NWS string like "5 mph" or "5 to 10 mph"
@@ -558,7 +558,11 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 game_dt = datetime.fromisoformat(
                     game_utc_iso.replace("Z", "+00:00"))
                 game_local = game_dt.astimezone()
-                game_hour = game_local.strftime("%Y-%m-%dT%H:00")
+                # Venue timezone from Open-Meteo response
+                _ofs = data.get("utc_offset_seconds", 0) or 0
+                _venue_tz = timezone(timedelta(seconds=_ofs))
+                game_venue = game_dt.astimezone(_venue_tz)
+                game_hour = game_venue.strftime("%Y-%m-%dT%H:00")
                 # Find start index
                 if game_hour in times:
                     idx = times.index(game_hour)
@@ -566,7 +570,7 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     idx = min(range(len(times)),
                               key=lambda i: abs(
                                   datetime.fromisoformat(times[i]).hour
-                                  - game_local.hour
+                                  - game_venue.hour
                                   + (0 if times[i][:10] == game_hour[:10]
                                      else 24)))
                 # Collect indices for the ~4-hour game window
@@ -615,7 +619,9 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     t_str = times[gi] if gi < len(times) else ""
                     try:
                         h_dt = datetime.fromisoformat(t_str)
-                        h_lbl = h_dt.strftime("%I %p").lstrip("0")
+                        # Display in user's local timezone
+                        h_dt_aware = h_dt.replace(tzinfo=_venue_tz)
+                        h_lbl = h_dt_aware.astimezone().strftime("%I %p").lstrip("0")
                         is_night = h_dt.hour >= 19 or h_dt.hour < 6
                     except Exception:
                         h_lbl = ""
@@ -729,7 +735,19 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 game_dt = datetime.fromisoformat(
                     game_utc_iso.replace("Z", "+00:00"))
                 game_local = game_dt.astimezone()
-                game_hour_str = game_local.strftime("%Y-%m-%d %H:00")
+                # Compute venue UTC offset from WeatherAPI location data
+                _wa_loc = data.get("location", {})
+                _wa_epoch = _wa_loc.get("localtime_epoch")
+                _wa_lstr = _wa_loc.get("localtime", "")
+                if _wa_epoch and _wa_lstr:
+                    _wa_utc_naive = datetime.utcfromtimestamp(_wa_epoch)
+                    _wa_loc_naive = datetime.fromisoformat(_wa_lstr)
+                    _wa_ofs = round((_wa_loc_naive - _wa_utc_naive).total_seconds())
+                    _wa_venue_tz = timezone(timedelta(seconds=_wa_ofs))
+                else:
+                    _wa_venue_tz = game_local.tzinfo  # fallback: assume same tz
+                game_venue = game_dt.astimezone(_wa_venue_tz)
+                game_hour_str = game_venue.strftime("%Y-%m-%d %H:00")
 
                 # Find starting hour index
                 start_idx = None
@@ -742,7 +760,7 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                         range(len(all_hours)),
                         key=lambda i: abs(
                             datetime.fromisoformat(
-                                all_hours[i]["time"]).hour - game_local.hour
+                                all_hours[i]["time"]).hour - game_venue.hour
                             + (0 if all_hours[i]["time"][:10] == game_hour_str[:10]
                                else 24)),
                     )
@@ -791,7 +809,9 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     t_str = wh.get("time", "")
                     try:
                         h_dt = datetime.fromisoformat(t_str)
-                        h_lbl = h_dt.strftime("%I %p").lstrip("0")
+                        # Display in user's local timezone
+                        h_dt_aware = h_dt.replace(tzinfo=_wa_venue_tz)
+                        h_lbl = h_dt_aware.astimezone().strftime("%I %p").lstrip("0")
                     except Exception:
                         h_lbl = ""
                     cond_txt = wh.get("condition", {}).get("text", "")
@@ -1171,8 +1191,10 @@ class MiniParkWidget(QWidget):
         self._cached_pm: QPixmap | None = None
         self._has_cycle = False
 
+        self._hourly = data.get("hourly_conditions", [])
+
         # Animated weather icon overlay (cycles hourly conditions)
-        hourly = data.get("hourly_conditions", [])
+        hourly = self._hourly
         if len(hourly) > 1:
             # Place overlay centred above the outfield
             ow, oh = 90, 68
@@ -1181,6 +1203,18 @@ class MiniParkWidget(QWidget):
             self._weather_overlay = _WeatherCycleOverlay(hourly, ow, oh, self)
             self._weather_overlay.move(ox, oy)
             self._has_cycle = True
+
+    def set_wind(self, idx: int):
+        """Update wind data from hourly slot *idx* and repaint arrows."""
+        if not self._hourly or idx < 0 or idx >= len(self._hourly):
+            return
+        slot = self._hourly[idx]
+        wd = slot.get("wind_dir", "")
+        self.d["wind_dir"] = wd
+        self.d["wind_angle"] = WIND_ANGLES.get(wd)
+        self.d["wind_speed"] = slot.get("wind_speed", 0)
+        self._cached_pm = None
+        self.update()
 
     # ── geometry constants (computed once) ──
     CX, CY_HOME = 130, 195         # home-plate position
@@ -1310,7 +1344,7 @@ class MiniParkWidget(QWidget):
                     Qt.AlignmentFlag.AlignRight, p_txt)
 
         elev = self.d.get("elevation")
-        e_txt = f"{elev:,} ft" if elev else "-- ft"
+        e_txt = f"{elev:,} ft" if elev is not None else "-- ft"
         p.drawText(QRectF(self.W - 90, 34, 82, 14),
                     Qt.AlignmentFlag.AlignRight, e_txt)
 
@@ -1408,11 +1442,11 @@ class ParkWeatherCard(QFrame):
         vl.addLayout(hdr)
 
         # ── mini park widget ──
-        park = MiniParkWidget(self.d)
+        self._park = MiniParkWidget(self.d)
         pw = QHBoxLayout()
         pw.setContentsMargins(0, 0, 0, 0)
         pw.addStretch()
-        pw.addWidget(park)
+        pw.addWidget(self._park)
         pw.addStretch()
         vl.addLayout(pw)
 
@@ -1425,8 +1459,8 @@ class ParkWeatherCard(QFrame):
         vl.addWidget(self._detail_lbl)
 
         # Connect to MiniParkWidget's overlay for synced cycling
-        if hasattr(park, '_weather_overlay') and park._has_cycle:
-            park._weather_overlay.indexChanged.connect(self._on_hour_change)
+        if hasattr(self._park, '_weather_overlay') and self._park._has_cycle:
+            self._park._weather_overlay.indexChanged.connect(self._on_hour_change)
 
         # ── park factor badge ──
         venue_id = self.d.get("venue_id")
@@ -1487,6 +1521,7 @@ class ParkWeatherCard(QFrame):
 
     def _on_hour_change(self, idx: int):
         self._detail_lbl.setText(self._detail_text(idx))
+        self._park.set_wind(idx)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

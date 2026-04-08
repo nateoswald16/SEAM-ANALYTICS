@@ -250,6 +250,7 @@ class MLBDataEngine:
                                 time_str = "TBD"
                         
                         status = game_info.get('status', {}).get('detailedState', '')
+                        abstract_state = game_info.get('status', {}).get('abstractGameState', '')
                         away_score = game_info.get('teams', {}).get('away', {}).get('score')
                         home_score = game_info.get('teams', {}).get('home', {}).get('score')
                         ls = game_info.get('linescore', {})
@@ -269,6 +270,7 @@ class MLBDataEngine:
                             "home": self._get_team_abbreviation(home_team),
                             "time": time_str,
                             "status": status,
+                            "abstract_state": abstract_state,
                             "away_score": away_score if away_score is not None else 0,
                             "home_score": home_score if home_score is not None else 0,
                             "inning": ls.get('currentInning'),

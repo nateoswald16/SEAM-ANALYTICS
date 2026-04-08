@@ -609,6 +609,72 @@ class DataManager:
         result.sort(key=lambda x: x[2], reverse=True)
         return result[:top_n]
 
+    def get_hr_sb_game_leaderboard(self, player_teams, season=2026, top_n=10):
+        """Top players with most games containing both a HR and a SB.
+
+        Joins plate_appearances (HR) and stolen_bases (successful SB)
+        per player per game, then counts games where both occurred.
+        Returns [(player_name, team_abbrev, game_count), …] sorted desc.
+        """
+        player_ids = list(player_teams.keys())
+        if not player_ids:
+            return []
+        conn = self.connect()
+        if not conn:
+            return []
+        placeholders = ','.join('?' * len(player_ids))
+        query = (
+            f"SELECT hr.batter_id AS pid, COUNT(*) AS games "
+            f"FROM ("
+            f"  SELECT batter_id, game_date"
+            f"  FROM plate_appearances"
+            f"  WHERE season = ? AND batter_id IN ({placeholders})"
+            f"  GROUP BY batter_id, game_date"
+            f"  HAVING MAX(is_home_run) = 1"
+            f") hr "
+            f"INNER JOIN ("
+            f"  SELECT runner_id, game_date"
+            f"  FROM stolen_bases"
+            f"  WHERE season = ? AND runner_id IN ({placeholders})"
+            f"    AND is_successful = 1"
+            f"  GROUP BY runner_id, game_date"
+            f") sb ON hr.batter_id = sb.runner_id AND hr.game_date = sb.game_date "
+            f"GROUP BY hr.batter_id "
+            f"ORDER BY games DESC "
+            f"LIMIT ?"
+        )
+        params = [season] + player_ids + [season] + player_ids + [top_n]
+        try:
+            rows = conn.execute(query, params).fetchall()
+        except Exception:
+            log.exception("get_hr_sb_game_leaderboard")
+            return []
+
+        # resolve player names
+        calc = self.calc_connect()
+        names = {}
+        if calc:
+            ph2 = ','.join('?' * len(player_ids))
+            try:
+                name_rows = calc.execute(
+                    f"SELECT player_id, player_name FROM calculated_batting_stats "
+                    f"WHERE season = ? AND matchup = 'all' AND window = 'season' "
+                    f"AND player_id IN ({ph2})",
+                    [season] + player_ids).fetchall()
+                names = {r[0]: r[1] for r in name_rows}
+            except Exception:
+                pass
+
+        result = []
+        for r in rows:
+            pid, cnt = r[0], r[1]
+            if cnt < 1:
+                continue
+            name = names.get(pid, str(pid))
+            team = player_teams.get(pid, '')
+            result.append((name, team, cnt))
+        return result
+
     def get_most_recent_game_date(self):
         conn = self.connect()
         if not conn:
@@ -643,7 +709,14 @@ class DataManager:
                 home_score = g.get('home_score', 0)
                 # Determine live flag conservatively
                 today = dt.date.today().isoformat()
-                live = (date_str == today and time_str and time_str.upper().startswith('LIVE'))
+                _ast = (g.get('abstract_state') or '').lower()
+                _st_lower = status.lower() if status else ''
+                live = (date_str == today and (
+                    _ast == 'live'
+                    or _st_lower.startswith('in progress')
+                    or _st_lower.startswith('manager challenge')
+                    or _st_lower.startswith('umpire review')
+                ))
                 # Override time display for postponed games
                 postponed = status.lower().startswith('postponed') if status else False
                 if postponed:
@@ -659,6 +732,7 @@ class DataManager:
                     'home_score': int(home_score or 0),
                     'id': gid,
                     'status': status,
+                    'abstract_state': g.get('abstract_state', ''),
                     'inning': g.get('inning'),
                     'inning_half': g.get('inning_half'),
                     'inning_state': g.get('inning_state'),
@@ -2973,9 +3047,7 @@ class GameCard(QFrame):
             _ensure_blink_timer()
 
     def _is_live(self):
-        g = self.game
-        st = (g.get("status") or "").lower()
-        return g.get("live") or g.get("time", "").upper() == "LIVE" or st.startswith("in progress")
+        return _is_game_live(self.game)
  
     def _restyle(self):
         bdr  = C["ora"] if self._sel else C["bdr"]
@@ -3154,6 +3226,8 @@ class GameCard(QFrame):
 
 class ScheduleGameCard(QFrame):
     """Game card for the schedule page with DraftKings betting lines."""
+    _collapsed_height = 0  # class-level: max collapsed height across all cards
+
     def __init__(self, game: dict, idx: int, odds: dict | None, on_click=None, parent=None):
         super().__init__(parent)
         self.game = game
@@ -3192,6 +3266,8 @@ class ScheduleGameCard(QFrame):
         outer.addWidget(self._game_content)
         # Play section (persists across game refreshes)
         self._build_play_section(outer)
+        # Defer initial resize so glow effects don't trigger painter errors
+        QTimer.singleShot(0, self._resize_for_expansion)
 
     def _build_content(self, root):
         g = self.game
@@ -3202,7 +3278,7 @@ class ScheduleGameCard(QFrame):
         is_final = (g.get("time", "").upper() == "FINAL"
                     or st.startswith("final") or st.startswith("game over")
                     or st.startswith("completed"))
-        is_live = g.get("live") or g.get("time", "").upper() == "LIVE" or st.startswith("in progress")
+        is_live = _is_game_live(g)
         show_score = is_live or is_final
         innings_detail = g.get('innings_detail', [])
         has_boxscore = show_score and len(innings_detail) > 0
@@ -3401,9 +3477,6 @@ class ScheduleGameCard(QFrame):
                 box_hl.addWidget(inn_w, 1)
             box_hl.addWidget(rhe_w)
             root.addLayout(box_hl)
-            # Size to content instead of fixed height
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
 
         else:
             if show_score:
@@ -3500,9 +3573,6 @@ class ScheduleGameCard(QFrame):
                 box_hl.addWidget(inn_w, 1)
                 box_hl.addWidget(rhe_w)
                 root.addLayout(box_hl)
-                # Size to content instead of fixed height
-                self.setMinimumHeight(0)
-                self.setMaximumHeight(16777215)
 
     def _build_play_section(self, outer):
         """Build the persistent play-log section (not rebuilt on score refresh)."""
@@ -3587,8 +3657,7 @@ class ScheduleGameCard(QFrame):
                 if w:
                     w.deleteLater()
             st = (self.game.get('status') or '').lower()
-            is_live = (self.game.get('live') or self.game.get('time', '').upper() == 'LIVE'
-                       or st.startswith('in progress'))
+            is_live = _is_game_live(self.game)
             is_final = ('final' in st or 'game over' in st or 'completed' in st
                         or self.game.get('time', '').upper() == 'FINAL')
             msg = "  Loading plays\u2026" if (is_live or is_final) else "  No play-by-play info yet"
@@ -3601,8 +3670,27 @@ class ScheduleGameCard(QFrame):
         """Adjust card size for expand/collapse state."""
         self.setMinimumHeight(0)
         self.setMaximumHeight(16777215)
+        # Temporarily strip glow effects so adjustSize() doesn't trigger painter errors
+        effects = []
+        for child in self.findChildren(QWidget):
+            eff = child.graphicsEffect()
+            if isinstance(eff, QGraphicsDropShadowEffect):
+                effects.append((child, eff))
+                child.setGraphicsEffect(None)
         self.adjustSize()
-        self.setFixedHeight(self.sizeHint().height())
+        h = self.sizeHint().height()
+        # Re-apply glow effects
+        for child, eff in effects:
+            try:
+                child.setGraphicsEffect(eff)
+            except RuntimeError:
+                pass  # widget deleted
+        if self._expanded:
+            self.setFixedHeight(h)
+        else:
+            if h > ScheduleGameCard._collapsed_height:
+                ScheduleGameCard._collapsed_height = h
+            self.setFixedHeight(ScheduleGameCard._collapsed_height)
 
     def _update_last_event(self):
         """Set the always-visible preview to the last play."""
@@ -3720,8 +3808,6 @@ class ScheduleGameCard(QFrame):
         gc_layout = QVBoxLayout(self._game_content)
         gc_layout.setContentsMargins(0, 0, 0, 0)
         gc_layout.setSpacing(2)
-        # Reset height to default; _build_content overrides for boxscore cards
-        self.setFixedHeight(142)
         self._build_content(gc_layout)
         outer.insertWidget(0, self._game_content)
         # Re-check if play section needs toggle (e.g. game went live)
@@ -3729,7 +3815,7 @@ class ScheduleGameCard(QFrame):
         is_final = (new_game.get('time', '').upper() == 'FINAL'
                     or st.startswith('final') or st.startswith('game over')
                     or st.startswith('completed'))
-        is_live = new_game.get('live') or new_game.get('time', '').upper() == 'LIVE' or st.startswith('in progress')
+        is_live = _is_game_live(new_game)
         if (is_live or is_final) and not self._toggle_btn and self._play_section:
             # Game just went live — rebuild entire play section
             old_ps = self._play_section
@@ -3748,8 +3834,7 @@ class ScheduleGameCard(QFrame):
             self._play_section = None
             if outer:
                 self._build_play_section(outer)
-        if self._expanded:
-            self._resize_for_expansion()
+        self._resize_for_expansion()
 
     def enterEvent(self, event):
         for gl in self.findChildren(_GradientLine):
@@ -4864,26 +4949,6 @@ def build_home_page():
     # Live score bar
     top = QHBoxLayout()
     top.setSpacing(10)
-    for g in [x for x in GAMES if x.get("live")]:
-        card = QFrame()
-        card.setStyleSheet(f"background:{C['bg1']}; border:1px solid {C['bdr']}; border-radius:6px;")
-        hl = QHBoxLayout(card)
-        hl.setContentsMargins(12, 10, 12, 10)
-        hl.setSpacing(6)
-        for team, score in [(g["away"], g.get("away_score",0)),
-                            (g["home"], g.get("home_score",0))]:
-            vv = QVBoxLayout()
-            vv.setSpacing(2)
-            vv.addWidget(mk_label(str(score), color=C["t1"], size=20, bold=True, mono=True,
-                                   align=Qt.AlignmentFlag.AlignCenter))
-            vv.addWidget(mk_label(team, color=C["t3"], size=11, mono=True,
-                                   align=Qt.AlignmentFlag.AlignCenter))
-            hl.addLayout(vv)
-            if team == g["away"]:
-                hl.addWidget(mk_label("—", color=C["t3"], size=13, mono=True))
-        hl.addWidget(mk_label("●", color=C["red"], size=10, mono=True))
-        hl.addWidget(mk_label(g["time"], color=C["red"], size=10, mono=True))
-        top.addWidget(card)
     cnt = QFrame()
     cnt.setStyleSheet(f"background:{C['bg1']}; border:1px solid {C['bdr']}; border-radius:6px;")
     cl = QVBoxLayout(cnt)
@@ -5173,6 +5238,11 @@ def build_matchup_page(games=None, odds=None, on_click=None):
             for c in range(rem, cols):
                 grid.addWidget(QWidget(), len(games) // cols, c)
         grid.setRowStretch(len(games) // cols + 1, 1)
+        # Equalize all collapsed cards to the tallest one
+        if ScheduleGameCard._collapsed_height:
+            for card in schedule_cards:
+                if not card._expanded:
+                    card.setFixedHeight(ScheduleGameCard._collapsed_height)
         page._schedule_cards = schedule_cards
 
     sa.setWidget(content)
@@ -5195,6 +5265,22 @@ def build_matchup_page(games=None, odds=None, on_click=None):
  
  
 # ═══════════════════════════════════════════════════════════════════════════════
+# Shared live-game detection
+# ═══════════════════════════════════════════════════════════════════════════════
+def _is_game_live(g):
+    """Return True if game dict represents a live/in-progress game."""
+    if g.get('live'):
+        return True
+    ast = (g.get('abstract_state') or '').lower()
+    if ast == 'live':
+        return True
+    st = (g.get('status') or '').lower()
+    return (st.startswith('in progress')
+            or st.startswith('manager challenge')
+            or st.startswith('umpire review'))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Sidebar sort helper
 # ═══════════════════════════════════════════════════════════════════════════════
 def _game_sort_key(g):
@@ -5205,7 +5291,7 @@ def _game_sort_key(g):
                 or st.startswith('game over')
                 or st.startswith('completed'))
     is_ppd = t == 'PPD' or st.startswith('postponed')
-    is_live = g.get('live') or t == 'LIVE' or st.startswith('in progress')
+    is_live = _is_game_live(g)
     if is_live:
         return (0, t)
     if not is_final and not is_ppd:
@@ -5797,7 +5883,7 @@ class SeamStatsApp(QMainWindow):
     @staticmethod
     def _game_changed(old, new, include_boxscore=False):
         """Return True if any visible game field differs between old and new."""
-        _FIELDS = ('away_score', 'home_score', 'status', 'inning',
+        _FIELDS = ('away_score', 'home_score', 'status', 'abstract_state', 'inning',
                    'inning_half', 'inning_state', 'live',
                    'on_first', 'on_second', 'on_third', 'outs')
         _BOX_FIELDS = ('innings_detail', 'away_hits', 'home_hits',
@@ -5815,6 +5901,20 @@ class SeamStatsApp(QMainWindow):
     def _status_changed(old, new):
         return old.get('status') != new.get('status') or old.get('live') != new.get('live')
 
+    @staticmethod
+    def _merge_game(old, new):
+        """Merge new game data over old, preserving live fields during API gaps."""
+        merged = {**old, **new}
+        was_live = _is_game_live(old)
+        if was_live:
+            # Preserve status when new response is empty/missing
+            if not (new.get('status') or '').strip() and old.get('status'):
+                merged['status'] = old['status']
+            # Preserve innings_detail when new is empty but old had data
+            if not new.get('innings_detail') and old.get('innings_detail'):
+                merged['innings_detail'] = old['innings_detail']
+        return merged
+
     def _on_scores_fetched(self, games):
         """Update sidebar cards whose data changed; re-sort & stop timer if all done."""
         self._score_fetching = False
@@ -5830,7 +5930,7 @@ class SeamStatsApp(QMainWindow):
         for gid, new in fresh.items():
             if gid in games_by_id:
                 idx = games_by_id[gid]
-                self._games[idx] = {**self._games[idx], **new}
+                self._games[idx] = self._merge_game(self._games[idx], new)
         any_active = False
         need_resort = False
         for i, card in enumerate(self._cards):
@@ -5842,8 +5942,7 @@ class SeamStatsApp(QMainWindow):
             if self._game_changed(old, new):
                 if self._status_changed(old, new):
                     need_resort = True
-                merged = {**old, **new}
-                card.update_game(merged)
+                card.update_game(self._merge_game(old, new))
             st = (new.get('status') or '').lower()
             is_done = (st.startswith('final') or st.startswith('game over')
                        or st.startswith('completed') or st.startswith('postponed'))
@@ -5863,7 +5962,7 @@ class SeamStatsApp(QMainWindow):
                 if self._game_changed(old, new, include_boxscore=True):
                     if self._status_changed(old, new):
                         need_resort_sched = True
-                    card.update_game({**old, **new})
+                    card.update_game(self._merge_game(old, new))
             except RuntimeError:
                 pass  # C++ object deleted
         if need_resort_sched:
@@ -5872,8 +5971,7 @@ class SeamStatsApp(QMainWindow):
             self._resort_sidebar()
         active_count = sum(1 for c in self._cards
                            if not (c.game.get('status') or '').lower().startswith(('final', 'game over', 'completed', 'postponed')))
-        any_live = any(c.game.get('live') or (c.game.get('status') or '').lower().startswith('in progress')
-                       for c in self._cards)
+        any_live = any(_is_game_live(c.game) for c in self._cards)
         self.set_status("Scores updated", right=f"{active_count} active" if active_count else "All final")
         if not any_active:
             self._score_timer.stop()
@@ -5957,7 +6055,7 @@ class SeamStatsApp(QMainWindow):
             if not gid:
                 continue
             st = (g.get('status') or '').lower()
-            is_live = g.get('live') or st.startswith('in progress')
+            is_live = _is_game_live(g)
             is_final = ('final' in st or 'game over' in st or 'completed' in st
                         or g.get('time', '').upper() == 'FINAL')
             if is_live:
@@ -5993,7 +6091,7 @@ class SeamStatsApp(QMainWindow):
         for card in sched_cards:
             gid = str(card.game.get('game_id') or card.game.get('id'))
             st = (card.game.get('status') or '').lower()
-            is_live = card.game.get('live') or st.startswith('in progress')
+            is_live = _is_game_live(card.game)
             is_final = ('final' in st or 'game over' in st or 'completed' in st
                         or card.game.get('time', '').upper() == 'FINAL')
             if card._expanded or is_live:
