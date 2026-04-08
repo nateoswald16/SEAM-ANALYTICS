@@ -288,10 +288,14 @@ def _compass_to_mlb_wind(deg: float, azimuth: float = 0) -> str:
     return best[1]
 
 
+# ── Circuit breaker config ───────────────────────────────────────────────────
+_CB_THRESHOLD = 3  # consecutive failures before tripping
+
 # ── NWS (National Weather Service) — primary provider ───────────────────────
-_nws_circuit_open = True   # False → NWS known unreachable, skip calls
+_nws_fail_count = 0   # consecutive failures; >= _CB_THRESHOLD → skip calls
 _nws_grid_cache: dict[str, dict] = {}   # "(lat,lon)" → {"hourly_url": ..., "stations_url": ...}
 _nws_grid_lock = threading.Lock()
+_nws_grid_pending: dict[str, threading.Event] = {}  # per-key fetch-in-progress events
 
 _NWS_HEADERS = {"User-Agent": "SeamAnalytics/1.0 (mlb-park-weather)", "Accept": "application/geo+json"}
 
@@ -323,6 +327,18 @@ def _nws_resolve_grid(lat, lon) -> dict:
     with _nws_grid_lock:
         if key in _nws_grid_cache:
             return _nws_grid_cache[key]
+        # If another thread is already fetching this key, wait for it
+        if key in _nws_grid_pending:
+            evt = _nws_grid_pending[key]
+            wait = True
+        else:
+            evt = threading.Event()
+            _nws_grid_pending[key] = evt
+            wait = False  # we are the fetcher
+    if wait:
+        evt.wait(timeout=10)
+        with _nws_grid_lock:
+            return _nws_grid_cache.get(key, {})
     try:
         r = _http_om.get(f"https://api.weather.gov/points/{lat},{lon}",
                          headers=_NWS_HEADERS, timeout=5)
@@ -333,8 +349,13 @@ def _nws_resolve_grid(lat, lon) -> dict:
         }
         with _nws_grid_lock:
             _nws_grid_cache[key] = info
+            evt.set()
+            _nws_grid_pending.pop(key, None)
         return info
     except Exception:
+        with _nws_grid_lock:
+            evt.set()
+            _nws_grid_pending.pop(key, None)
         return {}
 
 
@@ -345,8 +366,8 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
     NWS hourly gives temp, precip %, wind, and condition.
     Pressure is NOT included — use _fetch_pressure_weatherapi() separately.
     """
-    global _nws_circuit_open
-    if not _nws_circuit_open:
+    global _nws_fail_count
+    if _nws_fail_count >= _CB_THRESHOLD:
         return {}
     try:
         grid = _nws_resolve_grid(lat, lon)
@@ -455,21 +476,31 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
             except Exception:
                 pass
 
+        _nws_fail_count = 0  # success → reset consecutive failure count
         return result
     except Exception:
-        _nws_circuit_open = False
+        _nws_fail_count += 1
         return {}
 
 
-_om_circuit_open = True   # False → Open-Meteo known unreachable, skip calls
+_om_fail_count = 0   # consecutive failures; >= _CB_THRESHOLD → skip calls
+
+
+def _pressure_from_elevation(elevation_ft) -> float:
+    """Estimate surface pressure from venue elevation using the barometric formula.
+
+    Uses the international barometric formula:
+        P = 1013.25 × (1 − 2.25577×10⁻⁵ × h)^5.25588
+    where h is elevation in metres.  Returns hPa rounded to 1 decimal.
+    """
+    if elevation_ft is None:
+        return 1013.3                       # sea-level default
+    h_m = float(elevation_ft) * 0.3048
+    return round(1013.25 * (1 - 2.25577e-5 * h_m) ** 5.25588, 1)
 
 
 def _fetch_pressure_open_meteo(lat, lon) -> float | None:
-    """Lightweight Open-Meteo query for current surface pressure only.
-
-    No circuit breaker — pressure is needed for every card and Open-Meteo
-    is the only free provider that reliably supplies it.
-    """
+    """Lightweight Open-Meteo query for current surface pressure only."""
     try:
         r = _http_om.get(
             f"https://api.open-meteo.com/v1/forecast?"
@@ -490,33 +521,49 @@ def _fetch_pressure_batch(games: list[dict]) -> None:
 
     Open-Meteo supports comma-separated lat/lon for multi-location queries,
     returning all results in one request (~0.5–1 s total).
+    Falls back to elevation-based estimation when API is unavailable.
     """
     need = [g for g in games
             if g.get("pressure_hpa") is None and g.get("lat") and g.get("lon")]
     if not need:
+        # Still fill any games missing pressure via elevation
+        for g in games:
+            if g.get("pressure_hpa") is None:
+                g["pressure_hpa"] = _pressure_from_elevation(g.get("elevation"))
         return
     lats = ",".join(str(g["lat"]) for g in need)
     lons = ",".join(str(g["lon"]) for g in need)
-    try:
-        r = _http_om.get(
-            f"https://api.open-meteo.com/v1/forecast?"
-            f"latitude={lats}&longitude={lons}&current=surface_pressure",
-            timeout=8,
-        )
-        r.raise_for_status()
-        data = r.json()
-        # Single location returns a dict; multiple returns a list
-        if isinstance(data, dict):
-            data = [data]
-        for g, d in zip(need, data):
-            sp = d.get("current", {}).get("surface_pressure")
-            if sp:
-                g["pressure_hpa"] = round(sp, 1)
-    except Exception:
-        # Fall back to individual calls if batch fails
-        for g in need:
-            if g.get("pressure_hpa") is None:
-                g["pressure_hpa"] = _fetch_pressure_open_meteo(g["lat"], g["lon"])
+
+    # Try batch call with one retry on 429 (rate-limit)
+    for attempt in range(2):
+        try:
+            r = _http_om.get(
+                f"https://api.open-meteo.com/v1/forecast?"
+                f"latitude={lats}&longitude={lons}&current=surface_pressure",
+                timeout=8,
+            )
+            if r.status_code == 429 and attempt == 0:
+                import time; time.sleep(2)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, dict):
+                data = [data]
+            for g, d in zip(need, data):
+                sp = d.get("current", {}).get("surface_pressure")
+                if sp:
+                    g["pressure_hpa"] = round(sp, 1)
+            break
+        except Exception:
+            if attempt == 0:
+                import time; time.sleep(1)
+                continue
+            break
+
+    # Elevation-based fallback for any games still missing pressure
+    for g in games:
+        if g.get("pressure_hpa") is None:
+            g["pressure_hpa"] = _pressure_from_elevation(g.get("elevation"))
 
 
 def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
@@ -527,8 +574,8 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
     (forecast_temp, forecast_wind_speed, forecast_wind_deg,
     forecast_condition) for the hour closest to game time.
     """
-    global _om_circuit_open
-    if not _om_circuit_open:
+    global _om_fail_count
+    if _om_fail_count >= _CB_THRESHOLD:
         return {}
     try:
         url = (
@@ -647,16 +694,17 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
             except Exception:
                 pass
 
+        _om_fail_count = 0  # success → reset consecutive failure count
         return result
     except Exception:
-        _om_circuit_open = False   # trip circuit — skip remaining calls
+        _om_fail_count += 1
         return {}
 
 
 # ── WeatherAPI.com fallback ──────────────────────────────────────────────────
 _weatherapi_key: str | None = None
 _weatherapi_key_loaded = False
-_wa_circuit_open = True  # False → WeatherAPI known unreachable, skip calls
+_wa_fail_count = 0  # consecutive failures; >= _CB_THRESHOLD → skip calls
 
 
 def _load_weatherapi_key() -> str | None:
@@ -689,8 +737,8 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
     Returns the same dict shape as _fetch_open_meteo so the caller
     doesn't need to know which provider answered.
     """
-    global _wa_circuit_open
-    if not _wa_circuit_open:
+    global _wa_fail_count
+    if _wa_fail_count >= _CB_THRESHOLD:
         return {}
     key = _load_weatherapi_key()
     if not key:
@@ -830,9 +878,10 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
             except Exception:
                 pass
 
+        _wa_fail_count = 0  # success → reset consecutive failure count
         return result
     except Exception:
-        _wa_circuit_open = False  # trip circuit — skip remaining calls
+        _wa_fail_count += 1
         return {}
 
 
@@ -844,10 +893,10 @@ def fetch_park_weather(date_str: str) -> list[dict]:
     venue_id, lat, lon, elevation, roof_type, temp, condition,
     wind_speed, wind_dir, wind_angle, precip_pct, pressure_hpa.
     """
-    global _nws_circuit_open, _wa_circuit_open, _om_circuit_open
-    _nws_circuit_open = True   # reset circuit breakers for each fetch cycle
-    _wa_circuit_open = True
-    _om_circuit_open = True
+    global _nws_fail_count, _wa_fail_count, _om_fail_count
+    _nws_fail_count = 0   # reset circuit breakers for each fetch cycle
+    _wa_fail_count = 0
+    _om_fail_count = 0
     try:
         url = (
             "https://statsapi.mlb.com/api/v1/schedule"
@@ -1564,7 +1613,7 @@ def _save_weather_to_disk(date_str: str, data: list[dict]):
         pass
 
 
-def _cleanup_old_weather_cache(keep_days: int = 3):
+def _cleanup_old_weather_cache(keep_days: int = 4):
     """Remove disk cache files older than *keep_days*."""
     import datetime as _dt
     cutoff = _dt.date.today() - _dt.timedelta(days=keep_days)
@@ -1583,24 +1632,35 @@ def _cleanup_old_weather_cache(keep_days: int = 3):
         pass
 
 
-def prefetch_weather(date_str: str | None = None):
-    """Seed the in-memory cache from disk, then always re-fetch fresh data.
+def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
+    """Seed the in-memory cache from disk, then re-fetch fresh data.
+
+    *force_refresh* (default False): When True, delete existing disk cache
+    and always re-fetch.  When False, only fetch if no cache exists yet.
+    Today's date always forces a refresh regardless of this flag.
 
     Safe to call from any thread.  Designed to be kicked off at app startup
     exactly like the lineup prefetch (daemon thread, fire-and-forget).
     """
     import datetime as _dt
     date_str = date_str or _dt.date.today().isoformat()
+    is_today = (date_str == _dt.date.today().isoformat())
 
-    # Delete today's stale disk cache so we always get fresh weather on launch
-    try:
-        stale = _weather_cache_path(date_str)
-        if os.path.isfile(stale):
-            os.remove(stale)
-    except Exception:
-        pass
-    with _weather_lock:
-        _weather_cache.pop(date_str, None)
+    if is_today or force_refresh:
+        # Delete stale disk cache so we get fresh weather
+        try:
+            stale = _weather_cache_path(date_str)
+            if os.path.isfile(stale):
+                os.remove(stale)
+        except Exception:
+            pass
+        with _weather_lock:
+            _weather_cache.pop(date_str, None)
+    else:
+        # For non-today dates, use existing cache if available
+        existing = get_cached_weather(date_str)
+        if existing is not None:
+            return
 
     # Fetch fresh data and update cache + disk
     data = fetch_park_weather(date_str)
@@ -1638,6 +1698,16 @@ class _WeatherWorker(QThread):
         self._date = date_str
 
     def run(self):
+        import datetime as _dt
+        is_today = (self._date == _dt.date.today().isoformat())
+
+        # For non-today dates, use existing cache if it has pressure data
+        if not is_today:
+            cached = get_cached_weather(self._date)
+            if cached and all(g.get("pressure_hpa") for g in cached):
+                self.finished.emit(cached)
+                return
+
         try:
             data = fetch_park_weather(self._date)
         except Exception:
@@ -1861,12 +1931,22 @@ class ParkFactorsPage(QWidget):
             c.setParent(None)
             c.deleteLater()
         self._cards.clear()
+        self._pending_games = list(games)
+        self._populate_idx = 0
+        self._populate_batch()
 
-        for i, g in enumerate(games):
-            card = ParkWeatherCard(g)
+    def _populate_batch(self):
+        """Create cards in small batches to avoid UI freeze."""
+        BATCH = 4
+        end = min(self._populate_idx + BATCH, len(self._pending_games))
+        for i in range(self._populate_idx, end):
+            card = ParkWeatherCard(self._pending_games[i])
             self._cards.append(card)
             row, col = divmod(i, self._ncols)
             self._grid.addWidget(card, row, col)
+        self._populate_idx = end
+        if self._populate_idx < len(self._pending_games):
+            QTimer.singleShot(0, self._populate_batch)
 
     def _reflow_grid(self):
         """Reposition existing cards into the current column count."""

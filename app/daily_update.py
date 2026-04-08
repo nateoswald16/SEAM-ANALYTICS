@@ -192,8 +192,10 @@ def main(argv: list[str] | None = None, gui_cb=None):
             print('Warning checking last game date in DB:', e)
         return None
 
-    def _find_dates_missing_statcast(db_path: str, max_age_days: int = 5):
-        """Find dates that have plate_appearances but zero statcast data (launch_speed all NULL).
+    def _find_dates_missing_statcast(db_path: str, max_age_days: int = 7):
+        """Find dates that have plate_appearances but no statcast enrichment.
+        Uses release_speed (Statcast-only field) as the indicator, since
+        launch_speed can now be populated from the game feed hitData.
         Only looks back max_age_days from today to avoid re-scanning ancient data."""
         if not os.path.exists(db_path):
             return []
@@ -204,12 +206,11 @@ def main(argv: list[str] | None = None, gui_cb=None):
             cur.execute("""
                 SELECT DISTINCT game_date FROM plate_appearances
                 WHERE game_date >= ?
-                  AND launch_speed IS NULL
                   AND release_speed IS NULL
                 EXCEPT
                 SELECT DISTINCT game_date FROM plate_appearances
                 WHERE game_date >= ?
-                  AND (launch_speed IS NOT NULL OR release_speed IS NOT NULL)
+                  AND release_speed IS NOT NULL
                 ORDER BY 1
             """, (cutoff, cutoff))
             dates = [r[0] for r in cur.fetchall()]
@@ -279,15 +280,6 @@ def main(argv: list[str] | None = None, gui_cb=None):
 
     # ── Statcast backfill: re-enrich dates that have PAs but no statcast data ──
     missing_dates = _find_dates_missing_statcast(DB_PATH)
-    if missing_dates:
-        # Filter out dates that were just ingested (pipeline already tried statcast for those)
-        if ingested_new:
-            fresh = set()
-            d = ingested_start
-            while d <= ingested_end:
-                fresh.add(d.isoformat())
-                d += timedelta(days=1)
-            missing_dates = [d for d in missing_dates if d not in fresh]
 
     if missing_dates:
         print(f"\n── Statcast backfill: {len(missing_dates)} date(s) missing statcast data ──")

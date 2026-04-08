@@ -6,7 +6,16 @@ All notable changes to Seam Analytics are documented here.
 
 ## v1.0.2-beta — 2026-04-07
 
+> **Database refresh recommended.** This release includes significant changes to database calculations and structure (barrel heuristic, foul ball exclusion, hitData extraction, historical re-enrichment). When running the installer, check **"Replace local databases with the latest bundled data"** to get the corrected datasets. You can also use the in-app Update Data button after installing.
+
 ### Game Tracker
+
+**Date Selector**
+- Added date navigation arrows on the right side of the main navbar — browse yesterday, today, or tomorrow
+- Switching dates reloads sidebar game cards, schedule page, lineups, and weather for the selected day
+- Tomorrow's schedule and weather are pre-fetched on launch for instant switching
+- Live score polling pauses when viewing past or future dates
+- Leaderboards re-filter to the selected day's lineups
 
 **Live Card Stability**
 - Fixed cards reverting to pre-game state (all dashes) during inning transitions or API hiccups
@@ -31,6 +40,60 @@ All notable changes to Seam Analytics are documented here.
 - Mini-ballpark wind arrows now update when the hourly weather overlay cycles to a new hour
 - Arrow direction, color (hitter/pitcher friendly), and wind speed all refresh in sync with the cycling weather icon and detail text
 - Fixed sea-level venues (e.g. Oracle Park) showing "--" for altitude instead of "0 ft"
+
+**Weather Timezone Fix**
+- All three weather providers (NWS, WeatherAPI, Open-Meteo) now convert forecast times to the user's local timezone
+- Fixes hourly cycling showing wrong hour labels when viewing games in other time zones
+
+### Leaderboards
+
+**HR + SB Games**
+- New leaderboard card showing players with the most games featuring both a home run and a stolen base
+- Joins plate appearances and stolen bases data for the current season
+
+### Data Pipeline
+
+**Game Feed hitData Extraction**
+- Now extracts `hitData` from the MLB API game feed for every plate appearance — provides exit velocity, launch angle, batted ball type, hit distance, and spray chart coordinates
+- Data available immediately after games end, before Statcast publishes (typically ~2 day lag)
+- Increased batted ball event coverage from ~1,200 to ~7,500 for early 2026
+
+**Statcast Enrichment Fixes**
+- Fixed foul ball data overwriting real hit data: batted-ball fields (`launch_speed`, `launch_angle`, `bb_type`, `hc_x`, `hc_y`, `hit_distance_sc`) now only applied from the result pitch, not from intermediate fouls
+- Fixed barrel and pull flag derivation to only compute from the result pitch
+- Statcast enrichment now skips null values instead of overwriting game feed data with blanks
+- Fixed backfill detection: uses `release_speed` (Statcast-only) instead of `launch_speed` (now populated by game feed) so the daily updater correctly identifies dates needing Statcast enrichment
+
+**Barrel Heuristic**
+- Widened barrel zone formula to match MLB's definition: EV ≥ 98 mph with launch angle range expanding as EV increases
+- Previous heuristic was too narrow, underreporting barrel rate
+
+**Historical Data Re-enrichment**
+- Cleaned and re-enriched all historical seasons (2021–2025) with the corrected Statcast pipeline
+- Cleared ~915K plate appearances of foul-ball-contaminated BBE fields and re-applied Statcast data from scratch
+- Batted ball event coverage restored from ~20K to ~122–125K per season
+
+**Daily Updater Hardening**
+- Fixed backfill window: removed fresh-date exclusion that could permanently skip Statcast data if the user missed multiple days
+- Increased Statcast lookback window from 5 to 7 days
+
+**Foul Ball Exclusion**
+- Exit velocity and launch angle averages now exclude foul balls across all stat queries (calculated DB, batter stats, batter vs pitcher)
+- Only batted ball events with a valid `bb_type` contribute to EV/LA metrics
+
+### In-App Updates
+
+**Check for Updates**
+- Added "Check for Updates" button in the titlebar between the version label and Update Data button
+- Automatically checks for new releases on launch (silent — no popup if already up to date)
+- Manual check via the button shows a popup confirming you're on the latest version
+- When a new version is available, the button turns green and displays "Update → vX.Y.Z"
+
+**One-Click Install**
+- Clicking the green update button shows release notes and a confirmation dialog
+- Downloads the installer with a progress bar in the titlebar
+- Runs the Inno Setup installer silently in the background — no wizard, no interruptions
+- Automatically restarts the app after the update completes
 
 ---
 

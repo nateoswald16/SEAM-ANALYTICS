@@ -23,6 +23,8 @@ a = Analysis(
         (os.path.join(ROOT, 'assets', 'Logo.png'),               'assets'),
         (os.path.join(ROOT, 'assets', 'Logo.ico'),               'assets'),
         (os.path.join(ROOT, 'assets', 'info-svgrepo-com.svg'),   'assets'),
+        (os.path.join(ROOT, 'assets', 'arrow-circle-left.svg'),   'assets'),
+        (os.path.join(ROOT, 'assets', 'arrow-circle-right.svg'),  'assets'),
         (os.path.join(ROOT, 'assets', 'logos'),                   os.path.join('assets', 'logos')),
         # Schema / mapping files (read-only, used by build pipeline)
         (os.path.join(ROOT, 'database_schema.py'),               '.'),

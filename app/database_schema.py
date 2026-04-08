@@ -230,6 +230,7 @@ CREATE INDEX IF NOT EXISTS idx_pa_batter_id ON plate_appearances(batter_id);
 CREATE INDEX IF NOT EXISTS idx_pa_pitcher_id ON plate_appearances(pitcher_id);
 CREATE INDEX IF NOT EXISTS idx_pa_batter_season ON plate_appearances(batter_id, season);
 CREATE INDEX IF NOT EXISTS idx_pa_pitcher_season ON plate_appearances(pitcher_id, season);
+CREATE INDEX IF NOT EXISTS idx_pa_batter_pitcher ON plate_appearances(batter_id, pitcher_id);
 CREATE INDEX IF NOT EXISTS idx_pa_is_vs_lefty ON plate_appearances(is_vs_lefty);
 CREATE INDEX IF NOT EXISTS idx_pa_events ON plate_appearances(events);
 

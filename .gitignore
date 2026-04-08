@@ -16,6 +16,9 @@ venv_backup*/
 
 # ── Databases (too large for Git — ship via installer) ────────
 *.db
+*.db-shm
+*.db-wal
+*.db-journal
 
 # ── Caches & runtime data ────────────────────────────────────
 *.pkl
@@ -27,8 +30,8 @@ app/assets/logos/
 app/statcast_cache/
 
 # ── Installer build artifacts ─────────────────────────────────
-installer/build/
-installer/dist/
+build/
+dist/
 installer/output/
 
 # ── OS junk ───────────────────────────────────────────────────

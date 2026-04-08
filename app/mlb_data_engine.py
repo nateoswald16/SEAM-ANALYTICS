@@ -7,6 +7,7 @@ import os
 import pickle
 import json
 import sqlite3
+import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib3.util.retry import Retry
@@ -43,7 +44,9 @@ class MLBDataEngine:
         self._id_cache_dirty = False  # Track whether id_cache needs saving
         self._cleanup_done = False  # Only run cleanup once per session
         self._db_conn = None  # Reusable read-only DB connection
+        self._steals_conn = None  # Reusable steals DB connection
         self._player_data_cache = {}  # {(player_id,is_pitcher,year): {'ts': monotonic, 'result': {...}}}
+        self._cache_lock = threading.Lock()  # Protects shared caches from concurrent access
     
     def _load_cache(self):
         """Load player ID cache from disk."""
@@ -341,8 +344,9 @@ class MLBDataEngine:
             Handedness code: 'L', 'R', 'B', or 'Unknown'
         """
         # Check in-memory cache first
-        if player_id in self._handedness_cache:
-            return self._handedness_cache[player_id]
+        with self._cache_lock:
+            if player_id in self._handedness_cache:
+                return self._handedness_cache[player_id]
         
         try:
             url = f"{self.api_base}/people/{player_id}"
@@ -361,7 +365,8 @@ class MLBDataEngine:
                         result = 'L' if hand == 'L' else 'R' if hand == 'R' else 'Unknown'
                     else:
                         result = 'Unknown'
-                    self._handedness_cache[player_id] = result
+                    with self._cache_lock:
+                        self._handedness_cache[player_id] = result
                     return result
         except:
             pass
@@ -1237,29 +1242,26 @@ class MLBDataEngine:
         try:
             if 'events' in df.columns and 'description' in df.columns:
                 error_rows = df[df['events'] == 'field_error']
-                out_indicators = [
-                    'out at', 'thrown out', 'tag out', 'caught stealing',
-                    'picked off', 'double play', 'double-play', 'force out',
-                    'fielder\'s choice out', 'fielders choice out', 'out,',
-                    'out.'
-                ]
-                for _, er in error_rows.iterrows():
-                    desc = (er.get('description') or '').lower()
-                    for pat in out_indicators:
-                        if pat in desc:
-                            additional_outs += 1
-                            break
-                # As a final heuristic, if a fielding error entry shows the
-                # batter did NOT record a hit (`is_hit` falsy) but the
-                # `outs_when_up` value is > 0, it's likely an out occurred
-                # elsewhere on the play (e.g., runner thrown out). Count
-                # these as outs as well to reconcile with official summaries.
-                for _, er in error_rows.iterrows():
+                if not error_rows.empty:
+                    out_pattern = '|'.join([
+                        'out at', 'thrown out', 'tag out', 'caught stealing',
+                        'picked off', 'double play', 'double-play', 'force out',
+                        "fielder's choice out", 'fielders choice out', 'out,',
+                        r'out\.'
+                    ])
+                    descs = error_rows['description'].fillna('').str.lower()
+                    additional_outs += int(descs.str.contains(out_pattern, regex=True).sum())
+                    # As a final heuristic, if a fielding error entry shows the
+                    # batter did NOT record a hit (`is_hit` falsy) but the
+                    # `outs_when_up` value is > 0, it's likely an out occurred
+                    # elsewhere on the play (e.g., runner thrown out). Count
+                    # these as outs as well to reconcile with official summaries.
                     try:
-                        if not er.get('is_hit') and int(er.get('outs_when_up') or 0) > 0:
-                            additional_outs += 1
+                        no_hit = error_rows['is_hit'].fillna(0).astype(bool) == False
+                        outs_up = pd.to_numeric(error_rows['outs_when_up'], errors='coerce').fillna(0).astype(int)
+                        additional_outs += int((no_hit & (outs_up > 0)).sum())
                     except Exception:
-                        continue
+                        pass
         except Exception:
             additional_outs = 0
 
@@ -1435,18 +1437,11 @@ class MLBDataEngine:
                 return {stat: "---" for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'Pull%', 'EV']}
         
         filtered_df = df
-        if time_period == "Last 5":
-            last_5_dates = sorted(df['game_date'].unique())[-5:]
-            filtered_df = df[df['game_date'].isin(last_5_dates)]
-        elif time_period == "Last 10":
-            last_10_dates = sorted(df['game_date'].unique())[-10:]
-            filtered_df = df[df['game_date'].isin(last_10_dates)]
-        elif time_period == "Last 20":
-            last_20_dates = sorted(df['game_date'].unique())[-20:]
-            filtered_df = df[df['game_date'].isin(last_20_dates)]
-        elif time_period == "Last 30":
-            last_30_dates = sorted(df['game_date'].unique())[-30:]
-            filtered_df = df[df['game_date'].isin(last_30_dates)]
+        if time_period != "Season":
+            all_dates = sorted(df['game_date'].unique())
+            n = {'Last 5': 5, 'Last 10': 10, 'Last 20': 20, 'Last 30': 30}.get(time_period)
+            if n is not None:
+                filtered_df = df[df['game_date'].isin(all_dates[-n:])]
         
         if split == "vs LHP/LHB":
             if is_pitcher:
@@ -1507,12 +1502,10 @@ class MLBDataEngine:
         pulls = 0
         pull_pct = 0
         if len(batted_balls) > 0 and 'hc_x' in df.columns and 'stand' in df.columns:
-            for _, row in batted_balls.iterrows():
-                if not pd.isna(row.get('hc_x')) and not pd.isna(row.get('stand')):
-                    if row['stand'] == 'R':
-                        if row['hc_x'] < 100: pulls += 1
-                    else:
-                        if row['hc_x'] > 150: pulls += 1
+            valid = batted_balls.dropna(subset=['hc_x', 'stand'])
+            if len(valid) > 0:
+                is_right = valid['stand'] == 'R'
+                pulls = int(((is_right & (valid['hc_x'] < 100)) | (~is_right & (valid['hc_x'] > 150))).sum())
             pull_pct = (pulls / len(batted_balls) * 100) if len(batted_balls) > 0 else 0
         
         ev = df['launch_speed'].mean() if not df['launch_speed'].dropna().empty else 0
@@ -1803,11 +1796,12 @@ class MLBDataEngine:
             return empty
 
     def _get_steals_db_connection(self):
-        """Get a connection to the steals database."""
-        steals_db = _app_paths.STEALS_DB
-        if os.path.exists(steals_db):
-            return sqlite3.connect(steals_db, check_same_thread=False)
-        return None
+        """Get a reusable connection to the steals database."""
+        if self._steals_conn is None:
+            steals_db = _app_paths.STEALS_DB
+            if os.path.exists(steals_db):
+                self._steals_conn = sqlite3.connect(steals_db, check_same_thread=False)
+        return self._steals_conn
 
     def get_pitcher_baserunning_stats(self, pitcher_id, season, time_window='overall'):
         """Get pre-calculated baserunning defense stats for a pitcher.
@@ -1846,8 +1840,6 @@ class MLBDataEngine:
         except Exception as e:
             _log.warning(f"Error getting pitcher baserunning stats: {e}")
             return None
-        finally:
-            conn.close()
 
     def get_catcher_baserunning_stats(self, catcher_id, season, time_window='overall'):
         """Get pre-calculated baserunning defense stats for a catcher.
@@ -1886,8 +1878,6 @@ class MLBDataEngine:
         except Exception as e:
             _log.warning(f"Error getting catcher baserunning stats: {e}")
             return None
-        finally:
-            conn.close()
 
     def get_batter_baserunning_stats(self, batter_id, season, time_window='overall'):
         """Get pre-calculated baserunning stats for a batter/runner.
@@ -1923,8 +1913,6 @@ class MLBDataEngine:
         except Exception as e:
             _log.warning(f"Error getting batter baserunning stats: {e}")
             return None
-        finally:
-            conn.close()
 
     def get_batter_baserunning_stats_split(self, batter_id, season, time_window='overall', pitcher_hand=None):
         """Get baserunning stats for a batter filtered by pitcher handedness.
@@ -2046,8 +2034,21 @@ class MLBDataEngine:
         except Exception as e:
             _log.warning(f"Error getting batter baserunning split stats: {e}")
             return None
-        finally:
-            conn.close()
+
+    def close(self):
+        """Close open database connections."""
+        if self._db_conn is not None:
+            try:
+                self._db_conn.close()
+            except Exception:
+                pass
+            self._db_conn = None
+        if self._steals_conn is not None:
+            try:
+                self._steals_conn.close()
+            except Exception:
+                pass
+            self._steals_conn = None
 
     def get_database_stats(self):
         """Get statistics about cached data (stub for compatibility)."""

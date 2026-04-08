@@ -6,7 +6,7 @@
 ;         (run from repo root, or adjust SourceDir below)
 
 #define MyAppName      "Seam Analytics"
-#define MyAppVersion   "1.0.1-beta"
+#define MyAppVersion   "1.0.2-beta"
 #define MyAppPublisher "Seam Analytics"
 #define MyAppExeName   "SeamAnalytics.exe"
 #define MyUpdaterExe   "SeamUpdater.exe"
@@ -40,14 +40,15 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
+Name: "refreshdb";      Description: "Replace local databases with the latest bundled data"; GroupDescription: "Database:"; Flags: unchecked
 Name: "scheduledupdate"; Description: "Schedule daily data updates (recommended)"; GroupDescription: "Automatic Updates:"; Flags: checkedonce
 
 [Files]
 ; ── Main application (onedir bundle) ──────────────────────────────────
-Source: "dist\SeamAnalytics\*"; DestDir: "{app}\SeamAnalytics"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\SeamAnalytics\*"; DestDir: "{app}\SeamAnalytics"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ── Updater (onedir bundle) ───────────────────────────────────────────
-Source: "dist\SeamUpdater\*"; DestDir: "{app}\SeamUpdater"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "..\dist\SeamUpdater\*"; DestDir: "{app}\SeamUpdater"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ── Pre-loaded databases → user data dir ──────────────────────────────
 Source: "..\app\mlb_raw.db";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallDB('mlb_raw.db')
@@ -81,12 +82,17 @@ Type: files;          Name: "{localappdata}\SeamAnalytics\temp_lineups_cache.jso
 Type: files;          Name: "{localappdata}\SeamAnalytics\processed_dates.pkl"
 
 [Code]
-// Only install a DB if it doesn't already exist with real data (don't overwrite user data on upgrade)
+// Install a DB if it doesn't exist, is a 0-byte stub, or the user checked "Refresh databases"
 function ShouldInstallDB(DBName: String): Boolean;
 var
   Path: String;
   FindRec: TFindRec;
 begin
+  if WizardIsTaskSelected('refreshdb') then
+  begin
+    Result := True;
+    Exit;
+  end;
   Path := ExpandConstant('{localappdata}\SeamAnalytics\') + DBName;
   if FindFirst(Path, FindRec) then
   begin

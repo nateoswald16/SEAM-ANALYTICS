@@ -88,6 +88,16 @@ python daily_update.py --days-back 3        # update last 3 days
 python daily_update.py --start 2026-04-01 --end 2026-04-05 --season 2026
 ```
 
+## App Updates
+
+The app checks for new versions automatically on launch and can install updates with one click.
+
+- **Auto-check:** On startup, the app silently checks for a new release on GitHub. If you're already up to date, nothing happens.
+- **Manual check:** Click **Check for Updates** in the titlebar to see if a new version is available.
+- **Install:** When an update is found, the button turns green and shows the new version. Click it to view release notes, download the installer, and update — all without leaving the app. The app restarts automatically after the update completes.
+
+> Updates are distributed as GitHub Releases. Each release contains a full Inno Setup installer that is downloaded and run silently in the background.
+
 ## Project Structure
 
 ```

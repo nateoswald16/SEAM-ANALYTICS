@@ -555,6 +555,35 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
     # via the raw DB.  Statcast only enriches with detailed tracking data.
     barrel_pct = pull_pct = avg_launch_angle = avg_ev = max_ev = None
 
+    # --- Raw DB batted-ball stats (always available, covers all games) ---
+    raw_bb_sql = f"""
+        SELECT
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND barrel = 1 THEN 1 ELSE 0 END) AS barrels,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull IS NOT NULL THEN 1 ELSE 0 END) AS pull_eligible,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull = 1 THEN 1 ELSE 0 END) AS pulls,
+            AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_angle IS NOT NULL THEN launch_angle END) AS avg_la,
+            AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
+            MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev
+        FROM plate_appearances
+        WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
+    """
+    raw_bb = cur_raw.execute(raw_bb_sql, params).fetchone()
+    if raw_bb:
+        raw_bbe = raw_bb[0] or 0
+        if raw_bbe > 0:
+            barrel_pct = round((raw_bb[1] or 0) / raw_bbe, 3)
+            pull_elig = raw_bb[2] or 0
+            if pull_elig > 0:
+                pull_pct = round((raw_bb[3] or 0) / pull_elig, 3)
+        if raw_bb[4] is not None:
+            avg_launch_angle = round(raw_bb[4], 1)
+        if raw_bb[5] is not None:
+            avg_ev = round(raw_bb[5], 1)
+        if raw_bb[6] is not None:
+            max_ev = round(raw_bb[6], 1)
+
+    # --- Statcast enrichment: overrides raw DB when it has MORE data ---
     if sc_df is not None:
         pf = sc_df[sc_df['batter'] == player_id]
         # matchup filter
@@ -568,7 +597,9 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
 
         # BBE subset for barrel/pull
         bbe = pf[pf['bb_type'].notna()]
-        if len(bbe) > 0:
+        raw_bbe_count = (raw_bb[0] or 0) if raw_bb else 0
+        if len(bbe) > 0 and len(bbe) >= raw_bbe_count:
+            # Statcast covers all BBE — use its richer data
             barrel_count = int((bbe['launch_speed_angle'] == 6).sum())
             barrel_pct = round(barrel_count / len(bbe), 3)
             hcxy = bbe[bbe['hc_x'].notna() & bbe['hc_y'].notna()]
@@ -582,13 +613,13 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
                 is_pull = (((stand == 'R') & (spray < -16))
                            | (((stand == 'L') | (stand == 'S')) & (spray > 16)))
                 pull_pct = round(int(is_pull.sum()) / len(hcxy), 3)
-        la_vals = pf['launch_angle'].dropna()
-        if len(la_vals) > 0:
-            avg_launch_angle = round(float(la_vals.mean()), 1)
-        ev_vals = pf['launch_speed'].dropna()
-        if len(ev_vals) > 0:
-            avg_ev = round(float(ev_vals.mean()), 1)
-            max_ev = round(float(ev_vals.max()), 1)
+            la_vals = bbe['launch_angle'].dropna()
+            if len(la_vals) > 0:
+                avg_launch_angle = round(float(la_vals.mean()), 1)
+            ev_vals = bbe['launch_speed'].dropna()
+            if len(ev_vals) > 0:
+                avg_ev = round(float(ev_vals.mean()), 1)
+                max_ev = round(float(ev_vals.max()), 1)
 
     def safe_div(a, b):
         try:

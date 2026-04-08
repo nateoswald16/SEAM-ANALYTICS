@@ -370,6 +370,58 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
                 else:
                     earned_runs = rbi_val
 
+        # Extract hitData from the last playEvent that has it (ball in play)
+        hit_data = {}
+        last_count = {}
+        for ev in reversed(play_events):
+            if 'hitData' in ev and not hit_data:
+                hd = ev['hitData']
+                hit_data = {
+                    'launch_speed': hd.get('launchSpeed'),
+                    'launch_angle': hd.get('launchAngle'),
+                    'bb_type': hd.get('trajectory'),
+                    'hit_distance_sc': hd.get('totalDistance'),
+                    'hit_location': hd.get('location'),
+                    'hc_x': (hd.get('coordinates') or {}).get('coordX'),
+                    'hc_y': (hd.get('coordinates') or {}).get('coordY'),
+                }
+            if ev.get('isPitch') and 'count' in ev and not last_count:
+                c = ev['count']
+                last_count = {'balls': c.get('balls'), 'strikes': c.get('strikes')}
+            if hit_data and last_count:
+                break
+
+        # Compute barrel flag from game feed hitData
+        feed_barrel = None
+        feed_ls = hit_data.get('launch_speed')
+        feed_la = hit_data.get('launch_angle')
+        if feed_ls is not None and feed_la is not None:
+            try:
+                ev_f, ang_f = float(feed_ls), float(feed_la)
+                is_barrel = False
+                if ev_f >= 98:
+                    extra = ev_f - 98
+                    la_lo = max(26 - extra * 2, 8)
+                    la_hi = min(30 + extra * 3, 50)
+                    is_barrel = la_lo <= ang_f <= la_hi
+                feed_barrel = 1 if is_barrel else 0
+            except Exception:
+                pass
+
+        # Compute pull flag from game feed hitData
+        feed_pull = None
+        feed_hcx = hit_data.get('hc_x')
+        stand_code = matchup.get('batSide', {}).get('code')
+        if feed_hcx is not None and stand_code:
+            try:
+                hx = float(feed_hcx)
+                if stand_code == 'R':
+                    feed_pull = 1 if hx < 125.42 else 0
+                else:
+                    feed_pull = 1 if hx > 125.42 else 0
+            except Exception:
+                pass
+
         row = {
             'pa_id': pa_id,
             'game_id': str(game_pk),
@@ -404,18 +456,18 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'total_bases': total_bases,
             'is_sac_fly': is_sac_fly,
             'is_sac_bunt': is_sac_bunt,
-            'launch_speed': None,
-            'launch_angle': None,
+            'launch_speed': hit_data.get('launch_speed'),
+            'launch_angle': hit_data.get('launch_angle'),
             'spray_angle': None,
             'on_1b': None,
             'on_2b': None,
             'on_3b': None,
-            'bb_type': None,
-            'hit_location': None,
-            'hit_distance_sc': None,
+            'bb_type': hit_data.get('bb_type'),
+            'hit_location': hit_data.get('hit_location'),
+            'hit_distance_sc': hit_data.get('hit_distance_sc'),
             'at_bat_number': at_bat_number,
-            'balls': None,
-            'strikes': None,
+            'balls': last_count.get('balls'),
+            'strikes': last_count.get('strikes'),
             'release_speed': None,
             'release_spin_rate': None,
             'spin_axis': None,
@@ -425,6 +477,10 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'swing': None,
             'contact': None,
             'zone': None,
+            'hc_x': hit_data.get('hc_x'),
+            'hc_y': hit_data.get('hc_y'),
+            'barrel': feed_barrel,
+            'pull': feed_pull,
             'batter_is_home': 0 if about.get('isTopInning', True) else 1,
             'home_team': home,
             'away_team': away,
@@ -675,6 +731,11 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             except Exception:
                 pa_id = f"{int(game_pk)}_{int(batter)}_{int(at_bat_number)}"
 
+        # Batted-ball fields that only belong on the result pitch (not fouls).
+        _BBE_COLS = {'launch_speed', 'launch_angle', 'bb_type', 'hc_x', 'hc_y',
+                     'hit_distance_sc', 'hit_location'}
+        is_result_pitch = pd.notna(srow.get('events'))
+
         pa_update = {}
         pitch_row = {}
         for statcol, info in mapping.items():
@@ -686,7 +747,12 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             if pd.isna(val):
                 val = None
             if table == 'plate_appearances':
-                pa_update[col] = val
+                if val is not None:
+                    # Only apply BBE fields from the final result pitch,
+                    # not from foul balls or other intermediate pitches.
+                    if col in _BBE_COLS and not is_result_pitch:
+                        continue
+                    pa_update[col] = val
             elif table == 'pitching_appearances':
                 pitch_row[col] = val
 
@@ -704,35 +770,46 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             pa_update.setdefault('total_bases', 4)
 
         # Derive `barrel` (approx) and `pull` flags when Statcast does not provide them.
-        # Barrel: fallback heuristic based on exit velocity and launch angle
-        ls = srow.get('launch_speed')
-        la = srow.get('launch_angle')
-        hcx = srow.get('hc_x')
-        try:
-            if 'barrel' not in pa_update:
-                if pd.notna(ls) and pd.notna(la):
+        # Only compute from the result pitch (not fouls).
+        # Barrel: MLB barrel zone — EV ≥ 98 mph with LA range widening as EV increases.
+        if is_result_pitch:
+            ls = srow.get('launch_speed')
+            la = srow.get('launch_angle')
+            hcx = srow.get('hc_x')
+            try:
+                if 'barrel' not in pa_update:
+                    if pd.notna(ls) and pd.notna(la):
+                        try:
+                            ev, ang = float(ls), float(la)
+                            is_barrel = False
+                            if ev >= 98:
+                                # Base zone at 98 mph: 26-30°
+                                # Each +1 mph widens ~2° low, ~3° high
+                                extra = ev - 98
+                                la_lo = max(26 - extra * 2, 8)
+                                la_hi = min(30 + extra * 3, 50)
+                                is_barrel = la_lo <= ang <= la_hi
+                            pa_update['barrel'] = 1 if is_barrel else 0
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            # Pull: handedness-aware heuristic using hit coordinate (`hc_x`) and batter stand
+            try:
+                if 'pull' not in pa_update and pd.notna(hcx):
+                    stand = srow.get('stand')
                     try:
-                        pa_update['barrel'] = 1 if (float(ls) >= 98 and 26 <= float(la) <= 30) else 0
+                        hx = float(hcx)
+                        if pd.notna(stand):
+                            if stand == 'R':
+                                pa_update['pull'] = 1 if hx < 125.42 else 0
+                            else:  # L or S
+                                pa_update['pull'] = 1 if hx > 125.42 else 0
                     except Exception:
                         pass
-        except Exception:
-            pass
-
-        # Pull: handedness-aware heuristic using hit coordinate (`hc_x`) and batter stand
-        try:
-            if 'pull' not in pa_update and pd.notna(hcx):
-                stand = srow.get('stand')
-                try:
-                    hx = float(hcx)
-                    if pd.notna(stand):
-                        if stand == 'R':
-                            pa_update['pull'] = 1 if hx < 125.42 else 0
-                        else:  # L or S
-                            pa_update['pull'] = 1 if hx > 125.42 else 0
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         if pa_id and pa_update:
             # Try exact pa_id first

@@ -1174,9 +1174,9 @@ class DataManager:
                       SUM(CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END) as barrel_denom,
                       SUM(CASE WHEN hc_x IS NOT NULL AND ((stand='R' AND hc_x<125.42) OR (stand='L' AND hc_x>125.42)) THEN 1 ELSE 0 END) as pulls,
                       SUM(CASE WHEN hc_x IS NOT NULL THEN 1 ELSE 0 END) as pull_denom,
-                      AVG(CASE WHEN launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
-                      AVG(CASE WHEN launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
-                      MAX(launch_speed) as max_ev_raw
+                      AVG(CASE WHEN bb_type IS NOT NULL AND launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
+                      AVG(CASE WHEN bb_type IS NOT NULL AND launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
+                      MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw
                     FROM plate_appearances
                     WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
                     """
@@ -2053,9 +2053,9 @@ class DataManager:
                   SUM(CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END) as barrel_denom,
                   SUM(CASE WHEN hc_x IS NOT NULL AND ((stand='R' AND hc_x<125.42) OR (stand='L' AND hc_x>125.42)) THEN 1 ELSE 0 END) as pulls,
                   SUM(CASE WHEN hc_x IS NOT NULL THEN 1 ELSE 0 END) as pull_denom,
-                  AVG(CASE WHEN launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
-                  AVG(CASE WHEN launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
-                  MAX(launch_speed) as max_ev_raw
+                  AVG(CASE WHEN bb_type IS NOT NULL AND launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
+                  AVG(CASE WHEN bb_type IS NOT NULL AND launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
+                  MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw
                 FROM plate_appearances pa
                 WHERE pa.batter_id = ? AND pa.pitcher_id = ? {date_sql}
                 """
@@ -3899,6 +3899,7 @@ def build_navbar(height, items, on_switch, bg=None):
  
     hl.addStretch()
     restyle()
+    bar._layout = hl          # expose so callers can append right-side widgets
     return bar, btns
  
  
@@ -4068,40 +4069,45 @@ class GameDetailPanel(QWidget):
             home_starter = {'id': game.get('home_p_id'), 'name': home_p,
                             'throws': data['home_p_throws']}
 
-            # Batting
-            try:
-                lineup_res = _DM.get_game_lineup(gid) if gid else None
-                if lineup_res:
-                    data['bat'] = lineup_res
-                else:
-                    data['bat'] = _game_batting(away, home)
-            except Exception:
-                data['bat'] = _game_batting(away, home)
+            # Run all 4 data queries in parallel
+            def _q_bat():
+                try:
+                    res = _DM.get_game_lineup(gid) if gid else None
+                    return res if res else _game_batting(away, home)
+                except Exception:
+                    return _game_batting(away, home)
 
-            # Pitching
-            try:
-                pit_res = _DM.get_game_pitching(gid, away_starter=away_starter,
+            def _q_pit():
+                try:
+                    res = _DM.get_game_pitching(gid, away_starter=away_starter,
                                                  home_starter=home_starter) if gid else None
-                if pit_res:
-                    data['pit'] = pit_res
-                else:
-                    data['pit'] = _game_pitching(away, home, away_p, home_p)
-            except Exception:
-                data['pit'] = _game_pitching(away, home, away_p, home_p)
+                    return res if res else _game_pitching(away, home, away_p, home_p)
+                except Exception:
+                    return _game_pitching(away, home, away_p, home_p)
 
-            # Baserunning
-            try:
-                data['br'] = _DM.get_game_baserunning(gid, away_starter=away_starter,
-                                                       home_starter=home_starter) if gid else None
-            except Exception:
-                data['br'] = None
+            def _q_br():
+                try:
+                    return _DM.get_game_baserunning(gid, away_starter=away_starter,
+                                                     home_starter=home_starter) if gid else None
+                except Exception:
+                    return None
 
-            # BvP
-            try:
-                data['bvp'] = _DM.get_bvp_data(gid, away_starter=away_starter,
-                                                 home_starter=home_starter) if gid else None
-            except Exception:
-                data['bvp'] = None
+            def _q_bvp():
+                try:
+                    return _DM.get_bvp_data(gid, away_starter=away_starter,
+                                             home_starter=home_starter) if gid else None
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=4) as detail_pool:
+                f_bat = detail_pool.submit(_q_bat)
+                f_pit = detail_pool.submit(_q_pit)
+                f_br  = detail_pool.submit(_q_br)
+                f_bvp = detail_pool.submit(_q_bvp)
+                data['bat'] = f_bat.result()
+                data['pit'] = f_pit.result()
+                data['br']  = f_br.result()
+                data['bvp'] = f_bvp.result()
 
             # Seasons for filter
             try:
@@ -4956,8 +4962,10 @@ def build_home_page():
     cl.setSpacing(2)
     cl.addWidget(mk_label("TODAY'S GAMES", color=C["t3"], size=10, mono=True,
                            align=Qt.AlignmentFlag.AlignCenter))
-    cl.addWidget(mk_label(str(len(GAMES)), color=C["t1"], size=22, bold=True, mono=True,
-                           align=Qt.AlignmentFlag.AlignCenter))
+    _games_count_lbl = mk_label(str(len(GAMES)), color=C["t1"], size=22, bold=True, mono=True,
+                                align=Qt.AlignmentFlag.AlignCenter)
+    cl.addWidget(_games_count_lbl)
+    page._games_count_lbl = _games_count_lbl
     top.addWidget(cnt)
     vl.addLayout(top)
     vl.addSpacing(16)
@@ -5174,7 +5182,7 @@ def build_top_stats_page(title, subtitle, leaderboards=None):
     return page
  
  
-def build_matchup_page(games=None, odds=None, on_click=None):
+def build_matchup_page(games=None, odds=None, on_click=None, date=None):
     page = QWidget()
     page.setStyleSheet(f"background:{C['bg0']};")
     outer = QVBoxLayout(page)
@@ -5189,10 +5197,22 @@ def build_matchup_page(games=None, odds=None, on_click=None):
     hvl.setSpacing(0)
     hvl.addWidget(mk_label("Game Tracker", color=C["t1"], size=22, bold=True))
     try:
-        friendly = dt.datetime.now().strftime("%A, %B %d")
+        if date:
+            friendly = date.strftime("%A, %B %d")
+        else:
+            friendly = dt.datetime.now().strftime("%A, %B %d")
     except Exception:
         friendly = ""
-    sub_text = f"Today's matchups · {friendly}" if friendly else "Today's matchups"
+    today = dt.date.today()
+    if date and date == today:
+        prefix = "Today's matchups"
+    elif date and date == today - dt.timedelta(days=1):
+        prefix = "Yesterday's matchups"
+    elif date and date == today + dt.timedelta(days=1):
+        prefix = "Tomorrow's matchups"
+    else:
+        prefix = "Matchups"
+    sub_text = f"{prefix} · {friendly}" if friendly else prefix
     sub = mk_label(sub_text, color=C["t2"], size=13)
     sub.setContentsMargins(0, 3, 0, 0)
     hvl.addWidget(sub)
@@ -5339,6 +5359,66 @@ class SeamStatsApp(QMainWindow):
              ("[ 03 ]","PITCHING"),("[ 04 ]","BASE RUNNING"),("[ 05 ]","GAME TRACKER"),
              ("[ 06 ]","LINEUPS"),("[ 07 ]","PARK FACTORS")],
             self._on_main_nav)
+
+        # ── Date selector (right side of navbar) ──
+        self._selected_date = dt.date.today()
+        self._date_lbl = mk_label(
+            self._selected_date.strftime("%a, %b %d"),
+            color=C["t1"], size=12, bold=True, mono=True)
+        self._date_lbl.setContentsMargins(6, 0, 6, 0)
+
+        def _svg_icon(svg_path, color):
+            from PyQt6.QtCore import QByteArray
+            try:
+                with open(svg_path, "r", encoding="utf-8") as f:
+                    svg = f.read()
+                svg = svg.replace('stroke="#000000"', f'stroke="{color}"')
+                pm = QPixmap(20, 20)
+                pm.fill(QColor(0, 0, 0, 0))
+                rn = QSvgRenderer(QByteArray(svg.encode()))
+                p = QPainter(pm)
+                rn.render(p)
+                p.end()
+                return QIcon(pm)
+            except Exception:
+                return QIcon()
+
+        _arrow_l_svg = os.path.join(_app_paths.APP_DIR, "assets", "arrow-circle-left.svg")
+        _arrow_r_svg = os.path.join(_app_paths.APP_DIR, "assets", "arrow-circle-right.svg")
+        self._arrow_icons = {
+            'left':  _svg_icon(_arrow_l_svg, C["t2"]),
+            'left_dim':  _svg_icon(_arrow_l_svg, C["t3"]),
+            'right': _svg_icon(_arrow_r_svg, C["t2"]),
+            'right_dim': _svg_icon(_arrow_r_svg, C["t3"]),
+        }
+
+        _arrow_ss = f"""QPushButton {{
+            background:transparent; border:none; padding:2px;
+        }}
+        QPushButton:hover {{ background:{C['bg2']}; border-radius:4px; }}"""
+
+        self._date_left = QPushButton()
+        self._date_left.setFixedSize(28, 28)
+        self._date_left.setIconSize(QSize(20, 20))
+        self._date_left.setIcon(self._arrow_icons['left'])
+        self._date_left.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_left.setStyleSheet(_arrow_ss)
+        self._date_left.clicked.connect(lambda: self._shift_date(-1))
+
+        self._date_right = QPushButton()
+        self._date_right.setFixedSize(28, 28)
+        self._date_right.setIconSize(QSize(20, 20))
+        self._date_right.setIcon(self._arrow_icons['right'])
+        self._date_right.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._date_right.setStyleSheet(_arrow_ss)
+        self._date_right.clicked.connect(lambda: self._shift_date(+1))
+
+        main_nav._layout.addWidget(self._date_left)
+        main_nav._layout.addWidget(self._date_lbl)
+        main_nav._layout.addWidget(self._date_right)
+        main_nav._layout.addSpacing(8)
+        self._update_date_arrows()
+
         root.addWidget(main_nav)
  
         body = QHBoxLayout()
@@ -5385,6 +5465,21 @@ class SeamStatsApp(QMainWindow):
         # Immediately prefetch plays for all live/final games so data is ready
         # before the user opens the schedule page
         self._prefetch_all_plays()
+
+        # Pre-fetch tomorrow's schedule so date switching is instant
+        def _prefetch_tomorrow():
+            try:
+                import time
+                time.sleep(3)                  # let today's weather finish first
+                tomorrow = (dt.date.today() + dt.timedelta(days=1)).isoformat()
+                _DM.fetch_live_games(tomorrow)
+                prefetch_weather(tomorrow)      # soft: skips if cache exists
+            except Exception:
+                log.exception("prefetch_tomorrow")
+        _bg_pool.submit(_prefetch_tomorrow)
+
+        # Auto-check for app updates on launch (silent — only shows status bar hint)
+        QTimer.singleShot(3000, lambda: self._check_for_app_update(silent=True))
  
     def _titlebar(self):
         bar = QFrame()
@@ -5416,6 +5511,26 @@ class SeamStatsApp(QMainWindow):
         hl.addWidget(self._update_pct_lbl)
         hl.addSpacing(4)
 
+        # ── Version label ──
+        ver_lbl = mk_label(f"v{_app_paths.APP_VERSION}", color=C["t3"], size=10, mono=True)
+        hl.addWidget(ver_lbl)
+        hl.addSpacing(6)
+
+        # ── Check for Updates button ──
+        self._check_update_btn = QPushButton("Check for Updates")
+        self._check_update_btn.setFixedHeight(28)
+        self._check_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._check_update_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 10px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['grn']}; border-color:{C['grn']}; }}
+            QPushButton:disabled {{ color:{C['t3']}; border-color:{C['bdr']}; opacity:0.5; }}
+        """)
+        self._check_update_btn.clicked.connect(self._on_check_for_updates)
+        hl.addWidget(self._check_update_btn)
+        hl.addSpacing(6)
+
         # ── Update Data button ──
         self._update_btn = QPushButton("Update Data")
         self._update_btn.setFixedHeight(28)
@@ -5430,9 +5545,6 @@ class SeamStatsApp(QMainWindow):
         self._update_btn.clicked.connect(self._run_manual_update)
         hl.addWidget(self._update_btn)
         hl.addSpacing(6)
-
-        ver_lbl = mk_label(f"v{_app_paths.APP_VERSION}", color=C["t3"], size=10, mono=True)
-        hl.addWidget(ver_lbl)
         _info_svg = os.path.join(_app_paths.APP_DIR, "assets", "info-svgrepo-com.svg")
         about_btn = QPushButton()
         try:
@@ -5568,6 +5680,263 @@ class SeamStatsApp(QMainWindow):
             msg.exec()
             self.set_status("Data update complete!", timeout=8000)
 
+    # ── App-version update system ────────────────────────────────────
+    _GITHUB_RELEASES_URL = "https://api.github.com/repos/nateoswald16/SEAM-ANALYTICS/releases/latest"
+    _MSG_STYLE = (f"QMessageBox {{ background:{C['bg1']}; color:{C['t1']}; }}"
+                  f" QPushButton {{ background:{C['bg3']}; color:{C['t1']};"
+                  f" border:1px solid {C['bdr']}; padding:6px 20px; border-radius:4px; }}")
+
+    def _check_for_app_update(self, silent: bool = True):
+        """Query GitHub releases API for a newer version.
+
+        *silent* — if True (launch check) only show status bar hint;
+                   if False (button click) show progress on button.
+        """
+        class _CheckWorker(QThread):
+            result = pyqtSignal(str, str, str)  # new_ver, asset_url, body (or "" on no update)
+
+            def run(self_w):
+                try:
+                    r = requests.get(
+                        SeamStatsApp._GITHUB_RELEASES_URL,
+                        headers={"Accept": "application/vnd.github+json"},
+                        timeout=10,
+                    )
+                    if r.status_code == 404:
+                        self_w.result.emit("", "", "")
+                        return
+                    r.raise_for_status()
+                    data = r.json()
+                    tag = data.get("tag_name", "").lstrip("vV")
+                    body = data.get("body", "")
+                    # Find the setup .exe asset
+                    asset_url = ""
+                    for a in data.get("assets", []):
+                        name = a.get("name", "")
+                        if name.lower().endswith(".exe") and "setup" in name.lower():
+                            asset_url = a.get("browser_download_url", "")
+                            break
+                    if tag and tag != _app_paths.APP_VERSION:
+                        self_w.result.emit(tag, asset_url, body)
+                    else:
+                        self_w.result.emit("", "", "")
+                except Exception:
+                    self_w.result.emit("", "", "")
+
+        self._update_check_silent = silent
+        if not silent:
+            self._check_update_btn.setEnabled(False)
+            self._check_update_btn.setText("Checking…")
+        self._check_worker = _CheckWorker()
+        self._check_worker.result.connect(self._on_update_check_result)
+        self._check_worker.start()
+
+    def _on_update_check_result(self, new_ver: str, asset_url: str, body: str):
+        """Handle the result of a version check."""
+        self._check_update_btn.setEnabled(True)
+        self._check_update_btn.setText("Check for Updates")
+        if not new_ver:
+            if not self._update_check_silent:
+                from PyQt6.QtWidgets import QMessageBox
+                msg = QMessageBox(self)
+                msg.setWindowTitle("Check for Updates")
+                msg.setIcon(QMessageBox.Icon.Information)
+                msg.setText(f"v{_app_paths.APP_VERSION} — You're on the latest version!")
+                msg.setStyleSheet(self._MSG_STYLE)
+                msg.exec()
+            return
+        # Store for download
+        self._pending_update_ver = new_ver
+        self._pending_update_url = asset_url
+        self._pending_update_body = body
+        # Highlight button
+        self._check_update_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['grn']}; border:1px solid {C['grn']};
+                           border-radius:4px; font-size:11px; padding:0 10px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['t1']}; border-color:{C['grn']}; background:{C['bg3']}; }}
+        """)
+        self._check_update_btn.setText(f"Update → v{new_ver}")
+        if self._update_check_silent:
+            self.set_status(
+                f"Update v{new_ver} available — click \"Update → v{new_ver}\" to install",
+                timeout=0)
+
+    def _on_check_for_updates(self):
+        """Button-click handler: if an update is pending, start download; otherwise check."""
+        if hasattr(self, '_pending_update_ver') and self._pending_update_ver:
+            self._start_update_download()
+        else:
+            self._check_for_app_update(silent=False)
+
+    def _start_update_download(self):
+        """Download the installer and show confirmation dialog."""
+        from PyQt6.QtWidgets import QMessageBox
+        url = getattr(self, '_pending_update_url', '')
+        new_ver = getattr(self, '_pending_update_ver', '')
+        body = getattr(self, '_pending_update_body', '')
+        if not url:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Update Unavailable")
+            msg.setIcon(QMessageBox.Icon.Warning)
+            msg.setText("No installer found for this release.\n"
+                        "Please download manually from the GitHub releases page.")
+            msg.setStyleSheet(self._MSG_STYLE)
+            msg.exec()
+            return
+
+        # Confirmation dialog
+        msg = QMessageBox(self)
+        msg.setWindowTitle("App Update Available")
+        msg.setIcon(QMessageBox.Icon.Information)
+        detail_lines = [f"<b>Current version:</b>  v{_app_paths.APP_VERSION}",
+                        f"<b>New version:</b>  v{new_ver}"]
+        if body:
+            # Show first ~300 chars of release notes
+            notes = body[:300].replace("\n", "<br>")
+            if len(body) > 300:
+                notes += "…"
+            _t2 = C["t2"]
+            detail_lines.append(f"<br><b>Release notes:</b><br><span style='color:{_t2}'>{notes}</span>")
+        msg.setText("<br>".join(detail_lines))
+        msg.setInformativeText("Download and install this update?")
+        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
+        msg.setStyleSheet(self._MSG_STYLE)
+        if msg.exec() != QMessageBox.StandardButton.Yes:
+            return
+
+        # Start download
+        self._check_update_btn.setEnabled(False)
+        self._check_update_btn.setText("Downloading…")
+        self._update_progress.setRange(0, 100)
+        self._update_progress.setValue(0)
+        self._update_progress.show()
+        self._update_pct_lbl.setText("0%")
+        self._update_pct_lbl.show()
+        self.set_status("Downloading update…", timeout=0)
+
+        import tempfile
+        self._update_tmp_dir = tempfile.mkdtemp(prefix="seam_update_")
+        self._update_tmp_file = os.path.join(self._update_tmp_dir,
+                                             f"SeamAnalytics-Setup-{new_ver}.exe")
+
+        class _DownloadWorker(QThread):
+            progress = pyqtSignal(int)      # percent
+            finished = pyqtSignal(str)      # error_msg ("" on success)
+
+            def __init__(self_w, url, dest):
+                super().__init__()
+                self_w._url = url
+                self_w._dest = dest
+
+            def run(self_w):
+                try:
+                    r = requests.get(self_w._url, stream=True, timeout=60,
+                                     headers={"Accept": "application/octet-stream"})
+                    r.raise_for_status()
+                    total = int(r.headers.get("content-length", 0))
+                    downloaded = 0
+                    with open(self_w._dest, "wb") as f:
+                        for chunk in r.iter_content(chunk_size=256 * 1024):
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            if total > 0:
+                                self_w.progress.emit(int(downloaded * 100 / total))
+                    self_w.finished.emit("")
+                except Exception as exc:
+                    self_w.finished.emit(str(exc))
+
+        self._dl_worker = _DownloadWorker(url, self._update_tmp_file)
+        self._dl_worker.progress.connect(self._on_dl_progress)
+        self._dl_worker.finished.connect(self._on_dl_done)
+        self._dl_worker.start()
+
+    def _on_dl_progress(self, pct: int):
+        self._update_progress.setValue(pct)
+        self._update_pct_lbl.setText(f"{pct}%")
+        self._check_update_btn.setText(f"Downloading… {pct}%")
+
+    def _on_dl_done(self, error: str):
+        self._update_progress.hide()
+        self._update_pct_lbl.hide()
+        self._check_update_btn.setEnabled(True)
+        from PyQt6.QtWidgets import QMessageBox
+        if error:
+            self._check_update_btn.setText("Check for Updates")
+            self.set_status(f"Download failed: {error}", timeout=10000, error=True)
+            # Clean up temp file
+            try:
+                os.remove(self._update_tmp_file)
+                os.rmdir(self._update_tmp_dir)
+            except Exception:
+                pass
+            return
+
+        self.set_status("Download complete — installing…", timeout=0)
+        self._check_update_btn.setText("Installing…")
+        self._check_update_btn.setEnabled(False)
+
+        # Run the Inno Setup installer silently
+        import subprocess
+        try:
+            subprocess.Popen(
+                [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
+                 "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"],
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as exc:
+            self._check_update_btn.setEnabled(True)
+            self._check_update_btn.setText("Check for Updates")
+            self.set_status(f"Install failed: {exc}", timeout=10000, error=True)
+            return
+
+        # Prompt user to restart
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Update Installed")
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(f"<b>Seam Analytics v{self._pending_update_ver}</b> has been installed.<br><br>"
+                    "The app needs to restart to apply the update.")
+        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+        msg.setStyleSheet(self._MSG_STYLE)
+        msg.exec()
+
+        # Schedule temp file cleanup and restart
+        self._restart_after_update()
+
+    def _restart_after_update(self):
+        """Clean up temp installer and restart the app."""
+        import subprocess
+        # Build the restart command: delete temp file, then launch app
+        tmp = getattr(self, '_update_tmp_file', '')
+        tmp_dir = getattr(self, '_update_tmp_dir', '')
+        if _app_paths._frozen:
+            app_exe = sys.executable
+        else:
+            app_exe = None  # dev mode: user restarts manually
+
+        if sys.platform == "win32" and app_exe:
+            # Use cmd to wait a moment, delete temp, and relaunch
+            cleanup_cmd = (
+                f'cmd /c ping -n 2 127.0.0.1 >nul '
+                f'& del /q "{tmp}" '
+                f'& rmdir /q "{tmp_dir}" '
+                f'& start "" "{app_exe}"'
+            )
+            subprocess.Popen(cleanup_cmd, shell=True,
+                             creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            # Non-frozen / non-Windows: just clean up, user restarts
+            try:
+                if tmp and os.path.isfile(tmp):
+                    os.remove(tmp)
+                if tmp_dir and os.path.isdir(tmp_dir):
+                    os.rmdir(tmp_dir)
+            except Exception:
+                pass
+
+        QApplication.instance().quit()
+
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
         msg = QMessageBox(self)
@@ -5613,8 +5982,8 @@ class SeamStatsApp(QMainWindow):
  
     def _sidebar(self):
         sb = QFrame()
-        sb.setMinimumWidth(260)
-        sb.setMaximumWidth(300)
+        sb.setMinimumWidth(290)
+        sb.setMaximumWidth(320)
         sb.setStyleSheet(f"QFrame {{ background:{C['bg1']}; border-right:1px solid {C['bdr']}; }}")
         vl = QVBoxLayout(sb)
         vl.setContentsMargins(0,0,0,0)
@@ -5627,13 +5996,14 @@ class SeamStatsApp(QMainWindow):
         hl.setContentsMargins(14,8,14,8)
         hl.setSpacing(2)
         hl.addWidget(mk_label("[ SCHEDULE ]", color=C["t3"], size=10, mono=True))
-        # use system 'today' as selected date
-        sel_date = dt.date.today().isoformat()
+        # use selected date (defaults to today, changed by navbar date selector)
+        sel_date = self._selected_date.isoformat()
         try:
             friendly = dt.datetime.strptime(sel_date, "%Y-%m-%d").strftime("%a, %b %d")
         except Exception:
             friendly = sel_date
-        hl.addWidget(mk_label(friendly, color=C["t1"], size=14, bold=True))
+        self._sidebar_date_lbl = mk_label(friendly, color=C["t1"], size=14, bold=True)
+        hl.addWidget(self._sidebar_date_lbl)
         vl.addWidget(hdr)
  
         sa = SmoothScrollArea()
@@ -5655,15 +6025,12 @@ class SeamStatsApp(QMainWindow):
 
         self._games.sort(key=_game_sort_key)
 
-        # start background prefetch of lineups and weather (best-effort)
+        # start background prefetch of lineups (best-effort)
+        # (weather is fetched by ParkFactorsPage's _WeatherWorker)
         try:
             self._lineup_prefetch_future = _bg_pool.submit(_DM.prefetch_lineups, self._games)
         except Exception:
             self._lineup_prefetch_future = None
-            log.exception("_sidebar")
-        try:
-            _bg_pool.submit(prefetch_weather)
-        except Exception:
             log.exception("_sidebar")
         for i, game in enumerate(self._games):
             card = GameCard(game, i, self._on_game_clicked)
@@ -5687,9 +6054,11 @@ class SeamStatsApp(QMainWindow):
         self._stack.addWidget(build_matchup_page(
             games=self._games if hasattr(self, '_games') else GAMES,
             odds=None,
-            on_click=None))
+            on_click=None,
+            date=self._selected_date))
         self._stack.addWidget(QWidget())  # Lineups placeholder (actual view is IDX_GAME)
-        self._stack.addWidget(ParkFactorsPage())
+        self._park_page = ParkFactorsPage(date_str=self._selected_date.isoformat())
+        self._stack.addWidget(self._park_page)
 
         # Fetch leaderboard data in background thread
         class _LBNotifier(QObject):
@@ -5700,10 +6069,10 @@ class SeamStatsApp(QMainWindow):
         def _fetch_lb():
             hit_lbs, pit_lbs, br_lbs = [], [], []
             try:
-                # Wait for lineup prefetch to finish so cache files are available
+                # Wait for lineup prefetch (short timeout — proceed without if slow)
                 if getattr(self, '_lineup_prefetch_future', None):
                     try:
-                        self._lineup_prefetch_future.result(timeout=60)
+                        self._lineup_prefetch_future.result(timeout=10)
                     except Exception:
                         pass
                 pt = _DM.get_todays_player_info(self._games)
@@ -5732,6 +6101,7 @@ class SeamStatsApp(QMainWindow):
                         ("EXIT VELO",      bat_with_min["avg_ev"],   _fmt_spd),
                         ("HIT STREAK",     _DM.get_streak_leaderboard(pt, 'is_hit'),     _fmt_streak, "GAMES"),
                         ("HR STREAK",      _DM.get_streak_leaderboard(pt, 'is_home_run'), _fmt_streak, "GAMES"),
+                        ("HR + SB GAMES",  _DM.get_hr_sb_game_leaderboard(pt),            _fmt_streak, "GAMES"),
                     ]
 
                     _pit = "calculated_pitching_stats"
@@ -5867,6 +6237,9 @@ class SeamStatsApp(QMainWindow):
         """Spawn a background thread to fetch fresh schedule data."""
         if self._score_fetching:
             return
+        # Only poll live scores when viewing today
+        if self._selected_date != dt.date.today():
+            return
         self._score_fetching = True
         self.set_status("Updating scores\u2026", timeout=0)
         notifier = self._score_notifier
@@ -5904,7 +6277,8 @@ class SeamStatsApp(QMainWindow):
     @staticmethod
     def _merge_game(old, new):
         """Merge new game data over old, preserving live fields during API gaps."""
-        merged = {**old, **new}
+        merged = dict(old)
+        merged.update(new)
         was_live = _is_game_live(old)
         if was_live:
             # Preserve status when new response is empty/missing
@@ -6151,7 +6525,7 @@ class SeamStatsApp(QMainWindow):
         try:
             games = self._games if hasattr(self, '_games') else GAMES
             new_page = build_matchup_page(games=games, odds=odds,
-                                          on_click=None)
+                                          on_click=None, date=self._selected_date)
             cur = self._stack.currentIndex()
             old = self._stack.widget(self.IDX_MATCHUP)
             self._stack.removeWidget(old)
@@ -6202,6 +6576,135 @@ class SeamStatsApp(QMainWindow):
         for c in self._cards:
             c.set_selected(False)
         self._sel_card = None
+
+    # ── Date selector logic ───────────────────────────────────────────
+    def _update_date_arrows(self):
+        """Enable/disable arrow buttons based on selected date vs today ±1."""
+        today = dt.date.today()
+        can_left = self._selected_date > today - dt.timedelta(days=1)
+        can_right = self._selected_date < today + dt.timedelta(days=1)
+        self._date_left.setEnabled(can_left)
+        self._date_right.setEnabled(can_right)
+        self._date_left.setIcon(self._arrow_icons['left' if can_left else 'left_dim'])
+        self._date_right.setIcon(self._arrow_icons['right' if can_right else 'right_dim'])
+
+    def _shift_date(self, delta: int):
+        """Move selected date by *delta* days (-1 or +1), then reload."""
+        today = dt.date.today()
+        new_date = self._selected_date + dt.timedelta(days=delta)
+        if new_date < today - dt.timedelta(days=1) or new_date > today + dt.timedelta(days=1):
+            return
+        self._selected_date = new_date
+        self._date_lbl.setText(new_date.strftime("%a, %b %d"))
+        self._update_date_arrows()
+        self._load_date(new_date)
+
+    def _load_date(self, date: dt.date):
+        """Fetch games for *date* and refresh sidebar + schedule + leaderboards."""
+        date_str = date.isoformat()
+        today = dt.date.today()
+        self.set_status(f"Loading {date.strftime('%b %d')}\u2026", timeout=0)
+
+        # Fetch games: DB first, then live API
+        games = _DM.get_games_for_date(date_str)
+        if not games:
+            games = _DM.fetch_live_games(date_str)
+        if not games:
+            games = []
+
+        self._games = sorted(games, key=_game_sort_key)
+
+        # Clear stale play-by-play cache from previous date
+        self._plays_cache.clear()
+
+        # ── Rebuild sidebar cards ──
+        while self._card_layout.count():
+            item = self._card_layout.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self._cards = []
+        self._sel_card = None
+        for i, game in enumerate(self._games):
+            card = GameCard(game, i, self._on_game_clicked)
+            self._cards.append(card)
+            self._card_layout.addWidget(card)
+        self._card_layout.addStretch()
+
+        # Update sidebar header date label
+        try:
+            self._sidebar_date_lbl.setText(date.strftime("%a, %b %d"))
+        except Exception:
+            pass
+
+        # Update home page games count
+        try:
+            home = self._stack.widget(self.IDX_HOME)
+            if hasattr(home, '_games_count_lbl'):
+                home._games_count_lbl.setText(str(len(self._games)))
+        except Exception:
+            pass
+
+        # ── Rebuild schedule (matchup) page — deferred to avoid UI freeze ──
+        def _rebuild_matchup():
+            try:
+                new_page = build_matchup_page(games=self._games, odds=None, on_click=None, date=date)
+                cur = self._stack.currentIndex()
+                old = self._stack.widget(self.IDX_MATCHUP)
+                self._stack.removeWidget(old)
+                old.deleteLater()
+                self._stack.insertWidget(self.IDX_MATCHUP, new_page)
+                self._stack.setCurrentIndex(cur)
+            except Exception:
+                log.exception("_load_date matchup page")
+        QTimer.singleShot(0, _rebuild_matchup)
+
+        # ── Rebuild park factors page for new date — deferred ──
+        def _rebuild_park():
+            try:
+                new_park = ParkFactorsPage(date_str=date_str)
+                cur = self._stack.currentIndex()
+                old_park = self._stack.widget(self.IDX_PARK)
+                self._stack.removeWidget(old_park)
+                old_park.deleteLater()
+                self._stack.insertWidget(self.IDX_PARK, new_park)
+                self._park_page = new_park
+                self._stack.setCurrentIndex(cur)
+            except Exception:
+                log.exception("_load_date park page")
+        QTimer.singleShot(50, _rebuild_park)
+
+        # ── Prefetch lineups for new date in background ──
+        # (weather is fetched by ParkFactorsPage's _WeatherWorker above)
+        try:
+            self._lineup_prefetch_future = _bg_pool.submit(_DM.prefetch_lineups, self._games)
+        except Exception:
+            log.exception("_load_date prefetch lineups")
+
+        # ── Reset leaderboards so they re-fetch with new date's lineups ──
+        self._lb_fetched = False
+        # If user is currently on a leaderboard page, re-fetch immediately
+        if self._stack.currentIndex() in (self.IDX_HIT, self.IDX_PITCH, self.IDX_BR):
+            self._lb_fetched = True
+            _bg_pool.submit(self._fetch_lb)
+
+        # ── Score polling: only for today ──
+        if date == today:
+            if not self._score_timer.isActive():
+                self._score_timer.start()
+        else:
+            self._score_timer.stop()
+
+        # ── Re-fetch odds for today only ──
+        if date == today:
+            _bg_pool.submit(self._fetch_odds_bg)
+
+        # ── If currently viewing the lineup/game page, auto-select first game ──
+        if self._games and self._stack.currentIndex() == self.IDX_GAME:
+            self._on_game_clicked(0)
+
+        count = len(self._games)
+        self.set_status(f"Loaded {date.strftime('%b %d')}", right=f"{count} game{'s' if count != 1 else ''}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
