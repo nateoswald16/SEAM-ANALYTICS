@@ -46,5 +46,9 @@ nul
 *.swp
 *.swo
 
+# ── One-time repair / utility scripts ─────────────────────────
+app/backfill_swing_contact.py
+app/download_historical_statcast.py
+
 # ── API keys ──────────────────────────────────────────────────
 app/weatherapi_key.txt
