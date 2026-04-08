@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.0.2--beta-orange" alt="version">
+  <img src="https://img.shields.io/badge/version-1.0.3--beta-orange" alt="version">
   <img src="https://img.shields.io/badge/python-3.13%2B-blue" alt="python">
   <img src="https://img.shields.io/badge/platform-Windows-lightgrey" alt="platform">
 </p>
@@ -31,7 +31,7 @@
 
 ### Option A: Windows Installer (Recommended)
 
-1. Download `SeamAnalytics-Setup-1.0.0-beta.exe` from the [Releases](../../releases) page
+1. Download `SeamAnalytics-Setup-1.0.3-beta.exe` from the [Releases](../../releases) page
 2. Double-click the installer and follow the wizard
 3. The installer will:
    - Install the app to `Program Files\Seam Analytics`
