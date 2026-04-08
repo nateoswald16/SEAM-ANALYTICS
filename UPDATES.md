@@ -6,6 +6,11 @@ All notable changes to Seam Analytics are documented here.
 
 ## v1.0.3-beta — 2026-04-08
 
+### Game Tracker
+
+**Warmup Inning Indicator**
+- Sidebar and schedule cards now display "WARMUPS" instead of "TOP 1" when a game's status is "Warmup" (pre–first pitch)
+
 ### Game Detail
 
 **BvP Contact% & Whiff% Fix**

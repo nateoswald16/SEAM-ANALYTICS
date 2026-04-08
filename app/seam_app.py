@@ -3119,19 +3119,24 @@ class GameCard(QFrame):
             glow.setOffset(0, 0)
             lbl.setGraphicsEffect(glow)
             time_hl.addWidget(lbl)
-            inn = g.get("inning")
-            state = (g.get("inning_state") or g.get("inning_half") or "").lower()
-            if inn is not None:
-                if state.startswith("top"):
-                    hlbl = "TOP"
-                elif state.startswith("mid"):
-                    hlbl = "MID"
-                elif state.startswith("end"):
-                    hlbl = "END"
-                else:
-                    hlbl = "BOT"
+            _gstatus = (g.get('status') or '').lower()
+            if _gstatus.startswith('warmup'):
                 time_hl.addWidget(mk_label(
-                    f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
+                    "WARMUPS", color=C["t3"], size=10, mono=True))
+            else:
+                inn = g.get("inning")
+                state = (g.get("inning_state") or g.get("inning_half") or "").lower()
+                if inn is not None:
+                    if state.startswith("top"):
+                        hlbl = "TOP"
+                    elif state.startswith("mid"):
+                        hlbl = "MID"
+                    elif state.startswith("end"):
+                        hlbl = "END"
+                    else:
+                        hlbl = "BOT"
+                    time_hl.addWidget(mk_label(
+                        f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True))
         elif ppd:
@@ -3302,18 +3307,23 @@ class ScheduleGameCard(QFrame):
             glow.setOffset(0, 0)
             lbl.setGraphicsEffect(glow)
             time_hl.addWidget(lbl)
-            inn = g.get("inning")
-            state = (g.get("inning_state") or g.get("inning_half") or "").lower()
-            if inn is not None:
-                if state.startswith("top"):
-                    hlbl = "TOP"
-                elif state.startswith("mid"):
-                    hlbl = "MID"
-                elif state.startswith("end"):
-                    hlbl = "END"
-                else:
-                    hlbl = "BOT"
-                time_hl.addWidget(mk_label(f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
+            _gstatus = (g.get('status') or '').lower()
+            if _gstatus.startswith('warmup'):
+                time_hl.addWidget(mk_label(
+                    "WARMUPS", color=C["t3"], size=10, mono=True))
+            else:
+                inn = g.get("inning")
+                state = (g.get("inning_state") or g.get("inning_half") or "").lower()
+                if inn is not None:
+                    if state.startswith("top"):
+                        hlbl = "TOP"
+                    elif state.startswith("mid"):
+                        hlbl = "MID"
+                    elif state.startswith("end"):
+                        hlbl = "END"
+                    else:
+                        hlbl = "BOT"
+                    time_hl.addWidget(mk_label(f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True))
         elif ppd:
