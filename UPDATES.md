@@ -11,6 +11,13 @@ All notable changes to Seam Analytics are documented here.
 **Warmup Inning Indicator**
 - Sidebar and schedule cards now display "WARMUPS" instead of "TOP 1" when a game's status is "Warmup" (pre–first pitch)
 
+### Window
+
+**Multi-Monitor Geometry Persistence**
+- Window position, size, and maximized state are now saved on close and restored on next launch
+- The app remembers which monitor it was on and returns there after minimize/restart
+- If a saved monitor is no longer connected, the window resets to the primary screen
+
 ### Game Detail
 
 **BvP Contact% & Whiff% Fix**

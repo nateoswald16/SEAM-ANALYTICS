@@ -47,7 +47,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
 )
-from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread, QSize
+from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread, QSize, QSettings, QByteArray
 from PyQt6 import sip
 from PyQt6.QtGui import (
     QColor, QFont, QPainter, QPainterPath,
@@ -5381,11 +5381,14 @@ class SeamStatsApp(QMainWindow):
     IDX_PARK    = 6
     IDX_GAME    = 7
  
+    _qsettings = QSettings("SeamAnalytics", "SeamStats")
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"Seam Analytics — MLB Stats  v{_app_paths.APP_VERSION}")
         self.resize(1440, 860)
         self.setMinimumSize(960, 600)
+        self._restore_window_geometry()
         if os.path.exists(_app_paths.LOGO_PNG):
             self.setWindowIcon(QIcon(_app_paths.LOGO_PNG))
         self.setStyleSheet(f"QMainWindow {{ background:{C['bg0']}; }}")
@@ -6275,8 +6278,34 @@ class SeamStatsApp(QMainWindow):
         except RuntimeError:
             pass  # C++ object deleted
  
+    # ── window geometry persistence ────────────────────────────
+    def _restore_window_geometry(self):
+        geo = self._qsettings.value("windowGeometry")
+        state = self._qsettings.value("windowState")
+        if geo is not None and isinstance(geo, QByteArray):
+            self.restoreGeometry(geo)
+            # Verify the restored position is on a visible screen
+            from PyQt6.QtWidgets import QApplication
+            screen = QApplication.screenAt(self.geometry().center())
+            if screen is None:
+                # Saved position is off-screen; reset to primary
+                self.resize(1440, 860)
+                primary = QApplication.primaryScreen()
+                if primary:
+                    ag = primary.availableGeometry()
+                    self.move(ag.x() + (ag.width() - 1440) // 2,
+                              ag.y() + (ag.height() - 860) // 2)
+        if state is not None and isinstance(state, QByteArray):
+            self.restoreState(state)
+        self._geometry_restored = True
+
+    def _save_window_geometry(self):
+        self._qsettings.setValue("windowGeometry", self.saveGeometry())
+        self._qsettings.setValue("windowState", self.saveState())
+
     def closeEvent(self, event):
         """Stop background work promptly when the window is closed."""
+        self._save_window_geometry()
         _DM._shutting_down = True
         self._score_timer.stop()
         _bg_pool.shutdown(wait=False, cancel_futures=True)
@@ -6828,5 +6857,11 @@ if __name__ == "__main__":
     _bg_pool.submit(_init_logos)
 
     win = SeamStatsApp()
-    win.showMaximized()
+    # Restore saved window state (maximized, normal, etc.)
+    if win._qsettings.value("windowGeometry") is not None:
+        win.show()  # geometry already restored in __init__
+        if win.isMaximized():  # restoreGeometry sets the maximized flag
+            pass               # already correct
+    else:
+        win.showMaximized()    # first launch: default to maximized
     sys.exit(app.exec())
