@@ -36,6 +36,10 @@ All notable changes to Seam Analytics are documented here.
 - 61,962 pickoff rows with `is_successful = 1` were inflating SB counts (1,006 vs actual 243 for 2026) and causing players with zero real SBs (e.g. Murakami) to appear on the HR+SB list
 - All three affected queries now filter on `event_type = 'stolen_base'`, matching the existing base running page queries
 
+**Singles, Doubles, Triples Leaders**
+- Added three new leaderboard cards to the batting page: Singles (1B), Doubles (2B), Triples (3B)
+- Sourced from `calculated_batting_stats` for the current season, same as existing cards
+
 ### Park & Weather
 
 **Open-Meteo Double Conversion Fix**

@@ -6127,7 +6127,7 @@ class SeamStatsApp(QMainWindow):
                     _min_pa = ("plate_appearances", 10)
                     # Batch: 3 cols without min filter, 3 cols with min PA filter
                     bat_no_min = _DM.get_leaderboards_batch(
-                        _bat, ["hits", "home_runs", "rbis"], pt)
+                        _bat, ["hits", "home_runs", "rbis", "singles", "doubles", "triples"], pt)
                     bat_with_min = _DM.get_leaderboards_batch(
                         _bat, ["avg", "barrel_pct", "avg_ev"], pt,
                         min_col=_min_pa[0], min_val=_min_pa[1])
@@ -6136,6 +6136,9 @@ class SeamStatsApp(QMainWindow):
                         ("HOME RUNS (HR)", bat_no_min["home_runs"],  _fmt_int),
                         ("BATTING AVG",    bat_with_min["avg"],      _fmt_avg),
                         ("RBI",            bat_no_min["rbis"],       _fmt_int),
+                        ("SINGLES (1B)",   bat_no_min["singles"],    _fmt_int),
+                        ("DOUBLES (2B)",   bat_no_min["doubles"],    _fmt_int),
+                        ("TRIPLES (3B)",   bat_no_min["triples"],    _fmt_int),
                         ("BARREL %",       bat_with_min["barrel_pct"], _fmt_pct),
                         ("EXIT VELO",      bat_with_min["avg_ev"],   _fmt_spd),
                         ("HIT STREAK",     _DM.get_streak_leaderboard(pt, 'is_hit'),     _fmt_streak, "GAMES"),
