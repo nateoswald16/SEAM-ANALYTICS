@@ -636,7 +636,7 @@ class DataManager:
             f"  SELECT runner_id, game_date"
             f"  FROM stolen_bases"
             f"  WHERE season = ? AND runner_id IN ({placeholders})"
-            f"    AND is_successful = 1"
+            f"    AND event_type = 'stolen_base' AND is_successful = 1"
             f"  GROUP BY runner_id, game_date"
             f") sb ON hr.batter_id = sb.runner_id AND hr.game_date = sb.game_date "
             f"GROUP BY hr.batter_id "
@@ -999,7 +999,7 @@ class DataManager:
 
             # Stolen bases
             sb_row = conn.execute(
-                "SELECT SUM(is_successful) sb FROM stolen_bases WHERE season=?",
+                "SELECT SUM(is_successful) sb FROM stolen_bases WHERE season=? AND event_type='stolen_base'",
                 (season,)).fetchone()
             sb_per_g = (sb_row["sb"] or 0) / games
 
@@ -1012,7 +1012,7 @@ class DataManager:
             prev_avg = rp["h"] / max(rp["ab"], 1)
             prev_hr = rp["hr"] / prev_games
             prev_sb_row = conn.execute(
-                "SELECT SUM(is_successful) sb FROM stolen_bases WHERE season=?",
+                "SELECT SUM(is_successful) sb FROM stolen_bases WHERE season=? AND event_type='stolen_base'",
                 (prev,)).fetchone()
             prev_sb = (prev_sb_row["sb"] or 0) / prev_games
 

@@ -29,6 +29,13 @@ All notable changes to Seam Analytics are documented here.
 **Corrupt Cache Handling**
 - Lineup cache files with invalid JSON are now detected, deleted, and re-fetched instead of crashing
 
+### Leaderboards
+
+**Stolen Base Queries — Pickoff Exclusion**
+- Fixed HR+SB Games leaderboard and league SB stat cards counting pickoff attempts as stolen bases
+- 61,962 pickoff rows with `is_successful = 1` were inflating SB counts (1,006 vs actual 243 for 2026) and causing players with zero real SBs (e.g. Murakami) to appear on the HR+SB list
+- All three affected queries now filter on `event_type = 'stolen_base'`, matching the existing base running page queries
+
 ### Park & Weather
 
 **Open-Meteo Double Conversion Fix**
