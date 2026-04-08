@@ -18,6 +18,24 @@ All notable changes to Seam Analytics are documented here.
 - The app remembers which monitor it was on and returns there after minimize/restart
 - If a saved monitor is no longer connected, the window resets to the primary screen
 
+### App Updates
+
+**Pre-Release Detection Fix**
+- Fixed update checker not detecting new releases — the GitHub API endpoint `/releases/latest` excludes pre-releases, so all beta tags were invisible
+- Switched to `/releases` endpoint which includes pre-releases
+
+**Skip Version**
+- Update confirmation dialog now has a "Skip This Version" button
+- Skipped versions are suppressed from automatic launch checks
+- Clicking "Check for Updates" manually always shows available updates regardless of skip
+- The skip resets automatically when a newer version is published
+
+**Database Refresh Option**
+- Update confirmation dialog now includes a "Replace local databases" checkbox
+- When checked, the silent installer replaces both databases with the versions bundled in the new release
+- Unchecked by default — existing databases are preserved unless explicitly opted in
+- Full release notes from the GitHub release are shown in an expandable "Show Details" panel so users can review changes before deciding
+
 ### Game Detail
 
 **BvP Contact% & Whiff% Fix**

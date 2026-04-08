@@ -5733,7 +5733,7 @@ class SeamStatsApp(QMainWindow):
             self.set_status("Data update complete!", timeout=8000)
 
     # ── App-version update system ────────────────────────────────────
-    _GITHUB_RELEASES_URL = "https://api.github.com/repos/nateoswald16/SEAM-ANALYTICS/releases/latest"
+    _GITHUB_RELEASES_URL = "https://api.github.com/repos/nateoswald16/SEAM-ANALYTICS/releases"
     _MSG_STYLE = (f"QMessageBox {{ background:{C['bg1']}; color:{C['t1']}; }}"
                   f" QPushButton {{ background:{C['bg3']}; color:{C['t1']};"
                   f" border:1px solid {C['bdr']}; padding:6px 20px; border-radius:4px; }}")
@@ -5758,7 +5758,17 @@ class SeamStatsApp(QMainWindow):
                         self_w.result.emit("", "", "")
                         return
                     r.raise_for_status()
-                    data = r.json()
+                    releases = r.json()
+                    # /releases returns a list sorted newest-first;
+                    # pick the first non-draft entry (includes pre-releases)
+                    data = None
+                    for rel in (releases if isinstance(releases, list) else []):
+                        if not rel.get("draft", False):
+                            data = rel
+                            break
+                    if data is None:
+                        self_w.result.emit("", "", "")
+                        return
                     tag = data.get("tag_name", "").lstrip("vV")
                     body = data.get("body", "")
                     # Find the setup .exe asset
@@ -5796,6 +5806,10 @@ class SeamStatsApp(QMainWindow):
                 msg.setText(f"v{_app_paths.APP_VERSION} — You're on the latest version!")
                 msg.setStyleSheet(self._MSG_STYLE)
                 msg.exec()
+            return
+        # If this is a silent (auto) check, honour the user's skip preference
+        skipped = self._qsettings.value("skippedUpdateVersion", "")
+        if self._update_check_silent and new_ver == skipped:
             return
         # Store for download
         self._pending_update_ver = new_ver
@@ -5838,25 +5852,42 @@ class SeamStatsApp(QMainWindow):
             return
 
         # Confirmation dialog
+        from PyQt6.QtWidgets import QCheckBox
         msg = QMessageBox(self)
         msg.setWindowTitle("App Update Available")
         msg.setIcon(QMessageBox.Icon.Information)
-        detail_lines = [f"<b>Current version:</b>  v{_app_paths.APP_VERSION}",
-                        f"<b>New version:</b>  v{new_ver}"]
-        if body:
-            # Show first ~300 chars of release notes
-            notes = body[:300].replace("\n", "<br>")
-            if len(body) > 300:
-                notes += "…"
-            _t2 = C["t2"]
-            detail_lines.append(f"<br><b>Release notes:</b><br><span style='color:{_t2}'>{notes}</span>")
-        msg.setText("<br>".join(detail_lines))
+        msg.setText(f"<b>Current version:</b>  v{_app_paths.APP_VERSION}<br>"
+                    f"<b>New version:</b>  v{new_ver}")
         msg.setInformativeText("Download and install this update?")
+        if body:
+            msg.setDetailedText(body)
+        db_cb = QCheckBox("Replace local databases with the latest bundled data")
+        db_cb.setStyleSheet(f"QCheckBox {{ color:{C['t2']}; font-size:11px; }} "
+                            f"QCheckBox::indicator {{ width:14px; height:14px; }}")
+        msg.setCheckBox(db_cb)
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        skip_btn = msg.addButton("Skip This Version", QMessageBox.ButtonRole.RejectRole)
         msg.setDefaultButton(QMessageBox.StandardButton.Yes)
         msg.setStyleSheet(self._MSG_STYLE)
-        if msg.exec() != QMessageBox.StandardButton.Yes:
+        msg.exec()
+        if msg.clickedButton() == skip_btn:
+            self._qsettings.setValue("skippedUpdateVersion", new_ver)
+            self._pending_update_ver = ""
+            self._pending_update_url = ""
+            self._pending_update_body = ""
+            self._check_update_btn.setText("Check for Updates")
+            self._check_update_btn.setStyleSheet(f"""
+                QPushButton {{ background:transparent; color:{C['t2']}; border:1px solid {C['bdr']};
+                               border-radius:4px; font-size:11px; padding:0 10px;
+                               font-family:'Cascadia Mono','Consolas',monospace; }}
+                QPushButton:hover {{ color:{C['t1']}; border-color:{C['bdrl']}; background:{C['bg3']}; }}
+            """)
+            self.set_status(f"v{new_ver} skipped — you'll be notified when a newer release is available", timeout=8000)
             return
+        if msg.clickedButton() != msg.button(QMessageBox.StandardButton.Yes):
+            return
+
+        self._update_refresh_db = db_cb.isChecked()
 
         # Start download
         self._check_update_btn.setEnabled(False)
@@ -5932,9 +5963,12 @@ class SeamStatsApp(QMainWindow):
         # Run the Inno Setup installer silently
         import subprocess
         try:
+            cmd = [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
+                   "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"]
+            if getattr(self, '_update_refresh_db', False):
+                cmd.append("/TASKS=refreshdb")
             subprocess.Popen(
-                [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
-                 "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"],
+                cmd,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
         except Exception as exc:
