@@ -237,7 +237,7 @@ begin
           '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
           '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
           '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
-          '    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>' + #13#10 +
+          '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>' + #13#10 +
           '  </Settings>' + #13#10 +
           '  <Actions Context="Author"><Exec>' + #13#10 +
           '    <Command>' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '</Command>' + #13#10 +

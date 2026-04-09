@@ -6294,7 +6294,7 @@ class SeamStatsApp(QMainWindow):
             '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
             '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
             '    <StartWhenAvailable>true</StartWhenAvailable>\n'
-            '    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>\n'
+            '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
             '  </Settings>\n'
             '  <Actions Context="Author"><Exec>\n'
             f'    <Command>{updater}</Command>\n'
