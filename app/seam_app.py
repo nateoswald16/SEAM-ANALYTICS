@@ -2361,13 +2361,13 @@ _DM = DataManager()
 # otherwise try live schedule for today; fallback to most recent DB games or placeholders
 try:
     today = dt.date.today().isoformat()
-    db_games_today = _DM.get_games_for_date(today)
-    if db_games_today:
-        GAMES = db_games_today
+    live_today = _DM.fetch_live_games(today)
+    if live_today:
+        GAMES = live_today
     else:
-        live_today = _DM.fetch_live_games(today)
-        if live_today:
-            GAMES = live_today
+        db_games_today = _DM.get_games_for_date(today)
+        if db_games_today:
+            GAMES = db_games_today
         else:
             recent = _DM.get_most_recent_game_date()
             if recent:
@@ -7159,10 +7159,11 @@ class SeamStatsApp(QMainWindow):
         today = dt.date.today()
         self.set_status(f"Loading {date.strftime('%b %d')}\u2026", timeout=0)
 
-        # Fetch games: DB first, then live API
-        games = _DM.get_games_for_date(date_str)
+        # Fetch games: API first (includes innings_detail for box scores),
+        # fall back to DB (plate_appearances) when API is unavailable.
+        games = _DM.fetch_live_games(date_str)
         if not games:
-            games = _DM.fetch_live_games(date_str)
+            games = _DM.get_games_for_date(date_str)
         if not games:
             games = []
 
@@ -7217,6 +7218,9 @@ class SeamStatsApp(QMainWindow):
             except Exception:
                 log.exception("_load_date matchup page")
         QTimer.singleShot(0, _rebuild_matchup)
+
+        # ── Prefetch play-by-play for final games (schedule cards built above) ──
+        QTimer.singleShot(200, self._prefetch_all_plays)
 
         # ── Rebuild park factors page for new date — deferred ──
         def _rebuild_park():
