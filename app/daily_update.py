@@ -279,7 +279,12 @@ def main(argv: list[str] | None = None, gui_cb=None):
             tracker.finish()
 
     # ── Statcast backfill: re-enrich dates that have PAs but no statcast data ──
-    missing_dates = _find_dates_missing_statcast(DB_PATH)
+    # Use the actual gap size (or default 7 days) as the lookback window
+    if ingested_start:
+        _backfill_days = max(7, (date.today() - ingested_start).days + 1)
+    else:
+        _backfill_days = 7
+    missing_dates = _find_dates_missing_statcast(DB_PATH, max_age_days=_backfill_days)
 
     if missing_dates:
         print(f"\n── Statcast backfill: {len(missing_dates)} date(s) missing statcast data ──")
