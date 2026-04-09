@@ -287,6 +287,8 @@ class MLBDataEngine:
                             "on_second": bool(offense.get('second')),
                             "on_third": bool(offense.get('third')),
                             "outs": ls.get('outs', 0),
+                            "balls": ls.get('balls', 0),
+                            "strikes": ls.get('strikes', 0),
                             "innings_detail": innings_detail,
                             "away_hits": ls_teams.get('away', {}).get('hits', 0),
                             "home_hits": ls_teams.get('home', {}).get('hits', 0),
@@ -383,6 +385,7 @@ class MLBDataEngine:
                     'home_score': res.get('homeScore', 0),
                     'is_scoring': about.get('isScoringPlay', False),
                     'is_action': False,
+                    'is_challenge': about.get('hasReview', False),
                 })
 
             # Build a live preview string from the latest event in currentPlay
@@ -406,7 +409,39 @@ class MLBDataEngine:
                     elif last_ev.get('type') == 'pitch':
                         desc = det.get('description', '')
                         call = det.get('call', {}).get('description', '')
-                        live_preview = call or desc
+                        pitch_type = det.get('type', {}).get('description', '')
+                        pitch_speed = last_ev.get('pitchData', {}).get('startSpeed')
+                        base = call or desc
+                        if pitch_type or pitch_speed:
+                            extra = pitch_type or ''
+                            if pitch_speed:
+                                extra = f"{extra} - {pitch_speed} mph" if extra else f"{pitch_speed} mph"
+                            live_preview = f"{base} ({extra})" if base else extra
+                        else:
+                            live_preview = base
+                        if det.get('hasReview'):
+                            live_preview = f"Challenge: {live_preview}"
+
+                # Check if the current at-bat has a completed challenge
+                cp_about = cur_play.get('about', {})
+                cp_result = cur_play.get('result', {})
+                cp_desc = cp_result.get('description', '')
+                if cp_about.get('hasReview') and cp_desc:
+                    live_preview = cp_desc
+                elif cp_about.get('isComplete') and cp_desc:
+                    # At-bat is finished — show the detailed result instead
+                    # of the raw pitch call (e.g. "Groundout: ..." vs "In Play, Out(s)")
+                    live_preview = cp_desc
+
+            # Enrich live_count with linescore data from the same response
+            # so sidebar + schedule diamonds can stay in sync.
+            linescore = data.get('liveData', {}).get('linescore', {})
+            if linescore:
+                live_count['outs'] = linescore.get('outs', 0) or 0
+                offense = linescore.get('offense', {})
+                live_count['on_first'] = bool(offense.get('first'))
+                live_count['on_second'] = bool(offense.get('second'))
+                live_count['on_third'] = bool(offense.get('third'))
 
             return result, live_preview, live_count
         except Exception:

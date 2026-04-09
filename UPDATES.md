@@ -6,6 +6,32 @@ All notable changes to Seam Analytics are documented here.
 
 ## v1.0.5-beta — 2026-04-09
 
+### Game Tracker
+
+**Diamond Widget Sync Fix**
+- Fixed schedule card diamonds showing stale outs and runner positions — `update_plays()` was only syncing balls/strikes from the live feed, ignoring outs, on_first, on_second, on_third
+- Schedule card diamonds now use `set_state()` with all 6 fields (runners, outs, balls, strikes) from the live feed, matching the sidebar diamond behavior
+- Both sidebar and schedule diamonds now derive state from the same live feed API response, eliminating desync between the two views
+
+**Single Source of Truth for Game Data**
+- Sidebar and schedule cards previously did independent merges of fresh API data, leading to divergent state
+- Refactored `_on_scores_fetched` so both card types read from the same master `self._games` dict
+
+**Sidebar Update Latency**
+- Eliminated 1–2 second delay on sidebar score updates — `scores_ready` signal now emits immediately after `fetch_live_games()` returns, before per-game play fetches begin
+
+**3rd Out Play Event Display**
+- Fixed the last event preview showing "In Play, Out(s)" instead of the actual play result (e.g. "Flyout: ...") when the final out of a half-inning completed the at-bat
+- Now checks `isComplete` on the current play and uses the detailed result description
+
+**Parallel Play Fetches**
+- Per-game play-by-play API calls now run in parallel (up to 4 workers) in `_poll_scores`, `_prefetch_all_plays`, and `_poll_plays`
+- Conditional diamond repaint — only redraws when values actually change
+- Incremental play log rendering — appends only new plays instead of full rebuild on each update
+
+**Sidebar Batter/Pitcher Change Detection**
+- Added `current_batter_name` and `current_pitcher_name` to the change detection field set so sidebar cards update immediately when a new batter steps up or pitcher enters
+
 ### App Updates
 
 **Auto-Relaunch After Silent Update**

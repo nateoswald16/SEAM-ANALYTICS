@@ -740,6 +740,8 @@ class DataManager:
                     'on_second': g.get('on_second', False),
                     'on_third': g.get('on_third', False),
                     'outs': g.get('outs', 0),
+                    'balls': g.get('balls', 0),
+                    'strikes': g.get('strikes', 0),
                     'innings_detail': g.get('innings_detail', []),
                     'away_hits': g.get('away_hits', 0),
                     'home_hits': g.get('home_hits', 0),
@@ -3070,6 +3072,7 @@ class GameCard(QFrame):
         self._cb   = on_click
         self._sel  = False
         self._blink = True
+        self._diamond = None  # MiniDiamondWidget ref for live count sync
         self.setObjectName("GC")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._restyle()
@@ -3116,6 +3119,7 @@ class GameCard(QFrame):
     def update_game(self, new_game):
         was_live = self._is_live()
         self.game = new_game
+        self._diamond = None  # old widget destroyed by _clear_layout
         self._clear_layout(self._root)
         self._populate()
         self._sync_height()
@@ -3278,12 +3282,14 @@ class GameCard(QFrame):
             row += 1
             # Diamond spanning all rows in column 1 (live games only)
             if is_live:
-                diamond = MiniDiamondWidget(
+                self._diamond = MiniDiamondWidget(
                     r1b=g.get('on_first', False),
                     r2b=g.get('on_second', False),
                     r3b=g.get('on_third', False),
-                    outs=g.get('outs', 0))
-                grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                    outs=g.get('outs', 0),
+                    balls=g.get('balls', 0),
+                    strikes=g.get('strikes', 0))
+                grid.addWidget(self._diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
                 grid.setColumnMinimumWidth(1, 60)
             grid.setColumnStretch(0, 1)
             self._root.addLayout(grid)
@@ -3340,6 +3346,7 @@ class ScheduleGameCard(QFrame):
         self._play_section = None # persistent play-log area
         self._live_preview = ""   # pitch-by-pitch preview string
         self._diamond = None      # MiniDiamondWidget ref for live count updates
+        self._last_inning_hdr = None  # track last inning header for incremental renders
         self.setObjectName("SGC")
         if on_click:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3919,34 +3926,55 @@ class ScheduleGameCard(QFrame):
         self._plays = plays
         self._live_preview = live_preview
         self._update_last_event()
-        # Update diamond balls/strikes from live count
+        # Update diamond from live count (only repaint if changed)
         if live_count and self._diamond and not _is_deleted(self._diamond):
-            self._diamond.balls = max(0, min(3, live_count.get('balls', 0) or 0))
-            self._diamond.strikes = max(0, min(2, live_count.get('strikes', 0) or 0))
-            self._diamond.update()
+            new_b = max(0, min(3, live_count.get('balls', 0) or 0))
+            new_s = max(0, min(2, live_count.get('strikes', 0) or 0))
+            new_o = max(0, min(3, live_count.get('outs', 0) or 0))
+            r1 = bool(live_count.get('on_first'))
+            r2 = bool(live_count.get('on_second'))
+            r3 = bool(live_count.get('on_third'))
+            d = self._diamond
+            if (d.balls != new_b or d.strikes != new_s or
+                    d.outs != new_o or d.r1b != r1 or
+                    d.r2b != r2 or d.r3b != r3):
+                d.set_state(r1, r2, r3, new_o, new_b, new_s)
         if self._play_log and self._expanded:
-            if len(plays) != old_count:
+            new_count = len(plays)
+            if new_count != old_count and new_count > old_count:
+                # New plays appended — render only the new ones
+                self._render_plays(append_from=old_count)
+            elif new_count != old_count:
+                # Plays changed in a non-append way — full rebuild
                 self._render_plays()
 
-    def _render_plays(self):
-        """Rebuild the play log labels from self._plays."""
+    def _render_plays(self, append_from=0):
+        """Build play log labels. If append_from > 0, only add new entries."""
         if not self._play_layout:
             return
-        # Clear existing items
-        while self._play_layout.count():
-            item = self._play_layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.hide()
-                w.deleteLater()
+        if append_from == 0:
+            # Full rebuild — clear existing items
+            while self._play_layout.count():
+                item = self._play_layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.hide()
+                    w.deleteLater()
+            self._last_inning_hdr = None
+        else:
+            # Remove trailing stretch before appending
+            cnt = self._play_layout.count()
+            if cnt > 0:
+                item = self._play_layout.itemAt(cnt - 1)
+                if item and item.spacerItem():
+                    self._play_layout.takeAt(cnt - 1)
         # Build play entries grouped by inning
-        last_inning_hdr = None
-        for p in self._plays:
+        for p in self._plays[append_from:]:
             inn = p.get('inning', 0)
             half = (p.get('half') or '').capitalize()
             hdr_key = f"{half} {inn}"
-            if hdr_key != last_inning_hdr:
-                last_inning_hdr = hdr_key
+            if hdr_key != self._last_inning_hdr:
+                self._last_inning_hdr = hdr_key
                 sep = QWidget()
                 sep.setFixedHeight(1)
                 sep.setStyleSheet(f"background:{C['bdr']};")
@@ -3957,12 +3985,16 @@ class ScheduleGameCard(QFrame):
             desc = p.get('description', '')
             scoring = p.get('is_scoring', False)
             is_action = p.get('is_action', False)
-            if is_action:
+            is_challenge = p.get('is_challenge', False)
+            if is_challenge:
+                event_color = C["amb"]
+            elif is_action:
                 event_color = C["grn"] if scoring else C["amb"]
             else:
                 event_color = C["grn"] if scoring else C["ora"]
             if ev:
-                el = mk_label(ev, color=event_color, size=11, bold=not is_action)
+                display_ev = f"Challenge: {ev}" if is_challenge else ev
+                el = mk_label(display_ev, color=event_color, size=11, bold=not is_action)
                 el.setContentsMargins(12, 0, 0, 0)
                 self._play_layout.addWidget(el)
             if desc:
@@ -4005,46 +4037,58 @@ class ScheduleGameCard(QFrame):
         """Rebuild the card with fresh game data (preserves play log section)."""
         self.game = new_game
         outer = self.layout()
-        # Replace _game_content entirely to avoid QPainter conflicts
-        if self._game_content:
-            self._game_content.hide()
-            for child in self._game_content.findChildren(QWidget):
-                if child.graphicsEffect():
-                    child.setGraphicsEffect(None)
-            self._game_content.setParent(None)
-            self._game_content.deleteLater()
-        self._game_content = QWidget()
-        self._game_content.setStyleSheet("background:transparent;")
-        gc_layout = QVBoxLayout(self._game_content)
-        gc_layout.setContentsMargins(0, 0, 0, 0)
-        gc_layout.setSpacing(2)
-        self._build_content(gc_layout)
-        outer.insertWidget(0, self._game_content)
-        # Re-check if play section needs toggle (e.g. game went live)
-        st = (new_game.get('status') or '').lower()
-        is_final = (new_game.get('time', '').upper() == 'FINAL'
-                    or st.startswith('final') or st.startswith('game over')
-                    or st.startswith('completed'))
-        is_live = _is_game_live(new_game)
-        if (is_live or is_final) and not self._toggle_btn and self._play_section:
-            # Game just went live — rebuild entire play section
-            old_ps = self._play_section
-            outer = self.layout()
-            if outer:
-                outer.removeWidget(old_ps)
-                old_ps.setGraphicsEffect(None)
-                old_ps.hide()
-                old_ps.deleteLater()
-            self._play_log = None
-            self._toggle_btn = None
-            self._play_scroll = None
-            self._play_content = None
-            self._play_layout = None
-            self._last_event_lbl = None
-            self._play_section = None
-            if outer:
-                self._build_play_section(outer)
-        self._resize_for_expansion()
+        # Suppress painting during the rebuild to avoid visual flash
+        self.setUpdatesEnabled(False)
+        try:
+            # Replace _game_content entirely to avoid QPainter conflicts
+            if self._game_content:
+                self._game_content.hide()
+                for child in self._game_content.findChildren(QWidget):
+                    if child.graphicsEffect():
+                        child.setGraphicsEffect(None)
+                self._game_content.setParent(None)
+                self._game_content.deleteLater()
+            self._game_content = QWidget()
+            self._game_content.setStyleSheet("background:transparent;")
+            gc_layout = QVBoxLayout(self._game_content)
+            gc_layout.setContentsMargins(0, 0, 0, 0)
+            gc_layout.setSpacing(2)
+            self._build_content(gc_layout)
+            outer.insertWidget(0, self._game_content)
+            # Re-check if play section needs toggle (e.g. game went live)
+            st = (new_game.get('status') or '').lower()
+            is_final = (new_game.get('time', '').upper() == 'FINAL'
+                        or st.startswith('final') or st.startswith('game over')
+                        or st.startswith('completed'))
+            is_live = _is_game_live(new_game)
+            play_section_rebuilt = False
+            if (is_live or is_final) and not self._toggle_btn and self._play_section:
+                # Game just went live — rebuild entire play section
+                old_ps = self._play_section
+                outer = self.layout()
+                if outer:
+                    outer.removeWidget(old_ps)
+                    old_ps.setGraphicsEffect(None)
+                    old_ps.hide()
+                    old_ps.deleteLater()
+                self._play_log = None
+                self._toggle_btn = None
+                self._play_scroll = None
+                self._play_content = None
+                self._play_layout = None
+                self._last_event_lbl = None
+                self._play_section = None
+                if outer:
+                    self._build_play_section(outer)
+                play_section_rebuilt = True
+            # Only recalculate height when collapsed or play section was just
+            # rebuilt.  When the play log is already expanded the card height
+            # is stable — recalculating causes disruptive layout jumps.
+            if play_section_rebuilt or not self._expanded:
+                outer.activate()
+                self._resize_for_expansion()
+        finally:
+            self.setUpdatesEnabled(True)
 
     def enterEvent(self, event):
         for gl in self.findChildren(_GradientLine):
@@ -5699,7 +5743,7 @@ class SeamStatsApp(QMainWindow):
         self._score_notifier.scores_ready.connect(self._on_scores_fetched)
         self._score_fetching = False
         self._score_timer = QTimer(self)
-        self._score_timer.setInterval(10_000)
+        self._score_timer.setInterval(5_000)
         self._score_timer.timeout.connect(self._poll_scores)
         self._score_timer.start()
 
@@ -6767,7 +6811,7 @@ class SeamStatsApp(QMainWindow):
         os._exit(0)
 
     def _poll_scores(self):
-        """Spawn a background thread to fetch fresh schedule data."""
+        """Spawn a single background thread to fetch scores + plays together."""
         if self._score_fetching:
             return
         # Only poll live scores when viewing today
@@ -6775,30 +6819,99 @@ class SeamStatsApp(QMainWindow):
             return
         self._score_fetching = True
         self.set_status("Updating scores\u2026", timeout=0)
-        notifier = self._score_notifier
+
+        # Collect play-fetch game IDs on the main thread before submitting
+        play_gids = self._collect_play_gids()
+
+        score_notifier = self._score_notifier
+        plays_notifier = self._plays_notifier
         def _fetch():
             try:
-                games = _DM.fetch_live_games(dt.date.today().isoformat())
+                # Fetch scores and emit immediately so sidebar updates without
+                # waiting for the slower per-game play-by-play fetches.
+                try:
+                    games = _DM.fetch_live_games(dt.date.today().isoformat())
+                except Exception:
+                    games = []
+                score_notifier.scores_ready.emit(games)
+                # Fetch plays in parallel (up to 4 concurrent requests)
+                plays_result = {}
+                if play_gids and hasattr(_DM, 'api') and _DM.api:
+                    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed
+                    def _one(gid):
+                        plays, preview, count = _DM.api.fetch_game_plays(gid)
+                        return gid, plays, preview, count
+                    with _TPE(max_workers=min(4, len(play_gids))) as pool:
+                        futs = {pool.submit(_one, gid): gid for gid in play_gids}
+                        for fut in as_completed(futs):
+                            try:
+                                gid, plays, preview, count = fut.result()
+                                if plays or preview:
+                                    plays_result[gid] = (plays, preview, count)
+                            except Exception:
+                                pass
+                plays_notifier.plays_ready.emit(plays_result)
             except Exception:
-                games = []
-            notifier.scores_ready.emit(games)
-        _bg_pool.submit(_fetch)
-        # Also fetch plays for expanded/live schedule cards (skip if nothing to do)
-        self._poll_plays()
+                # Ensure guard flag is cleared even on unexpected errors
+                score_notifier.scores_ready.emit([])
+                plays_notifier.plays_ready.emit({})
+        try:
+            _bg_pool.submit(_fetch)
+        except RuntimeError:
+            # Thread pool already shut down
+            self._score_fetching = False
+
+    def _collect_play_gids(self):
+        """Gather game IDs that need play-by-play updates."""
+        sched_page = self._stack.widget(self.IDX_MATCHUP) if self._stack.count() > self.IDX_MATCHUP else None
+        sched_cards = getattr(sched_page, '_schedule_cards', []) if sched_page else []
+        gids = set()
+        if sched_cards:
+            for card in sched_cards:
+                gid = str(card.game.get('game_id') or card.game.get('id'))
+                st = (card.game.get('status') or '').lower()
+                is_live = _is_game_live(card.game)
+                is_final = ('final' in st or 'game over' in st or 'completed' in st
+                            or card.game.get('time', '').upper() == 'FINAL')
+                if card._expanded or is_live:
+                    gids.add(gid)
+                elif is_final and gid not in self._plays_cache:
+                    gids.add(gid)
+        else:
+            # No schedule cards built yet — use game list
+            games = getattr(self, '_games', None) or GAMES
+            for g in games:
+                gid = str(g.get('game_id') or g.get('id', ''))
+                if not gid:
+                    continue
+                st = (g.get('status') or '').lower()
+                is_live = _is_game_live(g)
+                is_final = ('final' in st or 'game over' in st or 'completed' in st
+                            or g.get('time', '').upper() == 'FINAL')
+                if is_live:
+                    gids.add(gid)
+                elif is_final and gid not in self._plays_cache:
+                    gids.add(gid)
+        return gids
+
+    # Fields compared every poll cycle to decide whether cards need a rebuild.
+    # Defined once as class attrs to avoid recreating tuples every 5 seconds.
+    _CMP_FIELDS = ('away_score', 'home_score', 'status', 'abstract_state', 'inning',
+                   'inning_half', 'inning_state', 'live',
+                   'on_first', 'on_second', 'on_third', 'outs',
+                   'balls', 'strikes',
+                   'current_batter_name', 'current_pitcher_name')
+    _CMP_BOX = ('innings_detail', 'away_hits', 'home_hits',
+                'away_errors', 'home_errors')
 
     @staticmethod
     def _game_changed(old, new, include_boxscore=False):
         """Return True if any visible game field differs between old and new."""
-        _FIELDS = ('away_score', 'home_score', 'status', 'abstract_state', 'inning',
-                   'inning_half', 'inning_state', 'live',
-                   'on_first', 'on_second', 'on_third', 'outs')
-        _BOX_FIELDS = ('innings_detail', 'away_hits', 'home_hits',
-                       'away_errors', 'home_errors')
-        for k in _FIELDS:
+        for k in SeamStatsApp._CMP_FIELDS:
             if old.get(k) != new.get(k):
                 return True
         if include_boxscore:
-            for k in _BOX_FIELDS:
+            for k in SeamStatsApp._CMP_BOX:
                 if old.get(k) != new.get(k):
                     return True
         return False
@@ -6823,13 +6936,13 @@ class SeamStatsApp(QMainWindow):
         return merged
 
     def _on_scores_fetched(self, games):
-        """Update sidebar cards whose data changed; re-sort & stop timer if all done."""
+        """Update sidebar + schedule cards from a single source of truth (self._games)."""
         self._score_fetching = False
         if not games:
             self.set_status("Scores updated", right=f"{len(self._cards)} games")
             return
         fresh = {str(g.get('game_id') or g.get('id')): g for g in games}
-        # Always keep self._games up-to-date with latest API data
+        # ── Update self._games (single source of truth) ──
         games_by_id = {}
         for i, gm in enumerate(self._games):
             gid = str(gm.get('game_id') or gm.get('id'))
@@ -6838,38 +6951,39 @@ class SeamStatsApp(QMainWindow):
             if gid in games_by_id:
                 idx = games_by_id[gid]
                 self._games[idx] = self._merge_game(self._games[idx], new)
+        # Build lookup from the updated master list
+        master = {str(g.get('game_id') or g.get('id')): g for g in self._games}
+        # ── Update sidebar cards from master ──
         any_active = False
         need_resort = False
         for i, card in enumerate(self._cards):
             gid = str(card.game.get('game_id') or card.game.get('id'))
-            if gid not in fresh:
+            mg = master.get(gid)
+            if mg is None:
                 continue
-            new = fresh[gid]
-            old = card.game
-            if self._game_changed(old, new):
-                if self._status_changed(old, new):
+            if self._game_changed(card.game, mg):
+                if self._status_changed(card.game, mg):
                     need_resort = True
-                card.update_game(self._merge_game(old, new))
-            st = (new.get('status') or '').lower()
+                card.update_game(mg)
+            st = (mg.get('status') or '').lower()
             is_done = (st.startswith('final') or st.startswith('game over')
                        or st.startswith('completed') or st.startswith('postponed'))
             if not is_done:
                 any_active = True
-        # Update schedule page cards too
+        # ── Update schedule page cards from master ──
         need_resort_sched = False
         sched_page = self._stack.widget(self.IDX_MATCHUP) if self._stack.count() > self.IDX_MATCHUP else None
         sched_cards = getattr(sched_page, '_schedule_cards', []) if sched_page else []
         for card in sched_cards:
             try:
                 gid = str(card.game.get('game_id') or card.game.get('id'))
-                if gid not in fresh:
+                mg = master.get(gid)
+                if mg is None:
                     continue
-                new = fresh[gid]
-                old = card.game
-                if self._game_changed(old, new, include_boxscore=True):
-                    if self._status_changed(old, new):
+                if self._game_changed(card.game, mg, include_boxscore=True):
+                    if self._status_changed(card.game, mg):
                         need_resort_sched = True
-                    card.update_game(self._merge_game(old, new))
+                    card.update_game(mg)
             except RuntimeError:
                 pass  # C++ object deleted
         if need_resort_sched:
@@ -6884,8 +6998,8 @@ class SeamStatsApp(QMainWindow):
             self._score_timer.stop()
         elif any_live:
             # Games in progress — poll fast
-            if self._score_timer.interval() != 10_000:
-                self._score_timer.setInterval(10_000)
+            if self._score_timer.interval() != 5_000:
+                self._score_timer.setInterval(5_000)
         else:
             # Games upcoming but none live yet — slow poll
             if self._score_timer.interval() != 60_000:
@@ -6895,8 +7009,13 @@ class SeamStatsApp(QMainWindow):
         """Re-order sidebar cards in-place to reflect status changes."""
         paired = list(zip(self._games, self._cards))
         paired.sort(key=lambda p: _game_sort_key(p[0]))
-        self._games = [g for g, _ in paired]
-        self._cards = [c for _, c in paired]
+        new_games = [g for g, _ in paired]
+        new_cards = [c for _, c in paired]
+        # Skip layout churn if order unchanged
+        if [id(c) for c in new_cards] == [id(c) for c in self._cards]:
+            return
+        self._games = new_games
+        self._cards = new_cards
         # Preserve which card is selected
         sel_gid = None
         if self._sel_card is not None and 0 <= self._sel_card < len(self._cards):
@@ -6952,8 +7071,7 @@ class SeamStatsApp(QMainWindow):
     def _prefetch_all_plays(self):
         """Background-fetch plays for every live/final game using self._games.
 
-        Called once at startup so data is warm before the schedule page opens,
-        and can also be reused by _poll_plays when no schedule cards exist yet.
+        Called once at startup so data is warm before the schedule page opens.
         """
         games = getattr(self, '_games', None) or GAMES
         gids = set()
@@ -6974,14 +7092,20 @@ class SeamStatsApp(QMainWindow):
         notifier = self._plays_notifier
         def _fetch():
             result = {}
-            for gid in gids:
-                try:
-                    if hasattr(_DM, 'api') and _DM.api:
-                        plays, preview, count = _DM.api.fetch_game_plays(gid)
-                        if plays or preview:
-                            result[gid] = (plays, preview, count)
-                except Exception:
-                    pass
+            if hasattr(_DM, 'api') and _DM.api:
+                from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed
+                def _one(gid):
+                    plays, preview, count = _DM.api.fetch_game_plays(gid)
+                    return gid, plays, preview, count
+                with _TPE(max_workers=min(4, len(gids))) as pool:
+                    futs = {pool.submit(_one, gid): gid for gid in gids}
+                    for fut in as_completed(futs):
+                        try:
+                            gid, plays, preview, count = fut.result()
+                            if plays or preview:
+                                result[gid] = (plays, preview, count)
+                        except Exception:
+                            pass
             notifier.plays_ready.emit(result)
         _bg_pool.submit(_fetch)
 
@@ -7010,19 +7134,25 @@ class SeamStatsApp(QMainWindow):
         notifier = self._plays_notifier
         def _fetch():
             result = {}
-            for gid in gids:
-                try:
-                    if hasattr(_DM, 'api') and _DM.api:
-                        plays, preview, count = _DM.api.fetch_game_plays(gid)
-                        if plays or preview:
-                            result[gid] = (plays, preview, count)
-                except Exception:
-                    pass
+            if hasattr(_DM, 'api') and _DM.api:
+                from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed
+                def _one(gid):
+                    plays, preview, count = _DM.api.fetch_game_plays(gid)
+                    return gid, plays, preview, count
+                with _TPE(max_workers=min(4, len(gids))) as pool:
+                    futs = {pool.submit(_one, gid): gid for gid in gids}
+                    for fut in as_completed(futs):
+                        try:
+                            gid, plays, preview, count = fut.result()
+                            if plays or preview:
+                                result[gid] = (plays, preview, count)
+                        except Exception:
+                            pass
             notifier.plays_ready.emit(result)
         _bg_pool.submit(_fetch)
 
     def _on_plays_fetched(self, plays_map):
-        """Update schedule cards with fresh play-by-play data."""
+        """Update schedule cards AND sidebar diamonds with fresh play-by-play data."""
         if not plays_map:
             return
         # Merge into cache (cap at 20 entries — evict oldest)
@@ -7039,6 +7169,41 @@ class SeamStatsApp(QMainWindow):
                 if gid in plays_map:
                     plays, preview, count = plays_map[gid]
                     card.update_plays(plays, preview, count)
+            except RuntimeError:
+                pass
+        # ── Sync sidebar diamonds from live feed linescore ──
+        # Build master index once for fast lookup
+        games_idx = {}
+        for i, gm in enumerate(self._games):
+            games_idx[str(gm.get('game_id') or gm.get('id'))] = i
+        _LS_KEYS = ('balls', 'strikes', 'outs', 'on_first', 'on_second', 'on_third')
+        for card in self._cards:
+            try:
+                gid = str(card.game.get('game_id') or card.game.get('id'))
+                if gid not in plays_map:
+                    continue
+                _, _, count = plays_map[gid]
+                if not count:
+                    continue
+                # Update master game dict so _on_scores_fetched won't revert
+                if gid in games_idx:
+                    mg = self._games[games_idx[gid]]
+                    for k in _LS_KEYS:
+                        if k in count:
+                            mg[k] = count[k]
+                # Update sidebar diamond directly (no full rebuild)
+                if card._diamond and not _is_deleted(card._diamond):
+                    new_b = max(0, min(3, count.get('balls', 0) or 0))
+                    new_s = max(0, min(2, count.get('strikes', 0) or 0))
+                    new_o = max(0, min(3, count.get('outs', 0) or 0))
+                    r1 = bool(count.get('on_first'))
+                    r2 = bool(count.get('on_second'))
+                    r3 = bool(count.get('on_third'))
+                    d = card._diamond
+                    if (d.balls != new_b or d.strikes != new_s or
+                            d.outs != new_o or d.r1b != r1 or
+                            d.r2b != r2 or d.r3b != r3):
+                        d.set_state(r1, r2, r3, new_o, new_b, new_s)
             except RuntimeError:
                 pass
 
@@ -7070,7 +7235,8 @@ class SeamStatsApp(QMainWindow):
             for card in getattr(new_page, '_schedule_cards', []):
                 gid = str(card.game.get('game_id') or card.game.get('id'))
                 if gid in self._plays_cache:
-                    card._plays = self._plays_cache[gid]
+                    plays, preview, count = self._plays_cache[gid]
+                    card.update_plays(plays, preview, count)
             self.set_status("Odds loaded", right=f"{len(odds)} games")
         except Exception:
             log.exception("_on_odds_fetched")
