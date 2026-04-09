@@ -4,7 +4,22 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
-## v1.0.5-beta — 2026-04-00
+## v1.0.5-beta — 2026-04-09
+
+### App Updates
+
+**Auto-Relaunch After Silent Update**
+- Fixed app not relaunching after a silent in-app update — the Inno Setup `[Run]` entry had `skipifsilent` which skipped the post-install launch during silent installs
+- Added `RestartApplications=yes` to the installer so Inno Setup handles closing and relaunching the app
+- Removed `/NORESTART` flag from the silent install command
+
+**Update Dialog Checkbox Styling**
+- "Replace local databases" and "Ensure scheduled task" checkboxes now render as proper toggle controls with visible indicators (orange fill when checked, border, hover effect) instead of plain text
+
+**Previous-Day Box Scores & Play Logs**
+- Box scores and play logs now display correctly when viewing previous days' games
+- Game loading now prefers the MLB API (which includes per-inning linescore data) over the local database
+- Play-by-play data is prefetched in the background after date navigation
 
 
 
