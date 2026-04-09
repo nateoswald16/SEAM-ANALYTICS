@@ -6081,18 +6081,20 @@ class SeamStatsApp(QMainWindow):
         msg.setInformativeText("Download and install this update?")
         if body:
             msg.setDetailedText(body)
+        _cb_style = (f"QCheckBox {{ color:{C['t2']}; font-size:11px; spacing:6px; }} "
+                     f"QCheckBox::indicator {{ width:14px; height:14px; border:1px solid {C['bdrl']}; border-radius:3px; background:{C['bg2']}; }}"
+                     f"QCheckBox::indicator:checked {{ background:{C['ora']}; border-color:{C['ora']}; }}"
+                     f"QCheckBox::indicator:hover {{ border-color:{C['t2']}; }}")
         db_cb = QCheckBox("Replace local databases with the latest bundled data")
-        _cb_style = (f"QCheckBox {{ color:{C['t2']}; font-size:11px; }} "
-                     f"QCheckBox::indicator {{ width:14px; height:14px; }}")
         db_cb.setStyleSheet(_cb_style)
-        msg.setCheckBox(db_cb)
-        # Add task repair checkbox via layout (setCheckBox only supports one)
+        _grid = msg.layout()
+        _grid.addWidget(db_cb, _grid.rowCount(), 0, 1, _grid.columnCount())
+        # Add task repair checkbox
         task_cb = None
         if sys.platform == "win32":
             task_cb = QCheckBox("Ensure scheduled task exists for daily auto-updates")
             task_cb.setChecked(True)
             task_cb.setStyleSheet(_cb_style)
-            _grid = msg.layout()
             _grid.addWidget(task_cb, _grid.rowCount(), 0, 1, _grid.columnCount())
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         skip_btn = msg.addButton("Skip This Version", QMessageBox.ButtonRole.RejectRole)
