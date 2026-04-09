@@ -22,6 +22,16 @@ All notable changes to Seam Analytics are documented here.
 - Updates in real-time as each new plate appearance begins
 - Displays on both sidebar and schedule page game cards during live games only
 
+**Ball/Strike/Out Count on Diamond**
+- MiniDiamondWidget now displays three rows of indicator dots below the base diamond: outs (orange), balls (blue), strikes (red)
+- Count updates in real-time from the live feed's `currentPlay.count`
+- Diamond widget only shown on live game cards — hidden on pre-game and final cards for a cleaner layout
+
+**Consistent Card Heights**
+- All game card states (pre-game, live, final) now include placeholder rows for current batter/pitcher fields
+- Prevents card height shifting when games transition between states
+- Added column spacing on non-live cards to prevent moneyline labels from overlapping scores
+
 ### App Updates
 
 **Version Comparison Fix**
