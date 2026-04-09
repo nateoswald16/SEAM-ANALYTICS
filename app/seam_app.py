@@ -2948,16 +2948,20 @@ class DiamondWidget(QWidget):
 
 class MiniDiamondWidget(QWidget):
     """Compact diamond + outs indicator for sidebar game cards."""
-    def __init__(self, r1b=False, r2b=False, r3b=False, outs=0, parent=None):
+    def __init__(self, r1b=False, r2b=False, r3b=False, outs=0, balls=0, strikes=0, parent=None):
         super().__init__(parent)
         self.r1b, self.r2b, self.r3b = r1b, r2b, r3b
         self.outs = max(0, min(3, outs))
-        self.setFixedSize(42, 52)
+        self.balls = max(0, min(3, balls))
+        self.strikes = max(0, min(2, strikes))
+        self.setFixedSize(42, 76)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-    def set_state(self, r1b, r2b, r3b, outs=0):
+    def set_state(self, r1b, r2b, r3b, outs=0, balls=0, strikes=0):
         self.r1b, self.r2b, self.r3b = r1b, r2b, r3b
         self.outs = max(0, min(3, outs))
+        self.balls = max(0, min(3, balls))
+        self.strikes = max(0, min(2, strikes))
         self.update()
 
     def paintEvent(self, _):
@@ -2989,14 +2993,30 @@ class MiniDiamondWidget(QWidget):
         _base(first, self.r1b)
         _base(second, self.r2b)
         _base(third, self.r3b)
-        # Outs (3 small circles below diamond)
-        out_y = 46
+        # Row 1: Outs (3 dots, orange when filled)
+        row1_y = 46
         for i in range(3):
             ox = cx - 9 + i * 9
             filled = i < self.outs
             p.setPen(QPen(QColor(C["bdr"]), 1))
             p.setBrush(QBrush(QColor(C["ora"] if filled else "#1a1a1a")))
-            p.drawEllipse(QPointF(ox, out_y), 3, 3)
+            p.drawEllipse(QPointF(ox, row1_y), 3, 3)
+        # Row 2: Balls (3 dots, blue when filled)
+        row2_y = 55
+        for i in range(3):
+            bx = cx - 9 + i * 9
+            filled = i < self.balls
+            p.setPen(QPen(QColor(C["bdr"]), 1))
+            p.setBrush(QBrush(QColor("#2196f3") if filled else QColor("#1a1a1a")))
+            p.drawEllipse(QPointF(bx, row2_y), 3, 3)
+        # Row 3: Strikes (2 dots, left-aligned, red when filled)
+        row3_y = 64
+        for i in range(2):
+            sx = cx - 9 + i * 9
+            filled = i < self.strikes
+            p.setPen(QPen(QColor(C["bdr"]), 1))
+            p.setBrush(QBrush(QColor("#c20303") if filled else QColor("#1a1a1a")))
+            p.drawEllipse(QPointF(sx, row3_y), 3, 3)
         p.end()
 
 
@@ -3041,6 +3061,8 @@ def _ensure_blink_timer():
 # Sidebar game card
 # ═══════════════════════════════════════════════════════════════════════════════
 class GameCard(QFrame):
+    _max_height = 0  # class-level: uniform height across all sidebar cards
+
     def __init__(self, game: dict, idx: int, on_click, parent=None):
         super().__init__(parent)
         self.game = game
@@ -3078,6 +3100,7 @@ class GameCard(QFrame):
         self._root.setContentsMargins(12, 9, 12, 9)
         self._root.setSpacing(4)
         self._populate()
+        QTimer.singleShot(0, self._sync_height)
 
     def _clear_layout(self, layout):
         while layout.count():
@@ -3095,12 +3118,21 @@ class GameCard(QFrame):
         self.game = new_game
         self._clear_layout(self._root)
         self._populate()
+        self._sync_height()
         now_live = self._is_live()
         if now_live and not was_live:
             _BLINK_CARDS.add(self)
             _ensure_blink_timer()
         elif was_live and not now_live:
             _BLINK_CARDS.discard(self)
+
+    def _sync_height(self):
+        """Ensure all sidebar cards share the same height (tallest wins)."""
+        h = self.sizeHint().height()
+        if h > GameCard._max_height:
+            GameCard._max_height = h
+        if GameCard._max_height:
+            self.setMinimumHeight(GameCard._max_height)
 
     def _populate(self):
         g = self.game
@@ -3186,7 +3218,12 @@ class GameCard(QFrame):
             _pitcher_name = g.get('current_pitcher_name', '')
             _batter_hand = g.get('current_batter_hand', '')
             _pitcher_hand = g.get('current_pitcher_hand', '')
-            _show_pab = is_live and _batter_name and _pitcher_name
+            # Suppress during inning transitions (Mid/End) — the API
+            # updates batter/pitcher for the next half before inning_half
+            # changes, which would show them on the wrong team rows.
+            _inn_state = (g.get('inning_state') or '').lower()
+            _in_transition = _inn_state.startswith('mid') or _inn_state.startswith('end')
+            _show_pab = is_live and _batter_name and _pitcher_name and not _in_transition
             # Format short names: "F. LastName"
             def _short(n):
                 p = n.split()
@@ -3211,12 +3248,14 @@ class GameCard(QFrame):
                                     color=C["t1"], size=15, bold=True, mono=True,
                                     align=Qt.AlignmentFlag.AlignRight), row, 2)
             row += 1
-            # Row 1 (optional): away P/AB label
+            # Row 1: away P/AB label (or empty placeholder)
             if _show_pab:
-                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
-                lbl.setContentsMargins(24, 0, 0, 0)
-                grid.addWidget(lbl, row, 0)
-                row += 1
+                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+            else:
+                lbl = mk_label("", size=9, mono=True)
+            lbl.setContentsMargins(24, 0, 0, 0)
+            grid.addWidget(lbl, row, 0)
+            row += 1
             # Row 2: dividers
             grid.addLayout(_card_divider(has_score=False), row, 0)
             div_line = mk_hline()
@@ -3229,29 +3268,38 @@ class GameCard(QFrame):
                                     color=C["t1"], size=15, bold=True, mono=True,
                                     align=Qt.AlignmentFlag.AlignRight), row, 2)
             row += 1
-            # Row 4 (optional): home P/AB label
+            # Row 4: home P/AB label (or empty placeholder)
             if _show_pab:
-                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
-                lbl.setContentsMargins(24, 0, 0, 0)
-                grid.addWidget(lbl, row, 0)
-                row += 1
-            # Diamond spanning all rows in column 1
-            diamond = MiniDiamondWidget(
-                r1b=g.get('on_first', False),
-                r2b=g.get('on_second', False),
-                r3b=g.get('on_third', False),
-                outs=g.get('outs', 0))
-            grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+            else:
+                lbl = mk_label("", size=9, mono=True)
+            lbl.setContentsMargins(24, 0, 0, 0)
+            grid.addWidget(lbl, row, 0)
+            row += 1
+            # Diamond spanning all rows in column 1 (live games only)
+            if is_live:
+                diamond = MiniDiamondWidget(
+                    r1b=g.get('on_first', False),
+                    r2b=g.get('on_second', False),
+                    r3b=g.get('on_third', False),
+                    outs=g.get('outs', 0))
+                grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                grid.setColumnMinimumWidth(1, 60)
             grid.setColumnStretch(0, 1)
-            grid.setColumnMinimumWidth(1, 60)
             self._root.addLayout(grid)
         else:
             show_score = is_final
             self._root.addLayout(team_row(g["away"], g.get("away_p",""),
                                     g.get("away_score") if show_score else None))
+            ph = mk_label("", size=9, mono=True)
+            ph.setContentsMargins(24, 0, 0, 0)
+            self._root.addWidget(ph)
             self._root.addLayout(_card_divider(has_score=show_score))
             self._root.addLayout(team_row(g["home"], g.get("home_p",""),
                                     g.get("home_score") if show_score else None))
+            ph2 = mk_label("", size=9, mono=True)
+            ph2.setContentsMargins(24, 0, 0, 0)
+            self._root.addWidget(ph2)
 
     def mousePressEvent(self, e):
         self._cb(self._idx)
@@ -3290,6 +3338,8 @@ class ScheduleGameCard(QFrame):
         self._last_event_lbl = None
         self._game_content = None # refreshable game-data area
         self._play_section = None # persistent play-log area
+        self._live_preview = ""   # pitch-by-pitch preview string
+        self._diamond = None      # MiniDiamondWidget ref for live count updates
         self.setObjectName("SGC")
         if on_click:
             self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -3401,7 +3451,12 @@ class ScheduleGameCard(QFrame):
         _pitcher_name = g.get('current_pitcher_name', '')
         _batter_hand = g.get('current_batter_hand', '')
         _pitcher_hand = g.get('current_pitcher_hand', '')
-        _show_pab = is_live and _batter_name and _pitcher_name
+        # Suppress during inning transitions (Mid/End) — the API
+        # updates batter/pitcher for the next half before inning_half
+        # changes, which would show them on the wrong team rows.
+        _inn_state = (g.get('inning_state') or '').lower()
+        _in_transition = _inn_state.startswith('mid') or _inn_state.startswith('end')
+        _show_pab = is_live and _batter_name and _pitcher_name and not _in_transition
         def _short(n):
             p = n.split()
             return f"{p[0][0]}. {' '.join(p[1:])}" if len(p) >= 2 else n
@@ -3427,12 +3482,14 @@ class ScheduleGameCard(QFrame):
                                     color=C["t1"], size=15, bold=True, mono=True,
                                     align=Qt.AlignmentFlag.AlignRight), row, 2)
             row += 1
-            # Optional: away P/AB label
+            # Away P/AB label (or empty placeholder)
             if _show_pab:
-                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
-                lbl.setContentsMargins(26, 0, 0, 0)
-                grid.addWidget(lbl, row, 0)
-                row += 1
+                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+            else:
+                lbl = mk_label("", size=9, mono=True)
+            lbl.setContentsMargins(26, 0, 0, 0)
+            grid.addWidget(lbl, row, 0)
+            row += 1
             # Divider with O/U
             div = QHBoxLayout()
             div.setSpacing(4)
@@ -3450,21 +3507,29 @@ class ScheduleGameCard(QFrame):
                                     color=C["t1"], size=15, bold=True, mono=True,
                                     align=Qt.AlignmentFlag.AlignRight), row, 2)
             row += 1
-            # Optional: home P/AB label
+            # Home P/AB label (or empty placeholder)
             if _show_pab:
-                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
-                lbl.setContentsMargins(26, 0, 0, 0)
-                grid.addWidget(lbl, row, 0)
-                row += 1
-            # Diamond spanning all rows in column 1
-            diamond = MiniDiamondWidget(
-                r1b=g.get('on_first', False),
-                r2b=g.get('on_second', False),
-                r3b=g.get('on_third', False),
-                outs=g.get('outs', 0))
-            grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+            else:
+                lbl = mk_label("", size=9, mono=True)
+            lbl.setContentsMargins(26, 0, 0, 0)
+            grid.addWidget(lbl, row, 0)
+            row += 1
+            # Diamond spanning all rows in column 1 (live games only)
+            if is_live:
+                diamond = MiniDiamondWidget(
+                    r1b=g.get('on_first', False),
+                    r2b=g.get('on_second', False),
+                    r3b=g.get('on_third', False),
+                    outs=g.get('outs', 0),
+                    balls=g.get('balls', 0),
+                    strikes=g.get('strikes', 0))
+                self._diamond = diamond
+                grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                grid.setColumnMinimumWidth(1, 60)
+            else:
+                grid.setColumnMinimumWidth(1, 16)
             grid.setColumnStretch(0, 1)
-            grid.setColumnMinimumWidth(1, 60)
             root.addLayout(grid)
 
             root.addSpacing(14)
@@ -3577,11 +3642,14 @@ class ScheduleGameCard(QFrame):
                                         color=C["t1"], size=15, bold=True, mono=True,
                                         align=Qt.AlignmentFlag.AlignRight), row, 2)
                 row += 1
+                # Away P/AB label (or empty placeholder)
                 if _show_pab:
-                    lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
-                    lbl.setContentsMargins(26, 0, 0, 0)
-                    grid.addWidget(lbl, row, 0)
-                    row += 1
+                    lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+                else:
+                    lbl = mk_label("", size=9, mono=True)
+                lbl.setContentsMargins(26, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
                 div = QHBoxLayout()
                 div.setSpacing(4)
                 div.setContentsMargins(26, 0, 0, 0)
@@ -3597,24 +3665,37 @@ class ScheduleGameCard(QFrame):
                                         color=C["t1"], size=15, bold=True, mono=True,
                                         align=Qt.AlignmentFlag.AlignRight), row, 2)
                 row += 1
+                # Home P/AB label (or empty placeholder)
                 if _show_pab:
-                    lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
-                    lbl.setContentsMargins(26, 0, 0, 0)
-                    grid.addWidget(lbl, row, 0)
-                    row += 1
-                diamond = MiniDiamondWidget(
-                    r1b=g.get('on_first', False),
-                    r2b=g.get('on_second', False),
-                    r3b=g.get('on_third', False),
-                    outs=g.get('outs', 0))
-                grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                    lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+                else:
+                    lbl = mk_label("", size=9, mono=True)
+                lbl.setContentsMargins(26, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
+                # Diamond spanning all rows in column 1 (live games only)
+                if is_live:
+                    diamond = MiniDiamondWidget(
+                        r1b=g.get('on_first', False),
+                        r2b=g.get('on_second', False),
+                        r3b=g.get('on_third', False),
+                        outs=g.get('outs', 0),
+                        balls=g.get('balls', 0),
+                        strikes=g.get('strikes', 0))
+                    self._diamond = diamond
+                    grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
+                    grid.setColumnMinimumWidth(1, 60)
+                else:
+                    grid.setColumnMinimumWidth(1, 16)
                 grid.setColumnStretch(0, 1)
-                grid.setColumnMinimumWidth(1, 60)
                 root.addLayout(grid)
                 root.addStretch()
             else:
                 # ── Scheduled games ──
                 root.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml))
+                ph = mk_label("", size=9, mono=True)
+                ph.setContentsMargins(26, 0, 0, 0)
+                root.addWidget(ph)
                 div = QHBoxLayout()
                 div.setSpacing(4)
                 div.setContentsMargins(26, 0, 0, 0)
@@ -3625,6 +3706,9 @@ class ScheduleGameCard(QFrame):
                     div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
                 root.addLayout(div)
                 root.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml))
+                ph2 = mk_label("", size=9, mono=True)
+                ph2.setContentsMargins(26, 0, 0, 0)
+                root.addWidget(ph2)
 
                 root.addSpacing(14)
 
@@ -3793,33 +3877,53 @@ class ScheduleGameCard(QFrame):
             self.setFixedHeight(ScheduleGameCard._collapsed_height)
 
     def _update_last_event(self):
-        """Set the always-visible preview to the last play."""
+        """Set the always-visible preview label.
+
+        When a live_preview string is available (from the latest pitch or
+        action in currentPlay), display it directly.  Otherwise fall back
+        to the last completed play in the log.
+        """
         if not self._last_event_lbl:
             return
-        # Don't show last event for final games
         st = (self.game.get('status') or '').lower()
         is_final = ('final' in st or 'game over' in st or 'completed' in st
                     or self.game.get('time', '').upper() == 'FINAL')
-        if is_final or not self._plays:
+        if is_final:
             self._last_event_lbl.setText("")
             return
-        last = self._plays[-1]
-        evt = last.get("event", "")
-        desc = last.get("description", "")
-        txt = f"{evt}: {desc}" if evt else desc
-        if last.get("is_scoring"):
-            self._last_event_lbl.setStyleSheet(
-                f"color:#4CAF50; background:transparent; font-family:'Segoe UI','Inter',sans-serif; font-size:11px; padding:0;")
-        else:
+        if not self._plays and not self._live_preview:
+            return
+
+        if self._live_preview:
+            txt = self._live_preview
             self._last_event_lbl.setStyleSheet(
                 f"color:{C['t2']}; background:transparent; font-family:'Segoe UI','Inter',sans-serif; font-size:11px; padding:0;")
+        else:
+            last = self._plays[-1] if self._plays else None
+            if not last:
+                return
+            evt = last.get("event", "")
+            desc = last.get("description", "")
+            txt = f"{evt}: {desc}" if evt else desc
+            if last.get("is_scoring"):
+                self._last_event_lbl.setStyleSheet(
+                    f"color:#4CAF50; background:transparent; font-family:'Segoe UI','Inter',sans-serif; font-size:11px; padding:0;")
+            else:
+                self._last_event_lbl.setStyleSheet(
+                    f"color:{C['t2']}; background:transparent; font-family:'Segoe UI','Inter',sans-serif; font-size:11px; padding:0;")
         self._last_event_lbl.setText(txt)
 
-    def update_plays(self, plays):
+    def update_plays(self, plays, live_preview="", live_count=None):
         """Update the play-by-play data and refresh the log widget."""
         old_count = len(self._plays)
         self._plays = plays
+        self._live_preview = live_preview
         self._update_last_event()
+        # Update diamond balls/strikes from live count
+        if live_count and self._diamond and not _is_deleted(self._diamond):
+            self._diamond.balls = max(0, min(3, live_count.get('balls', 0) or 0))
+            self._diamond.strikes = max(0, min(2, live_count.get('strikes', 0) or 0))
+            self._diamond.update()
         if self._play_log and self._expanded:
             if len(plays) != old_count:
                 self._render_plays()
@@ -3838,8 +3942,6 @@ class ScheduleGameCard(QFrame):
         # Build play entries grouped by inning
         last_inning_hdr = None
         for p in self._plays:
-            if p.get('is_live_action'):
-                continue  # transient preview-only event
             inn = p.get('inning', 0)
             half = (p.get('half') or '').capitalize()
             hdr_key = f"{half} {inn}"
@@ -5662,6 +5764,7 @@ class SeamStatsApp(QMainWindow):
 
         # ── Check for Updates button ──
         self._check_update_btn = QPushButton("Check for Updates")
+        self._check_update_btn.setToolTip("Check for new software versions")
         self._check_update_btn.setFixedHeight(28)
         self._check_update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._check_update_btn.setStyleSheet(f"""
@@ -5677,6 +5780,7 @@ class SeamStatsApp(QMainWindow):
 
         # ── Update Data button ──
         self._update_btn = QPushButton("Update Data")
+        self._update_btn.setToolTip("Manually check for new database data")
         self._update_btn.setFixedHeight(28)
         self._update_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_btn.setStyleSheet(f"""
@@ -6218,10 +6322,15 @@ class SeamStatsApp(QMainWindow):
         except Exception:
             self._lineup_prefetch_future = None
             log.exception("_sidebar")
+        GameCard._max_height = 0
         for i, game in enumerate(self._games):
             card = GameCard(game, i, self._on_game_clicked)
             self._cards.append(card)
             self._card_layout.addWidget(card)
+        # Uniform height pass
+        if GameCard._max_height:
+            for c in self._cards:
+                c.setMinimumHeight(GameCard._max_height)
         self._card_layout.addStretch()
         sa.setWidget(cw)
         vl.addWidget(sa, 1)
@@ -6659,9 +6768,9 @@ class SeamStatsApp(QMainWindow):
             for gid in gids:
                 try:
                     if hasattr(_DM, 'api') and _DM.api:
-                        plays = _DM.api.fetch_game_plays(gid)
-                        if plays:
-                            result[gid] = plays
+                        plays, preview, count = _DM.api.fetch_game_plays(gid)
+                        if plays or preview:
+                            result[gid] = (plays, preview, count)
                 except Exception:
                     pass
             notifier.plays_ready.emit(result)
@@ -6695,9 +6804,9 @@ class SeamStatsApp(QMainWindow):
             for gid in gids:
                 try:
                     if hasattr(_DM, 'api') and _DM.api:
-                        plays = _DM.api.fetch_game_plays(gid)
-                        if plays:
-                            result[gid] = plays
+                        plays, preview, count = _DM.api.fetch_game_plays(gid)
+                        if plays or preview:
+                            result[gid] = (plays, preview, count)
                 except Exception:
                     pass
             notifier.plays_ready.emit(result)
@@ -6719,7 +6828,8 @@ class SeamStatsApp(QMainWindow):
             try:
                 gid = str(card.game.get('game_id') or card.game.get('id'))
                 if gid in plays_map:
-                    card.update_plays(plays_map[gid])
+                    plays, preview, count = plays_map[gid]
+                    card.update_plays(plays, preview, count)
             except RuntimeError:
                 pass
 
@@ -6840,10 +6950,15 @@ class SeamStatsApp(QMainWindow):
                 w.deleteLater()
         self._cards = []
         self._sel_card = None
+        GameCard._max_height = 0
         for i, game in enumerate(self._games):
             card = GameCard(game, i, self._on_game_clicked)
             self._cards.append(card)
             self._card_layout.addWidget(card)
+        # Uniform height pass
+        if GameCard._max_height:
+            for c in self._cards:
+                c.setMinimumHeight(GameCard._max_height)
         self._card_layout.addStretch()
 
         # Update sidebar header date label

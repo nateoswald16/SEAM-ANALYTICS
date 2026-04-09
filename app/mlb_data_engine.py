@@ -293,7 +293,7 @@ class MLBDataEngine:
                             "away_errors": ls_teams.get('away', {}).get('errors', 0),
                             "home_errors": ls_teams.get('home', {}).get('errors', 0),
                             "current_batter_name": _batter.get('fullName', ''),
-                            "current_batter_hand": (_batter.get('batSide') or {}).get('code', ''),
+                            "current_batter_hand": {'S': 'B'}.get((_batter.get('batSide') or {}).get('code', ''), (_batter.get('batSide') or {}).get('code', '')),
                             "current_pitcher_name": _pitcher.get('fullName', ''),
                             "current_pitcher_hand": (_pitcher.get('pitchHand') or {}).get('code', ''),
                         })
@@ -385,36 +385,32 @@ class MLBDataEngine:
                     'is_action': False,
                 })
 
-            # Check currentPlay for a live in-progress action (mound visit,
-            # batter timeout, etc.) so the tracker preview stays current.
+            # Build a live preview string from the latest event in currentPlay
+            live_preview = ""
+            live_count = {"balls": 0, "strikes": 0}
             cur_play = data.get('liveData', {}).get('plays', {}).get('currentPlay')
             if cur_play:
+                # Extract current count
+                cp_count = cur_play.get('count', {})
+                live_count["balls"] = cp_count.get('balls', 0) or 0
+                live_count["strikes"] = cp_count.get('strikes', 0) or 0
+
                 cp_events = cur_play.get('playEvents', [])
                 if cp_events:
                     last_ev = cp_events[-1]
+                    det = last_ev.get('details', {})
                     if last_ev.get('type') == 'action':
-                        cp_det = last_ev.get('details', {})
-                        cp_event = cp_det.get('event', '')
-                        cp_desc = cp_det.get('description', '')
-                        cp_et = cp_det.get('eventType', '').lower()
-                        if (cp_event or cp_desc) and cp_et not in _ACTION_EVENTS:
-                            cp_about = cur_play.get('about', {})
-                            result.append({
-                                'inning': cp_about.get('inning', 0),
-                                'half': cp_about.get('halfInning', ''),
-                                'event': cp_event or '',
-                                'description': cp_desc or '',
-                                'rbi': 0,
-                                'away_score': cp_det.get('awayScore', 0),
-                                'home_score': cp_det.get('homeScore', 0),
-                                'is_scoring': False,
-                                'is_action': False,
-                                'is_live_action': True,
-                            })
+                        ev = det.get('event', '')
+                        desc = det.get('description', '')
+                        live_preview = f"{ev}: {desc}" if ev and desc else (ev or desc)
+                    elif last_ev.get('type') == 'pitch':
+                        desc = det.get('description', '')
+                        call = det.get('call', {}).get('description', '')
+                        live_preview = call or desc
 
-            return result
+            return result, live_preview, live_count
         except Exception:
-            return []
+            return [], "", {"balls": 0, "strikes": 0}
 
     def _fetch_player_handedness(self, player_id):
         """Fetch handedness for a single player from the people endpoint.
