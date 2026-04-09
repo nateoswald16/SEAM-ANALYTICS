@@ -210,6 +210,7 @@ var
   ResultCode: Integer;
   TimeStr: String;
   TaskExists: Boolean;
+  XmlPath: String;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -221,13 +222,31 @@ begin
         '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
       if not TaskExists then
       begin
-        // First install or task was deleted — create with chosen time
+        // First install or task was deleted — create with chosen time via XML
         TimeStr := GetScheduleTime('');
+        XmlPath := ExpandConstant('{tmp}') + '\SeamTask.xml';
+        SaveStringToFile(XmlPath,
+          '<?xml version="1.0"?>' + #13#10 +
+          '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
+          '  <Triggers><CalendarTrigger>' + #13#10 +
+          '    <StartBoundary>' + GetDateTimeString('yyyy-mm-dd', '-', #0) + 'T' + TimeStr + ':00</StartBoundary>' + #13#10 +
+          '    <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>' + #13#10 +
+          '  </CalendarTrigger></Triggers>' + #13#10 +
+          '  <Settings>' + #13#10 +
+          '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + #13#10 +
+          '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
+          '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
+          '    <StartWhenAvailable>true</StartWhenAvailable>' + #13#10 +
+          '    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>' + #13#10 +
+          '  </Settings>' + #13#10 +
+          '  <Actions Context="Author"><Exec>' + #13#10 +
+          '    <Command>' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '</Command>' + #13#10 +
+          '  </Exec></Actions>' + #13#10 +
+          '</Task>', False);
         Exec('schtasks.exe',
-          '/Create /F /TN "SeamAnalytics\DailyUpdate"' +
-          ' /TR "\"' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '\""' +
-          ' /SC DAILY /ST ' + TimeStr + ' /RL LIMITED',
+          '/Create /F /TN "SeamAnalytics\DailyUpdate" /XML "' + XmlPath + '"',
           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+        DeleteFile(XmlPath);
       end;
     end;
   end;

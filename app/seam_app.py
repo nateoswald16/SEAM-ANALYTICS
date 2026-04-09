@@ -6275,22 +6275,51 @@ class SeamStatsApp(QMainWindow):
         if sys.platform != "win32":
             return False
         import subprocess
+        import tempfile
+        from datetime import date as _date
         if _app_paths._frozen:
             install_dir = os.path.dirname(os.path.dirname(sys.executable))
             updater = os.path.join(install_dir, "SeamUpdater", "SeamUpdater.exe")
         else:
             updater = os.path.join(_app_paths.APP_DIR, "daily_update.py")
+        xml = (
+            '<?xml version="1.0" encoding="UTF-16"?>\n'
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+            '  <Triggers><CalendarTrigger>\n'
+            f'    <StartBoundary>{_date.today().isoformat()}T{time_str}:00</StartBoundary>\n'
+            '    <ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay>\n'
+            '  </CalendarTrigger></Triggers>\n'
+            '  <Settings>\n'
+            '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+            '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+            '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+            '    <ExecutionTimeLimit>PT2H</ExecutionTimeLimit>\n'
+            '  </Settings>\n'
+            '  <Actions Context="Author"><Exec>\n'
+            f'    <Command>{updater}</Command>\n'
+            '  </Exec></Actions>\n'
+            '</Task>\n'
+        )
+        xml_path = None
         try:
+            fd, xml_path = tempfile.mkstemp(suffix='.xml', prefix='seam_task_')
+            with os.fdopen(fd, 'w', encoding='utf-16') as f:
+                f.write(xml)
             r = subprocess.run(
                 ['schtasks', '/Create', '/F',
                  '/TN', r'SeamAnalytics\DailyUpdate',
-                 '/TR', f'"{updater}"',
-                 '/SC', 'DAILY', '/ST', time_str,
-                 '/RL', 'LIMITED'],
+                 '/XML', xml_path],
                 capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
             return r.returncode == 0
         except Exception:
             return False
+        finally:
+            if xml_path:
+                try:
+                    os.unlink(xml_path)
+                except Exception:
+                    pass
 
     def _show_settings(self):
         """Show the Settings dialog."""
