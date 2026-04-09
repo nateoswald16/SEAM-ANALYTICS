@@ -34,6 +34,12 @@ All notable changes to Seam Analytics are documented here.
 
 ### App Updates
 
+**Scheduled Task Preserved During Silent Upgrades**
+- Fixed one-click updater deleting the daily data update scheduled task on every upgrade
+- Root cause: Inno Setup's `/TASKS=` parameter is an explicit allowlist — passing only `refreshdb` deselected `scheduledupdate`, and the `checkedonce` flag meant it was unchecked by default on upgrades even without `/TASKS`
+- Silent install command now always includes `scheduledupdate` in the task list
+- Installer now checks if the task already exists before recreating it, preserving the user's original schedule time instead of resetting to the 6:00 AM default
+
 **Version Comparison Fix**
 - Fixed update checker treating any non-matching version as "newer" — a local build ahead of the latest release (e.g. v1.0.4 vs v1.0.3) would incorrectly prompt to downgrade
 - Now uses proper semantic version comparison so only strictly newer releases trigger the update button

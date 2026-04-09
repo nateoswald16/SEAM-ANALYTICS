@@ -6169,8 +6169,10 @@ class SeamStatsApp(QMainWindow):
         try:
             cmd = [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
                    "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"]
+            tasks = ["scheduledupdate"]
             if getattr(self, '_update_refresh_db', False):
-                cmd.append("/TASKS=refreshdb")
+                tasks.append("refreshdb")
+            cmd.append(f"/TASKS={','.join(tasks)}")
             subprocess.Popen(
                 cmd,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,

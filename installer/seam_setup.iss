@@ -209,17 +209,26 @@ procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
   TimeStr: String;
+  TaskExists: Boolean;
 begin
   if CurStep = ssPostInstall then
   begin
     if WizardIsTaskSelected('scheduledupdate') then
     begin
-      TimeStr := GetScheduleTime('');
-      Exec('schtasks.exe',
-        '/Create /F /TN "SeamAnalytics\DailyUpdate"' +
-        ' /TR "' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '"' +
-        ' /SC DAILY /ST ' + TimeStr + ' /RL LIMITED',
-        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      // Check if the scheduled task already exists
+      TaskExists := Exec('schtasks.exe',
+        '/Query /TN "SeamAnalytics\DailyUpdate"',
+        '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+      if not TaskExists then
+      begin
+        // First install or task was deleted — create with chosen time
+        TimeStr := GetScheduleTime('');
+        Exec('schtasks.exe',
+          '/Create /F /TN "SeamAnalytics\DailyUpdate"' +
+          ' /TR "' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '"' +
+          ' /SC DAILY /ST ' + TimeStr + ' /RL LIMITED',
+          '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+      end;
     end;
   end;
 end;
