@@ -13,7 +13,7 @@ All notable changes to Seam Analytics are documented here.
 **Play Log — Mid-At-Bat Action Events**
 - Play-by-play log now includes stolen bases, caught stealing, wild pitches, passed balls, balks, pickoffs, errors, and defensive indifference
 - These mid-at-bat events are extracted from `playEvents` in the MLB API feed and interleaved chronologically with at-bat results
-- Action events display with an `↳` prefix in amber; scoring actions show in green
+- Action events display in amber; scoring actions show in green
 
 **Live Event Preview**
 - The last-event preview line on schedule cards now shows transient in-progress events (mound visits, batter timeouts, etc.) instead of holding on the previous at-bat result
@@ -33,6 +33,11 @@ All notable changes to Seam Analytics are documented here.
 - All game card states (pre-game, live, final) now include placeholder rows for current batter/pitcher fields
 - Prevents card height shifting when games transition between states
 - Added column spacing on non-live cards to prevent moneyline labels from overlapping scores
+
+**Previous-Day Box Scores & Play Logs**
+- Box scores and play logs now display correctly when viewing previous days' games
+- Game loading now prefers the MLB API (which includes per-inning linescore data) over the local database (which only stores plate appearance totals)
+- Play-by-play data is prefetched in the background after date navigation so play logs are populated for all final games
 
 ### App Updates
 
