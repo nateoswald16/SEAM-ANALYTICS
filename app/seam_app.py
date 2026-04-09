@@ -6284,7 +6284,7 @@ class SeamStatsApp(QMainWindow):
             r = subprocess.run(
                 ['schtasks', '/Create', '/F',
                  '/TN', r'SeamAnalytics\DailyUpdate',
-                 '/TR', updater,
+                 '/TR', f'"{updater}"',
                  '/SC', 'DAILY', '/ST', time_str,
                  '/RL', 'LIMITED'],
                 capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)

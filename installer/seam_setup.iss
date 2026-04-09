@@ -225,7 +225,7 @@ begin
         TimeStr := GetScheduleTime('');
         Exec('schtasks.exe',
           '/Create /F /TN "SeamAnalytics\DailyUpdate"' +
-          ' /TR "' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '"' +
+          ' /TR "\"' + ExpandConstant('{app}') + '\SeamUpdater\' + ExpandConstant('{#MyUpdaterExe}') + '\""' +
           ' /SC DAILY /ST ' + TimeStr + ' /RL LIMITED',
           '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
       end;
