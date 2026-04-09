@@ -6195,7 +6195,7 @@ class SeamStatsApp(QMainWindow):
         # Run the Inno Setup installer silently
         import subprocess
         try:
-            cmd = [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
+            cmd = [self._update_tmp_file, "/VERYSILENT",
                    "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"]
             tasks = []
             if getattr(self, '_update_repair_task', True):
@@ -6213,42 +6213,20 @@ class SeamStatsApp(QMainWindow):
             self.set_status(f"Install failed: {exc}", timeout=10000, error=True)
             return
 
-        # Prompt user to restart
-        msg = QMessageBox(self)
-        msg.setWindowTitle("Update Installed")
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText(f"<b>Seam Analytics v{self._pending_update_ver}</b> has been installed.<br><br>"
-                    "The app needs to restart to apply the update.")
-        msg.setStandardButtons(QMessageBox.StandardButton.Ok)
-        msg.setStyleSheet(self._MSG_STYLE)
-        msg.exec()
-
-        # Schedule temp file cleanup and restart
-        self._restart_after_update()
-
-    def _restart_after_update(self):
-        """Clean up temp installer and restart the app."""
-        import subprocess
-        # Build the restart command: delete temp file, then launch app
+        # The installer will close this app via /CLOSEAPPLICATIONS,
+        # then relaunch it via RestartApplications=yes in the ISS.
+        # Clean up the temp installer in the background.
         tmp = getattr(self, '_update_tmp_file', '')
         tmp_dir = getattr(self, '_update_tmp_dir', '')
-        if _app_paths._frozen:
-            app_exe = sys.executable
-        else:
-            app_exe = None  # dev mode: user restarts manually
-
-        if sys.platform == "win32" and app_exe:
-            # Use cmd to wait a moment, delete temp, and relaunch
+        if sys.platform == "win32":
             cleanup_cmd = (
-                f'cmd /c ping -n 2 127.0.0.1 >nul '
+                f'cmd /c ping -n 3 127.0.0.1 >nul '
                 f'& del /q "{tmp}" '
-                f'& rmdir /q "{tmp_dir}" '
-                f'& start "" "{app_exe}"'
+                f'& rmdir /q "{tmp_dir}"'
             )
             subprocess.Popen(cleanup_cmd, shell=True,
                              creationflags=subprocess.CREATE_NO_WINDOW)
         else:
-            # Non-frozen / non-Windows: just clean up, user restarts
             try:
                 if tmp and os.path.isfile(tmp):
                     os.remove(tmp)
@@ -6257,7 +6235,7 @@ class SeamStatsApp(QMainWindow):
             except Exception:
                 pass
 
-        QApplication.instance().quit()
+        self.set_status("Installing update — app will restart automatically…", timeout=0)
 
     def _check_task_exists(self):
         """Check if the SeamAnalytics\\DailyUpdate scheduled task exists."""

@@ -4,6 +4,10 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.0.5-beta — 2026-04-00
+
+
+
 ## v1.0.4-beta — 2026-04-09
 
 > **Action Required:** This update fixes a bug where the daily scheduled task was broken due to a path-quoting issue. After updating, go to **Settings → Scheduled Task** and click **Repair Scheduled Task** to ensure automatic daily updates are working. If your data is out of date, click **Update Data** in the bottom bar to manually backfill any missing days.

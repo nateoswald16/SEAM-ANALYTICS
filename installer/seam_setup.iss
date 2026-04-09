@@ -31,6 +31,7 @@ PrivilegesRequiredOverridesAllowed=dialog commandline
 ArchitecturesAllowed=x64compatible
 CloseApplications=force
 CloseApplicationsFilter=SeamAnalytics.exe,SeamUpdater.exe
+RestartApplications=yes
 LicenseFile=
 ; Estimated installed size (MB): ~450 app + ~780 databases
 ExtraDiskSpaceRequired=838860800
@@ -67,7 +68,7 @@ Name: "{autodesktop}\{#MyAppName}";     Filename: "{app}\SeamAnalytics\{#MyAppEx
 
 [Run]
 ; Launch app after install
-Filename: "{app}\SeamAnalytics\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\SeamAnalytics\{#MyAppExeName}"; Description: "Launch {#MyAppName}"; Flags: nowait postinstall
 
 [UninstallRun]
 ; Remove scheduled task on uninstall
