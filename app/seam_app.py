@@ -745,6 +745,10 @@ class DataManager:
                     'home_hits': g.get('home_hits', 0),
                     'away_errors': g.get('away_errors', 0),
                     'home_errors': g.get('home_errors', 0),
+                    'current_batter_name': g.get('current_batter_name', ''),
+                    'current_batter_hand': g.get('current_batter_hand', ''),
+                    'current_pitcher_name': g.get('current_pitcher_name', ''),
+                    'current_pitcher_hand': g.get('current_pitcher_hand', ''),
                 })
             return out
         except Exception:
@@ -3177,33 +3181,67 @@ class GameCard(QFrame):
             return div
 
         if is_live or is_final:
-            # Grid layout: teams col 0, diamond col 1 (spans 3 rows), scores col 2
+            # Determine current batter/pitcher labels for live games
+            _batter_name = g.get('current_batter_name', '')
+            _pitcher_name = g.get('current_pitcher_name', '')
+            _batter_hand = g.get('current_batter_hand', '')
+            _pitcher_hand = g.get('current_pitcher_hand', '')
+            _show_pab = is_live and _batter_name and _pitcher_name
+            # Format short names: "F. LastName"
+            def _short(n):
+                p = n.split()
+                return f"{p[0][0]}. {' '.join(p[1:])}" if len(p) >= 2 else n
+            # Top → away batting, home pitching; Bottom → reversed
+            _half = (g.get('inning_half') or '').lower()
+            _away_is_batting = _half.startswith('top')
+            away_pab = (f"AB: {_short(_batter_name)} ({_batter_hand})" if _away_is_batting
+                        else f"P: {_short(_pitcher_name)} ({_pitcher_hand})") if _show_pab else ''
+            home_pab = (f"P: {_short(_pitcher_name)} ({_pitcher_hand})" if _away_is_batting
+                        else f"AB: {_short(_batter_name)} ({_batter_hand})") if _show_pab else ''
+
+            # Grid layout: teams col 0, diamond col 1, scores col 2
             grid = QGridLayout()
             grid.setHorizontalSpacing(4)
             grid.setVerticalSpacing(4)
             grid.setContentsMargins(0, 0, 0, 0)
+            row = 0
             # Row 0: away team + score
-            grid.addLayout(team_row(g["away"], g.get("away_p", "")), 0, 0)
+            grid.addLayout(team_row(g["away"], g.get("away_p", "")), row, 0)
             grid.addWidget(mk_label(str(g.get("away_score", 0)),
                                     color=C["t1"], size=15, bold=True, mono=True,
-                                    align=Qt.AlignmentFlag.AlignRight), 0, 2)
-            # Row 1: dividers
-            grid.addLayout(_card_divider(has_score=False), 1, 0)
+                                    align=Qt.AlignmentFlag.AlignRight), row, 2)
+            row += 1
+            # Row 1 (optional): away P/AB label
+            if _show_pab:
+                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
+                lbl.setContentsMargins(24, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
+            # Row 2: dividers
+            grid.addLayout(_card_divider(has_score=False), row, 0)
             div_line = mk_hline()
             div_line.setFixedWidth(16)
-            grid.addWidget(div_line, 1, 2, Qt.AlignmentFlag.AlignRight)
-            # Row 2: home team + score
-            grid.addLayout(team_row(g["home"], g.get("home_p", "")), 2, 0)
+            grid.addWidget(div_line, row, 2, Qt.AlignmentFlag.AlignRight)
+            row += 1
+            # Row 3: home team + score
+            grid.addLayout(team_row(g["home"], g.get("home_p", "")), row, 0)
             grid.addWidget(mk_label(str(g.get("home_score", 0)),
                                     color=C["t1"], size=15, bold=True, mono=True,
-                                    align=Qt.AlignmentFlag.AlignRight), 2, 2)
-            # Diamond spanning all 3 rows in column 1
+                                    align=Qt.AlignmentFlag.AlignRight), row, 2)
+            row += 1
+            # Row 4 (optional): home P/AB label
+            if _show_pab:
+                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
+                lbl.setContentsMargins(24, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
+            # Diamond spanning all rows in column 1
             diamond = MiniDiamondWidget(
                 r1b=g.get('on_first', False),
                 r2b=g.get('on_second', False),
                 r3b=g.get('on_third', False),
                 outs=g.get('outs', 0))
-            grid.addWidget(diamond, 0, 1, 3, 1, Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
             grid.setColumnStretch(0, 1)
             grid.setColumnMinimumWidth(1, 60)
             self._root.addLayout(grid)
@@ -3358,6 +3396,22 @@ class ScheduleGameCard(QFrame):
         ou = odds.get("over_under")
         ou_str = str(ou) if ou is not None else ""
 
+        # Current batter / pitcher labels (live games only)
+        _batter_name = g.get('current_batter_name', '')
+        _pitcher_name = g.get('current_pitcher_name', '')
+        _batter_hand = g.get('current_batter_hand', '')
+        _pitcher_hand = g.get('current_pitcher_hand', '')
+        _show_pab = is_live and _batter_name and _pitcher_name
+        def _short(n):
+            p = n.split()
+            return f"{p[0][0]}. {' '.join(p[1:])}" if len(p) >= 2 else n
+        _half = (g.get('inning_half') or '').lower()
+        _away_is_batting = _half.startswith('top')
+        away_pab = (f"AB: {_short(_batter_name)} ({_batter_hand})" if _away_is_batting
+                    else f"P: {_short(_pitcher_name)} ({_pitcher_hand})") if _show_pab else ''
+        home_pab = (f"P: {_short(_pitcher_name)} ({_pitcher_hand})" if _away_is_batting
+                    else f"AB: {_short(_batter_name)} ({_batter_hand})") if _show_pab else ''
+
         if has_boxscore:
             # ── Live/final with box score ──
 
@@ -3366,12 +3420,20 @@ class ScheduleGameCard(QFrame):
             grid.setHorizontalSpacing(4)
             grid.setVerticalSpacing(4)
             grid.setContentsMargins(0, 0, 0, 0)
+            row = 0
             # Row 0: away team + score
-            grid.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml), 0, 0)
+            grid.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml), row, 0)
             grid.addWidget(mk_label(str(g.get("away_score", 0)),
                                     color=C["t1"], size=15, bold=True, mono=True,
-                                    align=Qt.AlignmentFlag.AlignRight), 0, 2)
-            # Row 1: divider with O/U
+                                    align=Qt.AlignmentFlag.AlignRight), row, 2)
+            row += 1
+            # Optional: away P/AB label
+            if _show_pab:
+                lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
+                lbl.setContentsMargins(26, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
+            # Divider with O/U
             div = QHBoxLayout()
             div.setSpacing(4)
             div.setContentsMargins(26, 0, 0, 0)
@@ -3380,19 +3442,27 @@ class ScheduleGameCard(QFrame):
             if ou_str:
                 div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True))
                 div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
-            grid.addLayout(div, 1, 0)
-            # Row 2: home team + score
-            grid.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml), 2, 0)
+            grid.addLayout(div, row, 0)
+            row += 1
+            # Home team + score
+            grid.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml), row, 0)
             grid.addWidget(mk_label(str(g.get("home_score", 0)),
                                     color=C["t1"], size=15, bold=True, mono=True,
-                                    align=Qt.AlignmentFlag.AlignRight), 2, 2)
-            # Diamond spanning all 3 rows in column 1
+                                    align=Qt.AlignmentFlag.AlignRight), row, 2)
+            row += 1
+            # Optional: home P/AB label
+            if _show_pab:
+                lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
+                lbl.setContentsMargins(26, 0, 0, 0)
+                grid.addWidget(lbl, row, 0)
+                row += 1
+            # Diamond spanning all rows in column 1
             diamond = MiniDiamondWidget(
                 r1b=g.get('on_first', False),
                 r2b=g.get('on_second', False),
                 r3b=g.get('on_third', False),
                 outs=g.get('outs', 0))
-            grid.addWidget(diamond, 0, 1, 3, 1, Qt.AlignmentFlag.AlignCenter)
+            grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
             grid.setColumnStretch(0, 1)
             grid.setColumnMinimumWidth(1, 60)
             root.addLayout(grid)
@@ -3501,10 +3571,17 @@ class ScheduleGameCard(QFrame):
                 grid.setHorizontalSpacing(4)
                 grid.setVerticalSpacing(4)
                 grid.setContentsMargins(0, 0, 0, 0)
-                grid.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml), 0, 0)
+                row = 0
+                grid.addLayout(team_row(g["away"], g.get("away_p", ""), away_ml), row, 0)
                 grid.addWidget(mk_label(str(g.get("away_score", 0)),
                                         color=C["t1"], size=15, bold=True, mono=True,
-                                        align=Qt.AlignmentFlag.AlignRight), 0, 2)
+                                        align=Qt.AlignmentFlag.AlignRight), row, 2)
+                row += 1
+                if _show_pab:
+                    lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True)
+                    lbl.setContentsMargins(26, 0, 0, 0)
+                    grid.addWidget(lbl, row, 0)
+                    row += 1
                 div = QHBoxLayout()
                 div.setSpacing(4)
                 div.setContentsMargins(26, 0, 0, 0)
@@ -3513,17 +3590,24 @@ class ScheduleGameCard(QFrame):
                 if ou_str:
                     div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True))
                     div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
-                grid.addLayout(div, 1, 0)
-                grid.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml), 2, 0)
+                grid.addLayout(div, row, 0)
+                row += 1
+                grid.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml), row, 0)
                 grid.addWidget(mk_label(str(g.get("home_score", 0)),
                                         color=C["t1"], size=15, bold=True, mono=True,
-                                        align=Qt.AlignmentFlag.AlignRight), 2, 2)
+                                        align=Qt.AlignmentFlag.AlignRight), row, 2)
+                row += 1
+                if _show_pab:
+                    lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True)
+                    lbl.setContentsMargins(26, 0, 0, 0)
+                    grid.addWidget(lbl, row, 0)
+                    row += 1
                 diamond = MiniDiamondWidget(
                     r1b=g.get('on_first', False),
                     r2b=g.get('on_second', False),
                     r3b=g.get('on_third', False),
                     outs=g.get('outs', 0))
-                grid.addWidget(diamond, 0, 1, 3, 1, Qt.AlignmentFlag.AlignCenter)
+                grid.addWidget(diamond, 0, 1, row, 1, Qt.AlignmentFlag.AlignCenter)
                 grid.setColumnStretch(0, 1)
                 grid.setColumnMinimumWidth(1, 60)
                 root.addLayout(grid)
@@ -3754,6 +3838,8 @@ class ScheduleGameCard(QFrame):
         # Build play entries grouped by inning
         last_inning_hdr = None
         for p in self._plays:
+            if p.get('is_live_action'):
+                continue  # transient preview-only event
             inn = p.get('inning', 0)
             half = (p.get('half') or '').capitalize()
             hdr_key = f"{half} {inn}"
@@ -3768,13 +3854,19 @@ class ScheduleGameCard(QFrame):
             ev = p.get('event', '')
             desc = p.get('description', '')
             scoring = p.get('is_scoring', False)
-            event_color = C["grn"] if scoring else C["ora"]
+            is_action = p.get('is_action', False)
+            if is_action:
+                event_color = C["grn"] if scoring else C["amb"]
+            else:
+                event_color = C["grn"] if scoring else C["ora"]
             if ev:
-                self._play_layout.addWidget(
-                    mk_label(f"  {ev}", color=event_color, size=11, bold=True))
+                el = mk_label(ev, color=event_color, size=11, bold=not is_action)
+                el.setContentsMargins(12, 0, 0, 0)
+                self._play_layout.addWidget(el)
             if desc:
-                dl = mk_label(f"    {desc}", color=C["t2"], size=11)
+                dl = mk_label(desc, color=C["t2"], size=11)
                 dl.setWordWrap(True)
+                dl.setContentsMargins(24, 0, 0, 0)
                 self._play_layout.addWidget(dl)
         self._play_layout.addStretch()
         # Auto-scroll to bottom
@@ -5778,7 +5870,15 @@ class SeamStatsApp(QMainWindow):
                         if name.lower().endswith(".exe") and "setup" in name.lower():
                             asset_url = a.get("browser_download_url", "")
                             break
-                    if tag and tag != _app_paths.APP_VERSION:
+                    # Only notify if the remote tag is strictly newer
+                    def _parse_ver(v):
+                        """Parse '1.0.3-beta' → (1, 0, 3, 'beta')."""
+                        import re as _re
+                        m = _re.match(r"(\d+)\.(\d+)\.(\d+)(?:-(.+))?", v)
+                        if not m:
+                            return (0, 0, 0, "")
+                        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) or "")
+                    if tag and _parse_ver(tag) > _parse_ver(_app_paths.APP_VERSION):
                         self_w.result.emit(tag, asset_url, body)
                     else:
                         self_w.result.emit("", "", "")

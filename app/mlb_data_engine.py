@@ -205,7 +205,7 @@ class MLBDataEngine:
             List of dicts with keys: id, away, home, time, status
         """
         try:
-            url = f"{self.api_base}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,linescore"
+            url = f"{self.api_base}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,linescore,person"
             _log.debug(f"Fetching schedule for {date_str}...")
             response = _session.get(url, timeout=10)
             response.raise_for_status()
@@ -258,6 +258,10 @@ class MLBDataEngine:
                         home_score = game_info.get('teams', {}).get('home', {}).get('score')
                         ls = game_info.get('linescore', {})
                         offense = ls.get('offense', {})
+                        defense = ls.get('defense', {})
+                        # Current batter / pitcher from linescore
+                        _batter = offense.get('batter', {})
+                        _pitcher = defense.get('pitcher', {})
                         # Per-inning scores
                         innings_detail = []
                         for inn in ls.get('innings', []):
@@ -288,6 +292,10 @@ class MLBDataEngine:
                             "home_hits": ls_teams.get('home', {}).get('hits', 0),
                             "away_errors": ls_teams.get('away', {}).get('errors', 0),
                             "home_errors": ls_teams.get('home', {}).get('errors', 0),
+                            "current_batter_name": _batter.get('fullName', ''),
+                            "current_batter_hand": (_batter.get('batSide') or {}).get('code', ''),
+                            "current_pitcher_name": _pitcher.get('fullName', ''),
+                            "current_pitcher_hand": (_pitcher.get('pitchHand') or {}).get('code', ''),
                         })
                     except Exception as e:
                         _log.warning(f"  Warning: Could not parse game: {e}")
@@ -304,8 +312,24 @@ class MLBDataEngine:
 
         Returns a list of dicts:
             [{'inning': 1, 'half': 'top', 'event': 'Strikeout',
-              'description': '...', 'rbi': 0, 'away_score': 0, 'home_score': 0}, ...]
+              'description': '...', 'rbi': 0, 'away_score': 0, 'home_score': 0,
+              'is_scoring': False, 'is_action': False}, ...]
+
+        Mid-at-bat action events (stolen bases, caught stealing, wild pitches,
+        passed balls, balks, errors, defensive indifference) are extracted from
+        playEvents and interleaved chronologically with at-bat results.
         """
+        _ACTION_EVENTS = {
+            'stolen_base_2b', 'stolen_base_3b', 'stolen_base_home',
+            'caught_stealing_2b', 'caught_stealing_3b', 'caught_stealing_home',
+            'wild_pitch', 'passed_ball', 'balk',
+            'defensive_indifference',
+            'caught_stealing_double_play',
+            'pickoff_1b', 'pickoff_2b', 'pickoff_3b',
+            'pickoff_caught_stealing_2b', 'pickoff_caught_stealing_3b',
+            'pickoff_caught_stealing_home',
+            'error',
+        }
         try:
             url = f"{self.api_base.replace('/v1', '/v1.1')}/game/{game_id}/feed/live"
             resp = _session.get(url, timeout=10)
@@ -316,20 +340,78 @@ class MLBDataEngine:
             for p in all_plays:
                 res = p.get('result', {})
                 about = p.get('about', {})
+                inning = about.get('inning', 0)
+                half = about.get('halfInning', '')
+
+                # Extract mid-at-bat action events from playEvents
+                for pe in p.get('playEvents', []):
+                    if pe.get('type') != 'action':
+                        continue
+                    pe_details = pe.get('details', {})
+                    pe_event_type = pe_details.get('eventType', '')
+                    if pe_event_type.lower() not in _ACTION_EVENTS:
+                        continue
+                    pe_event = pe_details.get('event', '')
+                    pe_desc = pe_details.get('description', '')
+                    if not pe_event and not pe_desc:
+                        continue
+                    pe_scoring = pe_details.get('isScoringPlay', False)
+                    result.append({
+                        'inning': inning,
+                        'half': half,
+                        'event': pe_event or '',
+                        'description': pe_desc or '',
+                        'rbi': 0,
+                        'away_score': pe_details.get('awayScore', 0),
+                        'home_score': pe_details.get('homeScore', 0),
+                        'is_scoring': pe_scoring,
+                        'is_action': True,
+                    })
+
+                # At-bat result
                 event = res.get('event')
                 desc = res.get('description')
                 if not event and not desc:
                     continue
                 result.append({
-                    'inning': about.get('inning', 0),
-                    'half': about.get('halfInning', ''),
+                    'inning': inning,
+                    'half': half,
                     'event': event or '',
                     'description': desc or '',
                     'rbi': res.get('rbi', 0),
                     'away_score': res.get('awayScore', 0),
                     'home_score': res.get('homeScore', 0),
                     'is_scoring': about.get('isScoringPlay', False),
+                    'is_action': False,
                 })
+
+            # Check currentPlay for a live in-progress action (mound visit,
+            # batter timeout, etc.) so the tracker preview stays current.
+            cur_play = data.get('liveData', {}).get('plays', {}).get('currentPlay')
+            if cur_play:
+                cp_events = cur_play.get('playEvents', [])
+                if cp_events:
+                    last_ev = cp_events[-1]
+                    if last_ev.get('type') == 'action':
+                        cp_det = last_ev.get('details', {})
+                        cp_event = cp_det.get('event', '')
+                        cp_desc = cp_det.get('description', '')
+                        cp_et = cp_det.get('eventType', '').lower()
+                        if (cp_event or cp_desc) and cp_et not in _ACTION_EVENTS:
+                            cp_about = cur_play.get('about', {})
+                            result.append({
+                                'inning': cp_about.get('inning', 0),
+                                'half': cp_about.get('halfInning', ''),
+                                'event': cp_event or '',
+                                'description': cp_desc or '',
+                                'rbi': 0,
+                                'away_score': cp_det.get('awayScore', 0),
+                                'home_score': cp_det.get('homeScore', 0),
+                                'is_scoring': False,
+                                'is_action': False,
+                                'is_live_action': True,
+                            })
+
             return result
         except Exception:
             return []

@@ -4,6 +4,32 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.0.4-beta — 2026-04-08
+
+### Game Tracker
+
+**Play Log — Mid-At-Bat Action Events**
+- Play-by-play log now includes stolen bases, caught stealing, wild pitches, passed balls, balks, pickoffs, errors, and defensive indifference
+- These mid-at-bat events are extracted from `playEvents` in the MLB API feed and interleaved chronologically with at-bat results
+- Action events display with an `↳` prefix in amber; scoring actions show in green
+
+**Live Event Preview**
+- The last-event preview line on schedule cards now shows transient in-progress events (mound visits, batter timeouts, etc.) instead of holding on the previous at-bat result
+- These events are extracted from `currentPlay` in the live feed and automatically replaced when the next play occurs
+
+**Current Batter / Pitcher Display**
+- Live game cards now show the current pitcher and batter below each team row (e.g. "P: M. Petersen (R)" / "AB: T. Stephenson (R)")
+- Updates in real-time as each new plate appearance begins
+- Displays on both sidebar and schedule page game cards during live games only
+
+### App Updates
+
+**Version Comparison Fix**
+- Fixed update checker treating any non-matching version as "newer" — a local build ahead of the latest release (e.g. v1.0.4 vs v1.0.3) would incorrectly prompt to downgrade
+- Now uses proper semantic version comparison so only strictly newer releases trigger the update button
+
+---
+
 ## v1.0.3-beta — 2026-04-08
 
 ### Game Tracker
