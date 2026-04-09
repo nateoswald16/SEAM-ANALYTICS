@@ -40,6 +40,22 @@ All notable changes to Seam Analytics are documented here.
 - Silent install command now always includes `scheduledupdate` in the task list
 - Installer now checks if the task already exists before recreating it, preserving the user's original schedule time instead of resetting to the 6:00 AM default
 
+**Settings Dialog**
+- New "Settings" button in the bottom bar opens a popup dialog
+- **Scheduled Task** section shows current task status (Active / Not found) and lets you create or repair the daily update task with a custom time picker
+- Task creation now uses XML import instead of command-line flags, which fixes the path-splitting bug where spaces in the install path (e.g. `D:\Program Files\...`) caused `schtasks` to split the command at the first space — the task would silently fail with `0x80070002` (file not found)
+- Tasks are created with `StartWhenAvailable=true` so missed schedules (e.g. PC was off at 3 AM) run automatically when the machine wakes
+- Battery guards disabled — task runs even on battery power and won't be killed mid-update
+- No execution time limit — large backfills (weeks/months of missed data) can run to completion
+
+**Update Dialog — Scheduled Task Checkbox**
+- The app update confirmation dialog now includes a checked-by-default "Ensure scheduled task exists for daily auto-updates" checkbox
+- When checked, the silent installer recreates the task with the improved XML settings during the upgrade
+
+**Dynamic Statcast Backfill Window**
+- The daily updater's statcast backfill pass was hardcoded to only retry missing statcast data from the last 7 days
+- Now scales the lookback window to match the actual data gap, so users returning after weeks or months get full statcast enrichment
+
 **Version Comparison Fix**
 - Fixed update checker treating any non-matching version as "newer" — a local build ahead of the latest release (e.g. v1.0.4 vs v1.0.3) would incorrectly prompt to downgrade
 - Now uses proper semantic version comparison so only strictly newer releases trigger the update button
