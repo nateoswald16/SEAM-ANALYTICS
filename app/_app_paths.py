@@ -9,7 +9,7 @@ Frozen    – read-only assets come from the PyInstaller bundle;
 import os
 import sys
 
-APP_VERSION = "1.0.4-beta"
+APP_VERSION = "1.0.5-beta"
 
 _frozen = getattr(sys, "frozen", False)
 
