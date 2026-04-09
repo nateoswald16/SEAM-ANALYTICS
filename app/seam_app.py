@@ -5793,6 +5793,22 @@ class SeamStatsApp(QMainWindow):
         self._update_btn.clicked.connect(self._run_manual_update)
         hl.addWidget(self._update_btn)
         hl.addSpacing(6)
+
+        # ── Settings button ──
+        settings_btn = QPushButton("Settings")
+        settings_btn.setToolTip("Application settings")
+        settings_btn.setFixedHeight(28)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 10px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['ora']}; border-color:{C['ora']}; }}
+        """)
+        settings_btn.clicked.connect(self._show_settings)
+        hl.addWidget(settings_btn)
+        hl.addSpacing(6)
+
         _info_svg = os.path.join(_app_paths.APP_DIR, "assets", "info-svgrepo-com.svg")
         about_btn = QPushButton()
         try:
@@ -6066,9 +6082,18 @@ class SeamStatsApp(QMainWindow):
         if body:
             msg.setDetailedText(body)
         db_cb = QCheckBox("Replace local databases with the latest bundled data")
-        db_cb.setStyleSheet(f"QCheckBox {{ color:{C['t2']}; font-size:11px; }} "
-                            f"QCheckBox::indicator {{ width:14px; height:14px; }}")
+        _cb_style = (f"QCheckBox {{ color:{C['t2']}; font-size:11px; }} "
+                     f"QCheckBox::indicator {{ width:14px; height:14px; }}")
+        db_cb.setStyleSheet(_cb_style)
         msg.setCheckBox(db_cb)
+        # Add task repair checkbox via layout (setCheckBox only supports one)
+        task_cb = None
+        if sys.platform == "win32":
+            task_cb = QCheckBox("Ensure scheduled task exists for daily auto-updates")
+            task_cb.setChecked(True)
+            task_cb.setStyleSheet(_cb_style)
+            _grid = msg.layout()
+            _grid.addWidget(task_cb, _grid.rowCount(), 0, 1, _grid.columnCount())
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         skip_btn = msg.addButton("Skip This Version", QMessageBox.ButtonRole.RejectRole)
         msg.setDefaultButton(QMessageBox.StandardButton.Yes)
@@ -6092,6 +6117,7 @@ class SeamStatsApp(QMainWindow):
             return
 
         self._update_refresh_db = db_cb.isChecked()
+        self._update_repair_task = task_cb.isChecked() if task_cb else False
 
         # Start download
         self._check_update_btn.setEnabled(False)
@@ -6169,7 +6195,9 @@ class SeamStatsApp(QMainWindow):
         try:
             cmd = [self._update_tmp_file, "/VERYSILENT", "/NORESTART",
                    "/SUPPRESSMSGBOXES", "/CLOSEAPPLICATIONS"]
-            tasks = ["scheduledupdate"]
+            tasks = []
+            if getattr(self, '_update_repair_task', True):
+                tasks.append("scheduledupdate")
             if getattr(self, '_update_refresh_db', False):
                 tasks.append("refreshdb")
             cmd.append(f"/TASKS={','.join(tasks)}")
@@ -6228,6 +6256,176 @@ class SeamStatsApp(QMainWindow):
                 pass
 
         QApplication.instance().quit()
+
+    def _check_task_exists(self):
+        """Check if the SeamAnalytics\\DailyUpdate scheduled task exists."""
+        if sys.platform != "win32":
+            return False
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['schtasks', '/Query', '/TN', r'SeamAnalytics\DailyUpdate'],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _create_scheduled_task(self, time_str="03:00"):
+        """Create or recreate the SeamAnalytics\\DailyUpdate scheduled task."""
+        if sys.platform != "win32":
+            return False
+        import subprocess
+        if _app_paths._frozen:
+            install_dir = os.path.dirname(os.path.dirname(sys.executable))
+            updater = os.path.join(install_dir, "SeamUpdater", "SeamUpdater.exe")
+        else:
+            updater = os.path.join(_app_paths.APP_DIR, "daily_update.py")
+        try:
+            r = subprocess.run(
+                ['schtasks', '/Create', '/F',
+                 '/TN', r'SeamAnalytics\DailyUpdate',
+                 '/TR', updater,
+                 '/SC', 'DAILY', '/ST', time_str,
+                 '/RL', 'LIMITED'],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    def _show_settings(self):
+        """Show the Settings dialog."""
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                                     QPushButton, QComboBox, QGroupBox)
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Settings")
+        dlg.setFixedWidth(420)
+        dlg.setStyleSheet(f"""
+            QDialog {{ background:{C['bg1']}; color:{C['t1']}; }}
+            QLabel {{ color:{C['t2']}; font-family:'Cascadia Mono','Consolas',monospace; font-size:11px; }}
+            QGroupBox {{ color:{C['t2']}; border:1px solid {C['bdr']}; border-radius:6px;
+                         margin-top:12px; padding:14px 10px 10px 10px;
+                         font-family:'Cascadia Mono','Consolas',monospace; font-size:11px; }}
+            QGroupBox::title {{ subcontrol-origin:margin; left:10px; padding:0 4px; }}
+        """)
+
+        vl = QVBoxLayout(dlg)
+        vl.setContentsMargins(16, 16, 16, 16)
+        vl.setSpacing(12)
+
+        # ── Scheduled Task group ──
+        grp = QGroupBox("Scheduled Task")
+        gl = QVBoxLayout(grp)
+        gl.setSpacing(8)
+
+        # Status
+        task_exists = self._check_task_exists()
+        st_text = "Active" if task_exists else "Not found"
+        st_color = C["grn"] if task_exists else C["red"]
+        status_lbl = QLabel(f'Status: <span style="color:{st_color}">{st_text}</span>')
+        gl.addWidget(status_lbl)
+
+        # Time picker row
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("Time:"))
+
+        combo_css = f"""
+            QComboBox {{ background:{C['bg3']}; color:{C['t1']}; border:1px solid {C['bdr']};
+                         border-radius:4px; padding:4px 8px;
+                         font-family:'Cascadia Mono','Consolas',monospace; font-size:11px; }}
+            QComboBox:hover {{ border-color:{C['ora']}; }}
+            QComboBox::drop-down {{ border:none; }}
+            QComboBox QAbstractItemView {{ background:{C['bg2']}; color:{C['t1']};
+                                           selection-background-color:{C['bg3']}; }}
+        """
+        hour_cb = QComboBox()
+        for h in range(1, 13):
+            hour_cb.addItem(str(h))
+        hour_cb.setCurrentIndex(2)  # default 3
+        hour_cb.setStyleSheet(combo_css)
+        time_row.addWidget(hour_cb)
+
+        colon_lbl = QLabel(":")
+        colon_lbl.setFixedWidth(8)
+        colon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        time_row.addWidget(colon_lbl)
+
+        min_cb = QComboBox()
+        for m in ["00", "15", "30", "45"]:
+            min_cb.addItem(m)
+        min_cb.setStyleSheet(combo_css)
+        time_row.addWidget(min_cb)
+
+        ampm_cb = QComboBox()
+        ampm_cb.addItems(["AM", "PM"])
+        ampm_cb.setStyleSheet(combo_css)
+        time_row.addWidget(ampm_cb)
+
+        time_row.addStretch()
+        gl.addLayout(time_row)
+
+        # Description
+        desc = QLabel("Creates a Windows scheduled task that runs the daily\n"
+                      "data updater automatically. Use this to repair a\n"
+                      "missing task or change the update time.")
+        desc.setStyleSheet(f"color:{C['t3']}; font-size:10px;")
+        desc.setWordWrap(True)
+        gl.addWidget(desc)
+
+        # Repair / Create button
+        btn_text = "Repair Scheduled Task" if task_exists else "Create Scheduled Task"
+        repair_btn = QPushButton(btn_text)
+        repair_btn.setFixedHeight(30)
+        repair_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        repair_btn.setStyleSheet(f"""
+            QPushButton {{ background:{C['bg3']}; color:{C['t1']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 14px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ border-color:{C['ora']}; color:{C['ora']}; }}
+        """)
+
+        def _on_repair():
+            h12 = int(hour_cb.currentText())
+            is_pm = ampm_cb.currentText() == "PM"
+            if is_pm:
+                h24 = h12 if h12 == 12 else h12 + 12
+            else:
+                h24 = 0 if h12 == 12 else h12
+            ts = f"{h24:02d}:{min_cb.currentText()}"
+            ok = self._create_scheduled_task(ts)
+            if ok:
+                status_lbl.setText(f'Status: <span style="color:{C["grn"]}">Active</span>')
+                repair_btn.setText("Repair Scheduled Task")
+                self.set_status(
+                    f"Scheduled task created \u2014 daily update at "
+                    f"{hour_cb.currentText()}:{min_cb.currentText()} {ampm_cb.currentText()}",
+                    timeout=8000)
+            else:
+                status_lbl.setText(f'Status: <span style="color:{C["red"]}">Failed</span>')
+                self.set_status("Failed to create scheduled task", timeout=8000, error=True)
+
+        repair_btn.clicked.connect(_on_repair)
+        gl.addWidget(repair_btn)
+
+        vl.addWidget(grp)
+
+        # ── Close button ──
+        close_row = QHBoxLayout()
+        close_row.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.setFixedHeight(30)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{ background:{C['bg3']}; color:{C['t1']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 20px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ border-color:{C['ora']}; }}
+        """)
+        close_btn.clicked.connect(dlg.accept)
+        close_row.addWidget(close_btn)
+        vl.addLayout(close_row)
+
+        dlg.exec()
 
     def _show_about(self):
         from PyQt6.QtWidgets import QMessageBox
