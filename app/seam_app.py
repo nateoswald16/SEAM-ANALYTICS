@@ -6315,37 +6315,96 @@ class SeamStatsApp(QMainWindow):
             msg.exec()
             return
 
-        # Confirmation dialog
-        from PyQt6.QtWidgets import QCheckBox
-        msg = QMessageBox(self)
-        msg.setWindowTitle("App Update Available")
-        msg.setIcon(QMessageBox.Icon.Information)
-        msg.setText(f"<b>Current version:</b>  v{_app_paths.APP_VERSION}<br>"
-                    f"<b>New version:</b>  v{new_ver}")
-        msg.setInformativeText("Download and install this update?")
-        if body:
-            msg.setDetailedText(body)
-        _cb_style = (f"QCheckBox {{ color:{C['t2']}; font-size:11px; spacing:6px; }} "
+        # Confirmation dialog — custom QDialog for reliable button handling
+        from PyQt6.QtWidgets import (QDialog, QCheckBox, QTextEdit)
+        _FONT = "'Segoe UI','Inter',sans-serif"
+        _btn_style = (f"QPushButton {{ background:{C['bg3']}; color:{C['t1']};"
+                      f" border:1px solid {C['bdr']}; padding:6px 18px; border-radius:4px;"
+                      f" font-family:{_FONT}; font-size:12px; }}"
+                      f" QPushButton:hover {{ background:{C['bg2']}; border-color:{C['bdrl']}; }}")
+        _cb_style = (f"QCheckBox {{ color:{C['t2']}; font-size:11px; spacing:6px; font-family:{_FONT}; }} "
                      f"QCheckBox::indicator {{ width:14px; height:14px; border:1px solid {C['bdrl']}; border-radius:3px; background:{C['bg2']}; }}"
                      f"QCheckBox::indicator:checked {{ background:{C['ora']}; border-color:{C['ora']}; }}"
                      f"QCheckBox::indicator:hover {{ border-color:{C['t2']}; }}")
+        dlg = QDialog(self)
+        dlg.setWindowTitle("App Update Available")
+        dlg.setFixedWidth(420)
+        dlg.setStyleSheet(f"QDialog {{ background:{C['bg1']}; }}")
+        dlg_layout = QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(20, 18, 20, 16)
+        dlg_layout.setSpacing(12)
+        # Version info
+        ver_lbl = QLabel(f"<b style='color:{C['t1']};'>Current version:</b>"
+                         f"  <span style='color:{C['ora']};'>v{_app_paths.APP_VERSION}</span><br>"
+                         f"<b style='color:{C['t1']};'>New version:</b>"
+                         f"  <span style='color:{C['grn']};'>v{new_ver}</span>")
+        ver_lbl.setStyleSheet(f"color:{C['t1']}; font-family:{_FONT}; font-size:13px;")
+        dlg_layout.addWidget(ver_lbl)
+        prompt_lbl = QLabel("Download and install this update?")
+        prompt_lbl.setStyleSheet(f"color:{C['t2']}; font-family:{_FONT}; font-size:12px;")
+        dlg_layout.addWidget(prompt_lbl)
+        # Release notes expander
+        if body:
+            _details_box = QTextEdit()
+            _details_box.setReadOnly(True)
+            _details_box.setPlainText(body)
+            _details_box.setVisible(False)
+            _details_box.setFixedHeight(180)
+            _details_box.setStyleSheet(
+                f"QTextEdit {{ background:{C['bg2']}; color:{C['t2']}; border:1px solid {C['bdr']};"
+                f" border-radius:4px; font-family:'Cascadia Mono','Consolas',monospace; font-size:11px;"
+                f" padding:8px; }}")
+            _details_btn = QPushButton("Show Details ▸")
+            _details_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            _details_btn.setStyleSheet(
+                f"QPushButton {{ background:transparent; color:{C['t2']}; border:none;"
+                f" font-family:{_FONT}; font-size:11px; text-align:left; padding:0; }}"
+                f" QPushButton:hover {{ color:{C['t1']}; }}")
+            def _toggle_details():
+                vis = not _details_box.isVisible()
+                _details_box.setVisible(vis)
+                _details_btn.setText("Hide Details ▾" if vis else "Show Details ▸")
+                dlg.adjustSize()
+            _details_btn.clicked.connect(_toggle_details)
+            dlg_layout.addWidget(_details_btn)
+            dlg_layout.addWidget(_details_box)
+        # Checkboxes
         db_cb = QCheckBox("Replace local databases with the latest bundled data")
         db_cb.setStyleSheet(_cb_style)
-        _grid = msg.layout()
-        _grid.addWidget(db_cb, _grid.rowCount(), 0, 1, _grid.columnCount())
-        # Add task repair checkbox
+        dlg_layout.addWidget(db_cb)
         task_cb = None
         if sys.platform == "win32":
             task_cb = QCheckBox("Ensure scheduled task exists for daily auto-updates")
             task_cb.setChecked(True)
             task_cb.setStyleSheet(_cb_style)
-            _grid.addWidget(task_cb, _grid.rowCount(), 0, 1, _grid.columnCount())
-        msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        skip_btn = msg.addButton("Skip This Version", QMessageBox.ButtonRole.RejectRole)
-        msg.setDefaultButton(QMessageBox.StandardButton.Yes)
-        msg.setStyleSheet(self._MSG_STYLE)
-        msg.exec()
-        if msg.clickedButton() == skip_btn:
+            dlg_layout.addWidget(task_cb)
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        yes_btn = QPushButton("Yes")
+        no_btn = QPushButton("No")
+        skip_btn = QPushButton("Skip This Version")
+        for b in (yes_btn, no_btn, skip_btn):
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setStyleSheet(_btn_style)
+        btn_row.addWidget(yes_btn)
+        btn_row.addWidget(no_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(skip_btn)
+        dlg_layout.addLayout(btn_row)
+        _result = {"action": "cancel"}
+        def _accept():
+            _result["action"] = "yes"; dlg.accept()
+        def _reject():
+            _result["action"] = "no"; dlg.reject()
+        def _skip():
+            _result["action"] = "skip"; dlg.reject()
+        yes_btn.clicked.connect(_accept)
+        no_btn.clicked.connect(_reject)
+        skip_btn.clicked.connect(_skip)
+        dlg.exec()
+
+        if _result["action"] == "skip":
             self._qsettings.setValue("skippedUpdateVersion", new_ver)
             self._pending_update_ver = ""
             self._pending_update_url = ""
@@ -6359,7 +6418,7 @@ class SeamStatsApp(QMainWindow):
             """)
             self.set_status(f"v{new_ver} skipped — you'll be notified when a newer release is available", timeout=8000)
             return
-        if msg.clickedButton() != msg.button(QMessageBox.StandardButton.Yes):
+        if _result["action"] != "yes":
             return
 
         self._update_refresh_db = db_cb.isChecked()
