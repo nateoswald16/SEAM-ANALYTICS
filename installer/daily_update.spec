@@ -42,6 +42,7 @@ a = Analysis(
         'bs4',
         'sqlalchemy', 'sqlalchemy.dialects.sqlite',
         'tqdm',
+        'winotify',
     ],
     hookspath=[],
     hooksconfig={},
@@ -67,7 +68,7 @@ exe = EXE(
     bootloader_ignore_signals=False,
     strip=False,
     upx=True,
-    console=True,                 # console app for scheduled tasks
+    console=False,                # windowless — notifies via OS toast
     icon=os.path.join(ROOT, 'assets', 'Logo.ico'),
     uac_admin=False,
     uac_uiaccess=False,

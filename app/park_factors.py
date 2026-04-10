@@ -1040,7 +1040,15 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                     except Exception:
                         pass
 
-    results.sort(key=lambda x: x.get("time", "TBD"))
+    def _park_time_key(x):
+        t = (x.get("time") or "").strip()
+        try:
+            from datetime import datetime as _dt
+            return _dt.strptime(t.upper(), "%I:%M %p").time()
+        except Exception:
+            from datetime import time as _t
+            return _t(23, 59, 59)
+    results.sort(key=_park_time_key)
 
     # ── Pressure fill — single batched Open-Meteo call for all games ──
     _fetch_pressure_batch(results)

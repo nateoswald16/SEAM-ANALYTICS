@@ -39,6 +39,7 @@ from urllib3.util.retry import Retry
 from mlb_data_engine import MLBDataEngine
 from MLB_AVG import grade_stat
 from park_factors import ParkFactorsPage, prefetch_weather
+from search import PlayerSearchWidget
 import _app_paths
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -1322,18 +1323,23 @@ class DataManager:
         return BAT_COLS, BAT_HI, away_rows, home_rows
 
     def get_game_pitching(self, game_id, season=None, matchup=None, window=None,
-                          away_starter=None, home_starter=None):
-        """Return pitching table cols and rows for away/home starting pitchers.
+                          away_starter=None, home_starter=None,
+                          away_pitchers=None, home_pitchers=None):
+        """Return pitching table cols and rows for away/home pitchers.
 
         Looks up starters from plate_appearances for the game. When no PAs
         exist (unplayed/future game), uses ``away_starter``/``home_starter``
         dicts (keys: id, name, throws) to look up their season stats.
+
+        When ``away_pitchers``/``home_pitchers`` are provided (lists of
+        {id, name, throws} dicts), builds rows for every pitcher in each
+        list and skips the starter-detection logic (used by bullpen page).
         """
-        PIT_COLS = ["PITCHER", "IP", "K", "K%", "BB", "BB%",
+        PIT_COLS = ["PITCHER", "IP", "OUTS", "K", "K%", "BB", "BB%",
                     "H", "1B", "2B", "3B", "HR", "ERA", "WHIP",
                     "xOBA", "BABIP", "SLG", "Zone%",
                     "Barrel%", "Soft%", "LD%", "Hard%", "Contact%", "Velo", "Top", "Whiff%"]
-        PIT_HI = {3, 24}  # K%, Whiff%
+        PIT_HI = {4, 25}  # K%, Whiff%
 
         conn = self.connect()
         if not conn:
@@ -1402,7 +1408,7 @@ class DataManager:
             _cache_pitcher(pid, pname, p_throws)
 
             display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-            empty = [display_name, "0.0", "0", "", "0", "",
+            empty = [display_name, "0.0", "0", "0", "", "0", "",
                      "0", "0", "0", "0", "0", "", "",
                      "", "", "", "", "", "", "", "", "", "", "", ""]
 
@@ -1453,7 +1459,7 @@ class DataManager:
                         avg_velo_v = float(crow[25]) if crow[25] is not None else None
                         top_velo_v = float(crow[26]) if crow[26] is not None else None
                         fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
-                        return [display_name, _fmt_ip(outs), str(k),
+                        return [display_name, _fmt_ip(outs), str(outs), str(k),
                                 fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
                                 str(hits), str(singles), str(doubles), str(triples), str(hrs),
                                 fmt_era(era), fmt3(whip_v),
@@ -1531,7 +1537,7 @@ class DataManager:
                     _babip_d = _ab - k - hrs
                     _babip = round((hits - hrs) / _babip_d, 3) if _babip_d > 0 else None
                     _whip = round((bb + hits) / innings, 3) if innings > 0 else None
-                    return [display_name, _fmt_ip(outs), str(k),
+                    return [display_name, _fmt_ip(outs), str(outs), str(k),
                             fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
                             fmt_era(era), fmt3(_whip),
@@ -1581,6 +1587,16 @@ class DataManager:
 
             return home_pids, away_pids, pitcher_info
 
+        # ── Bullpen / multi-pitcher mode ──
+        if away_pitchers is not None or home_pitchers is not None:
+            away_rows = [_build_pitcher_row(p.get('id'), p.get('name', 'TBD'), p.get('throws', ''))
+                         for p in (away_pitchers or [])]
+            home_rows = [_build_pitcher_row(p.get('id'), p.get('name', 'TBD'), p.get('throws', ''))
+                         for p in (home_pitchers or [])]
+            if not away_rows and not home_rows:
+                return None
+            return PIT_COLS, PIT_HI, away_rows, home_rows
+
         home_pids, away_pids, pitcher_info = _get_pitcher_teams(game_id)
 
         def _build_side(pids, info):
@@ -1611,6 +1627,57 @@ class DataManager:
             return None
 
         return PIT_COLS, PIT_HI, away_rows, home_rows
+
+    def get_bullpen_pitching(self, game_id, season=None, matchup=None, window=None):
+        """Return pitching stats for all bullpen pitchers in the game.
+
+        Fetches bullpen roster from the MLB API boxscore endpoint, then
+        delegates to ``get_game_pitching`` with the pitcher lists to reuse
+        the same stat-building logic.
+        """
+        if not game_id:
+            return None
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
+            resp = _http.get(url, timeout=10)
+            resp.raise_for_status()
+            box = resp.json()
+        except Exception:
+            log.exception("get_bullpen_pitching: API fetch")
+            return None
+
+        away_pitchers = []
+        home_pitchers = []
+        for side, plist in [('away', away_pitchers), ('home', home_pitchers)]:
+            team_data = box.get('teams', {}).get(side, {})
+            bullpen_ids = team_data.get('bullpen', [])
+            pitcher_ids = team_data.get('pitchers', [])
+            players = team_data.get('players', {})
+
+            # pitchers[0] is the starter — relievers are pitchers[1:]
+            relievers_used = pitcher_ids[1:] if len(pitcher_ids) > 1 else []
+
+            # Combine: relievers who already entered + those still available
+            seen = set()
+            all_bp_ids = []
+            for pid in relievers_used + bullpen_ids:
+                if pid not in seen:
+                    seen.add(pid)
+                    all_bp_ids.append(pid)
+
+            for pid in all_bp_ids:
+                player_key = f"ID{pid}"
+                player_info = players.get(player_key, {})
+                person = player_info.get('person', {})
+                name = person.get('fullName', f'Unknown ({pid})')
+                plist.append({'id': pid, 'name': name, 'throws': ''})
+
+        if not away_pitchers and not home_pitchers:
+            return None
+
+        return self.get_game_pitching(
+            game_id, season=season, matchup=matchup, window=window,
+            away_pitchers=away_pitchers, home_pitchers=home_pitchers)
 
     def get_game_baserunning(self, game_id, season=None, matchup=None, window=None,
                               away_starter=None, home_starter=None):
@@ -1919,11 +1986,11 @@ class DataManager:
             return '', []
 
         # ── BvP Pitching: aggregate pitcher stats from PAs vs lineup batters ──
-        BVP_PIT_COLS = ["PITCHER", "IP", "K", "K%", "BB", "BB%",
+        BVP_PIT_COLS = ["PITCHER", "IP", "OUTS", "K", "K%", "BB", "BB%",
                         "H", "1B", "2B", "3B", "HR", "ERA", "WHIP",
                         "xOBA", "BABIP", "SLG", "Zone%",
                         "Barrel%", "Soft%", "LD%", "Hard%", "Contact%", "Velo", "Top", "Whiff%"]
-        BVP_PIT_HI = {3, 24}
+        BVP_PIT_HI = {4, 25}
 
         def _build_bvp_pitcher_row(pid, pname, p_throws, batter_ids, window):
             # Resolve full name from DB (API may pass abbreviated "F. Last")
@@ -1936,7 +2003,7 @@ class DataManager:
                 except Exception:
                     pass
             display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-            empty = [display_name, "0.0", "0", "", "0", "",
+            empty = [display_name, "0.0", "0", "0", "", "0", "",
                      "0", "0", "0", "0", "0", "",
                      "", "", "", "", "",
                      "", "", "", "", "", "", "", ""]
@@ -2022,7 +2089,7 @@ class DataManager:
                     zone_pct = round(in_zone / total_pitches_z, 3) if total_pitches_z > 0 else None
                     contact_pct = round((swings - whiffs) / swings, 3) if swings > 0 else None
                     fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
-                    return [display_name, _fmt_ip(outs), str(k),
+                    return [display_name, _fmt_ip(outs), str(outs), str(k),
                             fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
                             fmt_era(era), fmt3(whip),
@@ -4226,7 +4293,7 @@ class GameDetailPanel(QWidget):
         self._inner_stack = None
         self._pending_data = None
         self._built_tabs = set()
-        for attr in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack',
+        for attr in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack', '_bullpen_stack',
                       '_br_tables', '_bvp_tables'):
             try:
                 setattr(self, attr, None)
@@ -4252,7 +4319,7 @@ class GameDetailPanel(QWidget):
         inner.setStyleSheet(f"background:{C['bg0']};")
 
         sub_items = [("[ 01 ]","BATTING"),("[ 02 ]","PITCHING"),
-                     ("[ 03 ]","BASE RUNNING"),("[ 04 ]","BvP")]
+                     ("[ 03 ]","BASE RUNNING"),("[ 04 ]","BvP"),("[ 05 ]","BULLPEN")]
         subnav, _ = build_navbar(40, sub_items,
                                  self._on_subnav_changed,
                                  bg=C["bg1"])
@@ -4270,8 +4337,8 @@ class GameDetailPanel(QWidget):
         ll.addWidget(mk_label("Loading game data…", color=C["t3"], size=14, mono=True,
                                align=Qt.AlignmentFlag.AlignCenter))
         ll.addStretch()
-        # Add loading page for all 4 tabs
-        for _ in range(4):
+        # Add loading page for all 5 tabs
+        for _ in range(5):
             placeholder = QWidget()
             placeholder.setStyleSheet(f"background:{C['bg0']};")
             pl = QVBoxLayout(placeholder)
@@ -4365,15 +4432,23 @@ class GameDetailPanel(QWidget):
                 except Exception:
                     return None
 
-            with ThreadPoolExecutor(max_workers=4) as detail_pool:
+            def _q_bullpen():
+                try:
+                    return _DM.get_bullpen_pitching(gid) if gid else None
+                except Exception:
+                    return None
+
+            with ThreadPoolExecutor(max_workers=5) as detail_pool:
                 f_bat = detail_pool.submit(_q_bat)
                 f_pit = detail_pool.submit(_q_pit)
                 f_br  = detail_pool.submit(_q_br)
                 f_bvp = detail_pool.submit(_q_bvp)
+                f_bp  = detail_pool.submit(_q_bullpen)
                 data['bat'] = f_bat.result()
                 data['pit'] = f_pit.result()
                 data['br']  = f_br.result()
                 data['bvp'] = f_bvp.result()
+                data['bullpen'] = f_bp.result()
 
             # Seasons for filter
             try:
@@ -4490,6 +4565,8 @@ class GameDetailPanel(QWidget):
             self._bvp_home_name = home
             self._bvp_away_p = away_p
             self._bvp_home_p = home_p
+            self._bp_away_name = away
+            self._bp_home_name = home
 
             # Update season combobox if DB returned additional seasons
             seasons = data.get('seasons', [])
@@ -4714,6 +4791,39 @@ class GameDetailPanel(QWidget):
             bvl.addStretch()
             inner.insertWidget(idx, self._scroll_page(bvp_w))
 
+        elif idx == 4:
+            # ── Bullpen ──
+            bp_data = data.get('bullpen')
+            bp_w = QWidget()
+            bp_w.setStyleSheet(f"background:{C['bg0']};")
+            bpv = QVBoxLayout(bp_w)
+            bpv.setContentsMargins(14, 12, 14, 12)
+            bpv.setSpacing(10)
+            self._bullpen_stack = QStackedWidget()
+            self._bullpen_stack.setStyleSheet(f"background:{C['bg0']};")
+            if bp_data:
+                bp_cols, bp_hi, bp_away, bp_home = bp_data
+                self._bullpen_stack.addWidget(table_section(
+                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, bp_away, bp_hi, 170))
+                self._bullpen_stack.addWidget(table_section(
+                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, bp_home, bp_hi, 170))
+            else:
+                bp_cols = ["PITCHER", "IP", "K", "K%", "BB", "BB%",
+                           "H", "1B", "2B", "3B", "HR", "ERA", "WHIP",
+                           "xOBA", "BABIP", "SLG", "Zone%",
+                           "Barrel%", "Soft%", "LD%", "Hard%", "Contact%", "Velo", "Top", "Whiff%"]
+                bp_hi = {3, 24}
+                self._bullpen_stack.addWidget(table_section(
+                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 170))
+                self._bullpen_stack.addWidget(table_section(
+                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 170))
+            self._bullpen_stack.setCurrentIndex(0)
+            self._bp_cols = bp_cols if bp_data else bp_cols
+            self._bp_hi = bp_hi if bp_data else bp_hi
+            bpv.addWidget(self._bullpen_stack)
+            bpv.addStretch()
+            inner.insertWidget(idx, self._scroll_page(bp_w))
+
         # Remove the old placeholder and show the new tab
         if old:
             inner.removeWidget(old)
@@ -4722,7 +4832,7 @@ class GameDetailPanel(QWidget):
             inner.setCurrentIndex(self._current_subnav_idx)
         # Sync newly-built stack with current team toggle state
         toggle_idx = 1 if getattr(self, '_home_btn', None) and self._home_btn.isChecked() else 0
-        for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack'):
+        for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack', '_bullpen_stack'):
             stack = getattr(self, stack_name, None)
             if stack and not _is_deleted(stack) and stack.currentIndex() != toggle_idx:
                 stack.setCurrentIndex(toggle_idx)
@@ -4741,6 +4851,8 @@ class GameDetailPanel(QWidget):
                 self._refresh_baserunning()
             elif idx == 3:
                 self._refresh_bvp()
+            elif idx == 4:
+                self._refresh_bullpen()
         except RuntimeError:
             pass  # C++ object deleted
         except Exception:
@@ -4767,9 +4879,10 @@ class GameDetailPanel(QWidget):
                         self._refresh_baserunning()
                     elif idx == 3:
                         self._refresh_bvp()
+                    elif idx == 4:
+                        self._refresh_bullpen()
                 except Exception:
                     log.exception("_on_subnav_changed")
-            # Update matchup label and items per page type
             if idx == 0:  # Batting
                 self._season_label.show()
                 self.season_cb.show()
@@ -4807,6 +4920,16 @@ class GameDetailPanel(QWidget):
                 self.season_cb.hide()
                 # Show time filter for BvP (pitcher's last N games)
                 self.window_cb.show()
+            elif idx == 4:  # Bullpen
+                self._season_label.show()
+                self.season_cb.show()
+                self._matchup_label.setText("Batter")
+                self._matchup_label.show()
+                self.matchup_cb.show()
+                self.matchup_cb.blockSignals(True)
+                self.matchup_cb.clear()
+                self.matchup_cb.addItems(["Both", "RHB", "LHB"])
+                self.matchup_cb.blockSignals(False)
         except RuntimeError:
             pass  # C++ object deleted
 
@@ -4819,9 +4942,9 @@ class GameDetailPanel(QWidget):
             self._away_btn.setChecked(which == 'away')
             self._home_btn.setChecked(which == 'home')
             subnav = getattr(self, '_current_subnav_idx', 0)
-            _stack_map = {0: '_team_stack', 1: '_pit_stack', 2: '_br_stack', 3: '_bvp_stack'}
+            _stack_map = {0: '_team_stack', 1: '_pit_stack', 2: '_br_stack', 3: '_bvp_stack', 4: '_bullpen_stack'}
             visible_name = _stack_map.get(subnav)
-            for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack'):
+            for stack_name in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack', '_bullpen_stack'):
                 stack = getattr(self, stack_name, None)
                 if stack and not _is_deleted(stack):
                     if stack_name == visible_name:
@@ -4965,6 +5088,65 @@ class GameDetailPanel(QWidget):
             stack.updateGeometry()
         except Exception:
             log.exception("_refresh_pitching")
+
+    def _refresh_bullpen(self):
+        """Refresh the bullpen tables using current filter selections."""
+        try:
+            if _is_deleted(self):
+                return
+            game = getattr(self, '_current_game', None)
+            if not game:
+                return
+            gid = game.get('game_id')
+            try:
+                sel_season = int(self.season_cb.currentText())
+            except Exception:
+                sel_season = None
+            mmap = {'Both': 'all', 'RHB': 'vs_righty', 'LHB': 'vs_lefty',
+                    'RHP': 'vs_righty', 'LHP': 'vs_lefty'}
+            wmap = {'All Games': 'season', 'Last 5 Games': 'last5', 'Last 10 Games': 'last10',
+                    'Last 15 Games': 'last15', 'Last 30 Games': 'last30'}
+            sel_matchup = mmap.get(self.matchup_cb.currentText(), 'all')
+            sel_window = wmap.get(self.window_cb.currentText(), 'season')
+
+            try:
+                res = _DM.get_bullpen_pitching(gid, season=sel_season, matchup=sel_matchup,
+                                                window=sel_window)
+                if not res:
+                    return
+                new_cols, new_hi, new_away, new_home = res
+            except Exception:
+                return
+
+            stack = getattr(self, '_bullpen_stack', None)
+            if not stack or _is_deleted(stack):
+                return
+            cur_idx = stack.currentIndex()
+            away_w = stack.widget(0) if stack.count() > 0 else None
+            home_w = stack.widget(1) if stack.count() > 1 else None
+            if (away_w and home_w and
+                    hasattr(away_w, '_table') and hasattr(home_w, '_table') and
+                    away_w._table._cols == new_cols):
+                away_w._table.set_data(new_away)
+                home_w._table.set_data(new_home)
+            else:
+                while stack.count():
+                    w = stack.widget(0)
+                    stack.removeWidget(w)
+                    w.deleteLater()
+                away_name = getattr(self, '_bp_away_name', 'AWAY')
+                home_name = getattr(self, '_bp_home_name', 'HOME')
+                stack.addWidget(table_section(
+                    f"{away_name}  BULLPEN", "[ ©SA ]", new_cols, new_away, new_hi, 170))
+                stack.addWidget(table_section(
+                    f"{home_name}  BULLPEN", "[ ©SA ]", new_cols, new_home, new_hi, 170))
+            stack.setCurrentIndex(cur_idx)
+            cur_w = stack.currentWidget()
+            if cur_w:
+                stack.setFixedHeight(cur_w.sizeHint().height())
+            stack.updateGeometry()
+        except Exception:
+            log.exception("_refresh_bullpen")
 
     def _refresh_baserunning(self):
         """Refresh the base running tables using current filter selections."""
@@ -5590,8 +5772,12 @@ def _is_game_live(g):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Sidebar sort helper
 # ═══════════════════════════════════════════════════════════════════════════════
+from datetime import time as _time_type
+_time_max = _time_type(23, 59, 59)
+
 def _game_sort_key(g):
-    """Sort: live first (0), scheduled next (1), final/postponed last (2)."""
+    """Sort: live first (0), scheduled next (1), final/postponed last (2).
+    Secondary sort by chronological game time."""
     t = (g.get('time') or '').upper()
     st = (g.get('status') or '').lower()
     is_final = (t == 'FINAL' or st.startswith('final')
@@ -5599,11 +5785,19 @@ def _game_sort_key(g):
                 or st.startswith('completed'))
     is_ppd = t == 'PPD' or st.startswith('postponed')
     is_live = _is_game_live(g)
+    # Parse 12-hour time string (e.g. "2:00 PM") into sortable value
+    try:
+        from datetime import datetime as _dt
+        time_val = _dt.strptime(t.strip(), '%I:%M %p').time()
+    except Exception:
+        time_val = None
+    # Use parsed time for chronological sort, fall back to end-of-day
+    sort_time = time_val if time_val is not None else _time_max
     if is_live:
-        return (0, t)
+        return (0, sort_time)
     if not is_final and not is_ppd:
-        return (1, t)
-    return (2, t)
+        return (1, sort_time)
+    return (2, sort_time)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5782,6 +5976,12 @@ class SeamStatsApp(QMainWindow):
         hl.addWidget(mk_label("SEAM \u2009ANALYTICS", color=C["t1"], size=12, bold=True, mono=True))
         hl.addWidget(mk_label("/", color=C["t3"], size=12, mono=True))
         hl.addWidget(mk_label("MLB · 2026 · ©SA", color=C["t3"], size=12, mono=True))
+        hl.addStretch()
+
+        # ── Centered search bar ──
+        self._search_widget = PlayerSearchWidget(parent=bar, compact=True)
+        hl.addWidget(self._search_widget)
+
         hl.addStretch()
 
         # ── Update progress bar (hidden until update runs) ──

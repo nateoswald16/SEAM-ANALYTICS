@@ -49,7 +49,7 @@
     "mapped_to": "plate_appearances.zone"
   },
   "des": {
-    "mapped_to": "plate_appearances.description"
+    "mapped_to": "plate_appearances.des"
   },
   "game_type": {
     "mapped_to": "plate_appearances.game_type"

@@ -6,7 +6,7 @@
 ;         (run from repo root, or adjust SourceDir below)
 
 #define MyAppName      "Seam Analytics"
-#define MyAppVersion   "1.0.5-beta"
+#define MyAppVersion   "1.1.0"
 #define MyAppPublisher "Seam Analytics"
 #define MyAppExeName   "SeamAnalytics.exe"
 #define MyUpdaterExe   "SeamUpdater.exe"

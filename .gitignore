@@ -48,7 +48,9 @@ nul
 
 # ── One-time repair / utility scripts ─────────────────────────
 app/backfill_swing_contact.py
+app/backfill_outs_er.py
 app/download_historical_statcast.py
 
 # ── API keys ──────────────────────────────────────────────────
 app/weatherapi_key.txt
+app/assets/headshots/

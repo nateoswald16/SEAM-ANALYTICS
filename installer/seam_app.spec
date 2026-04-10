@@ -26,6 +26,8 @@ a = Analysis(
         (os.path.join(ROOT, 'assets', 'arrow-circle-left.svg'),   'assets'),
         (os.path.join(ROOT, 'assets', 'arrow-circle-right.svg'),  'assets'),
         (os.path.join(ROOT, 'assets', 'logos'),                   os.path.join('assets', 'logos')),
+        (os.path.join(ROOT, 'assets', 'players.csv'),             'assets'),
+        (os.path.join(ROOT, 'assets', 'headshots'),               os.path.join('assets', 'headshots')),
         # Schema / mapping files (read-only, used by build pipeline)
         (os.path.join(ROOT, 'database_schema.py'),               '.'),
         (os.path.join(ROOT, 'pybaseball_to_schema_mapping.json'), '.'),
@@ -38,6 +40,10 @@ a = Analysis(
         'mlb_data_engine',
         'MLB_AVG',
         'park_factors',
+        'search',
+        'player_card',
+        'build_raw_db',
+        'build_calculated_db',
         # ── PyQt6 ────────────────────────────────────────────
         'PyQt6.sip',
         'PyQt6.QtSvg',

@@ -305,74 +305,17 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
         else:
             batter_runs = 0
 
-        # compute outs recorded and earned runs for this plate appearance
-        outs_on_play = 0
-        earned_runs = 0
+        # compute outs recorded and earned runs from runners array
+        runners = play.get('runners') or []
+        outs_on_play = sum(1 for r in runners if r.get('movement', {}).get('isOut'))
+        earned_runs = sum(1 for r in runners if r.get('details', {}).get('earned'))
+
         play_events = play.get('playEvents') or []
-        if play_events:
-            # sum outs; detect scoring events and whether they are earned
-            for ev in play_events:
-                # outs
-                if ev.get('isOut'):
-                    try:
-                        outs_on_play += 1
-                    except Exception:
-                        outs_on_play += 0
-
-            # detect scoring + earned status per event
-            for ev in play_events:
-                # determine rbi count
-                rbi_count = 0
-                if ev.get('rbi') is not None:
-                    try:
-                        rbi_count = int(ev.get('rbi'))
-                    except Exception:
-                        rbi_count = 1
-                elif ev.get('isScoringPlay'):
-                    rbi_count = 1
-
-                if rbi_count > 0:
-                    # check for explicit earned flag
-                    is_earned = None
-                    if 'isEarned' in ev:
-                        is_earned = ev.get('isEarned')
-                    elif isinstance(ev.get('details'), dict) and 'isEarned' in ev.get('details'):
-                        is_earned = ev.get('details').get('isEarned')
-
-                    # fallback: if any play event has an error flag, treat runs as unearned
-                    if is_earned is None:
-                        has_error = any((e.get('isError') or (isinstance(e.get('details'), dict) and e.get('details').get('error'))) for e in play_events)
-                        is_earned = not has_error
-
-                    if is_earned:
-                        earned_runs += rbi_count
-        else:
-            # fallback heuristics when playEvents not available
-            if 'double play' in ev_low or 'double_play' in ev_low:
-                outs_on_play = 2
-            elif 'triple play' in ev_low or 'triple_play' in ev_low:
-                outs_on_play = 3
-            elif is_strikeout:
-                outs_on_play = 1
-            elif 'out' in ev_low or 'ground out' in ev_low or 'fly out' in ev_low:
-                outs_on_play = 1
-
-            # earned runs fallback: assume rbi is earned unless description contains 'error'
-            rbi_val = result.get('rbi') if result.get('rbi') is not None else 0
-            try:
-                rbi_val = int(rbi_val)
-            except Exception:
-                rbi_val = 0
-            desc = (result.get('description') or '') or ''
-            if rbi_val > 0:
-                if 'error' in desc.lower() or 'fielding error' in desc.lower():
-                    earned_runs = 0
-                else:
-                    earned_runs = rbi_val
 
         # Extract hitData from the last playEvent that has it (ball in play)
         hit_data = {}
         last_count = {}
+        last_pitch_info = {}
         for ev in reversed(play_events):
             if 'hitData' in ev and not hit_data:
                 hd = ev['hitData']
@@ -388,7 +331,16 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             if ev.get('isPitch') and 'count' in ev and not last_count:
                 c = ev['count']
                 last_count = {'balls': c.get('balls'), 'strikes': c.get('strikes')}
-            if hit_data and last_count:
+            if ev.get('isPitch') and not last_pitch_info:
+                details = ev.get('details') or {}
+                pitch_type_info = details.get('type') or {}
+                pitch_data = ev.get('pitchData') or {}
+                last_pitch_info = {
+                    'pitch_name': pitch_type_info.get('description'),
+                    'pitch_type_primary': pitch_type_info.get('code'),
+                    'release_speed': pitch_data.get('startSpeed'),
+                }
+            if hit_data and last_count and last_pitch_info:
                 break
 
         # Compute barrel flag from game feed hitData
@@ -468,7 +420,9 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'at_bat_number': at_bat_number,
             'balls': last_count.get('balls'),
             'strikes': last_count.get('strikes'),
-            'release_speed': None,
+            'release_speed': last_pitch_info.get('release_speed'),
+            'pitch_name': last_pitch_info.get('pitch_name'),
+            'pitch_type_primary': last_pitch_info.get('pitch_type_primary'),
             'release_spin_rate': None,
             'spin_axis': None,
             'effective_speed': None,
@@ -755,6 +709,16 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                     pa_update[col] = val
             elif table == 'pitching_appearances':
                 pitch_row[col] = val
+
+        # On the result pitch (last pitch of the PA), copy pitch_name and
+        # the narrative description (`des`) onto the plate_appearances row.
+        if is_result_pitch:
+            _pn = srow.get('pitch_name')
+            if pd.notna(_pn):
+                pa_update['pitch_name'] = _pn
+            _des = srow.get('des')
+            if pd.notna(_des):
+                pa_update['des'] = _des
 
         # Keep the feed's `at_bat_number` canonical; Statcast's original
         # 1-based value is stored in `statcast_at_bat_number` (mapping updated).

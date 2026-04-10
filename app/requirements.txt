@@ -11,3 +11,4 @@ lxml>=6.0
 beautifulsoup4>=4.14
 SQLAlchemy>=2.0
 PyGithub>=2.9
+winotify>=1.1

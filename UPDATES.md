@@ -4,6 +4,75 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.1.0 — 2026-04-10
+
+> **Action Required:** This update includes a critical fix to the outs and earned runs data pipeline. We recommend all users rebuild their database using the bundled database included with this release, then on first app launch click **Update Data** in the title bar to run the manual data updater. This ensures all historical data is populated with correct values.
+
+### Player Search
+
+**Global Search Bar**
+- Added a player search bar centered in the application title bar
+- Type any player name to search across the full 1,267-player roster
+- Compact design (320×28px) fits naturally in the title bar without stealing focus on app launch
+- Floating dropdown (380px wide) appears below the input with up to 25 results, max 6 visible rows
+- Each result row shows a headshot thumbnail (32×48 vertical rounded rect), player name, and subtitle (MLB | 2026 | Position | Team)
+- Clicking a result opens the full Player Profile dialog with batting/pitching stats, spray chart, game log, and PA table
+- Dropdown uses `Qt.WindowType.Tool` to avoid stealing keyboard focus from the main app
+
+### Player Card
+
+**Pitcher Outs Filter**
+- The OUTS filter on the pitcher game log bar chart now displays correct per-game out totals
+- Previously showed all zeros due to a data pipeline bug (see Data Pipeline section below)
+
+### Pitching Tables
+
+**Outs Column Added**
+- Added an "OUTS" column to the Pitchers, Bullpen, and BvP pitching tables
+- Positioned immediately after the IP (Innings Pitched) column for quick reference
+- Shows the raw outs count alongside the formatted IP value (e.g. IP: 6.1, OUTS: 19)
+
+### Data Pipeline
+
+**Outs Recorded & Earned Runs Fix (Critical)**
+- Fixed `outs_recorded` being zero for all plate appearances in the database
+- Root cause: `parse_plays_to_pas()` in `build_raw_db.py` was checking `playEvents[].isOut` — a field that does not exist at the top level of play event objects in the MLB API
+- Replaced the ~40-line broken calculation with a correct 4-line implementation using the `play.runners[]` array:
+  - Outs: count runners where `movement.isOut == True`
+  - Earned runs: count runners where `details.earned == True`
+- Correctly handles all out types: strikeouts, field outs, force outs, double plays (2 outs), triple plays (3 outs), and baserunner outs
+- Fixed `earned_runs` calculation which had the same issue — was relying on `playEvents` fields that didn't exist
+- All future daily updates will automatically use the corrected logic
+
+### Game Tracker
+
+**Chronological Game Sorting**
+- Fixed games sorting out of order when start times crossed a digit boundary (e.g. 10:00 PM appearing before 2:00 PM)
+- Root cause: time strings were compared alphabetically — `"10:00 PM"` < `"2:00 PM"` because `'1' < '2'`
+- `_game_sort_key` now parses the 12-hour time string into a `datetime.time` for proper chronological ordering
+- Affects sidebar, schedule page, and all live re-sort paths
+- Park factors page sort updated with the same fix
+
+### Bullpen Page
+
+**New Bullpen Sub-Tab**
+- Added a "BULLPEN" tab to the game detail sub-navbar alongside Batting, Pitching, Base Running, and BvP
+- Fetches active bullpen roster from the MLB API boxscore endpoint (`teams.{side}.bullpen[]`) for each game
+- Displays full pitching stats table for every bullpen pitcher (same columns as the Pitching tab: IP, K, K%, BB, BB%, ERA, WHIP, xOBA, etc.)
+- Dynamically sizes to fit any number of active bullpen pitchers
+- Supports Season, Batter handedness (RHB/LHB), and Time window filters
+- Away/Home team toggle works the same as all other sub-tabs
+
+### Daily Updater
+
+**Silent Execution with OS Notification**
+- SeamUpdater.exe now runs without launching a console window (`console=False` in PyInstaller spec)
+- On completion, a Windows toast notification is displayed via `winotify` with a summary of updated data (games, PAs, pitching appearances, stolen bases, statcast backfill)
+- If the database is already up to date, the notification reports "Database is already up to date"
+- Notification is best-effort — failures are silently ignored to avoid disrupting the update process
+
+---
+
 ## v1.0.5-beta — 2026-04-09
 
 ### Game Tracker

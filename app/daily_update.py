@@ -359,5 +359,36 @@ def main(argv: list[str] | None = None, gui_cb=None):
     }
 
 
+def _send_notification(summary: dict):
+    """Send a Windows toast notification with the update summary."""
+    try:
+        from winotify import Notification
+        if summary.get("up_to_date"):
+            body = "Database is already up to date. Nothing to do."
+        else:
+            rng = summary.get("range", "")
+            lines = [f"Range: {rng}"]
+            if summary.get("games"):
+                lines.append(f"Games: {summary['games']}")
+            if summary.get("plate_appearances"):
+                lines.append(f"PAs: {summary['plate_appearances']}")
+            if summary.get("pitching_appearances"):
+                lines.append(f"Pitching: {summary['pitching_appearances']}")
+            if summary.get("stolen_bases"):
+                lines.append(f"SBs: {summary['stolen_bases']}")
+            if summary.get("statcast_backfill"):
+                lines.append(f"Statcast backfill: {summary['statcast_backfill']} date(s)")
+            body = "\n".join(lines)
+        toast = Notification(
+            app_id="Seam Analytics",
+            title="Daily Update Complete",
+            msg=body,
+        )
+        toast.show()
+    except Exception:
+        pass  # Notification is best-effort
+
+
 if __name__ == '__main__':
-    main()
+    result = main()
+    _send_notification(result or {})
