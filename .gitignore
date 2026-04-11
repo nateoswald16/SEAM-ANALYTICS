@@ -19,6 +19,7 @@ venv_backup*/
 *.db-shm
 *.db-wal
 *.db-journal
+*.schema_version
 
 # ── Caches & runtime data ────────────────────────────────────
 *.pkl
@@ -47,7 +48,9 @@ nul
 *.swo
 
 # ── One-time repair / utility scripts ─────────────────────────
-app/backfill_swing_contact.py
+app/backfill_*.py
+app/verify_2025.py
+app/rebuild_2026.py
 app/backfill_outs_er.py
 app/download_historical_statcast.py
 

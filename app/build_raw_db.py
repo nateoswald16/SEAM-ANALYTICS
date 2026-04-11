@@ -118,7 +118,19 @@ def create_db(db_path: str = DB_PATH):
     except Exception as e:
         print('Warning during stolen_bases migration:', e)
 
+    # ── Schema version tracking ──────────────────────────────────────
+    cur.execute("CREATE TABLE IF NOT EXISTS schema_version (key TEXT PRIMARY KEY, value INTEGER)")
+    cur.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
+                (_app_paths.RAW_DB_SCHEMA_VERSION,))
+    conn.commit()
+
     conn.close()
+
+    # Write version marker file for installer version checks
+    version_file = db_path + '.schema_version'
+    with open(version_file, 'w') as f:
+        f.write(str(_app_paths.RAW_DB_SCHEMA_VERSION))
+
     print('Database created/updated.')
 
 
@@ -226,11 +238,38 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
                     _game_runs[rn_id] += 1
     # Track which player's runs we've already assigned to a PA
     _runs_assigned = {}
+    # Track inherited-runner earned runs: {pitcher_id: count}
+    _inherited_er: Dict[int, int] = {}
+    # Track outs from non-PA events (CS, pickoff, runner out) per pitcher
+    _non_pa_outs: Dict[int, int] = {}
+
+    # Events that are NOT true plate appearances — skip them entirely
+    _SKIP_EVENTS = frozenset({
+        'Pickoff 1B', 'Pickoff 2B', 'Pickoff 3B',
+        'Pickoff Caught Stealing 2B', 'Pickoff Caught Stealing 3B',
+        'Pickoff Caught Stealing Home',
+        'Caught Stealing 2B', 'Caught Stealing 3B', 'Caught Stealing Home',
+        'Balk', 'Game Advisory',
+        'Runner Out',   # rare: runner thrown out between plays
+    })
 
     for idx, play in enumerate(plays, start=1):
         about = play.get('about', {})
         matchup = play.get('matchup', {})
         result = play.get('result', {})
+        # Skip non-PA events (runner events, advisories, truncated/incomplete PAs)
+        event_str = result.get('event') or result.get('eventType') or ''
+        if not event_str or event_str.lower() == 'truncated_pa':
+            continue
+        if event_str in _SKIP_EVENTS:
+            # Count outs from non-PA events (CS, pickoff, runner out)
+            runners = play.get('runners') or []
+            skip_outs = sum(1 for r in runners if r.get('movement', {}).get('isOut'))
+            if skip_outs > 0:
+                pid = matchup.get('pitcher', {}).get('id')
+                if pid:
+                    _non_pa_outs[pid] = _non_pa_outs.get(pid, 0) + skip_outs
+            continue
         at_bat_number = about.get('atBatIndex', idx)
         batter = matchup.get('batter', {})
         pitcher = matchup.get('pitcher', {})
@@ -279,14 +318,17 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
         is_walk = 1 if ('walk' in ev_low or 'base on balls' in ev_low or 'intent_walk' in ev_low) else 0
         is_strikeout = 1 if ('strikeout' in ev_low or 'struck out' in ev_low) else 0
         is_hr = 1 if ('home_run' in ev_low or 'home run' in ev_low) else 0
-        is_single = 1 if ('single' in ev_low and 'double' not in ev_low) else 0
-        is_double = 1 if 'double' in ev_low else 0
-        is_triple = 1 if 'triple' in ev_low else 0
+        is_single = 1 if ev_low in ('single',) else 0
+        is_double = 1 if ev_low in ('double',) else 0
+        is_triple = 1 if ev_low in ('triple',) else 0
         is_hbp = 1 if ('hit by pitch' in ev_low or 'hbp' in ev_low) else 0
         is_sac_fly = 1 if ('sac fly' in ev_low or 'sacrifice fly' in ev_low) else 0
         is_sac_bunt = 1 if ('sac bunt' in ev_low or 'sacrifice bunt' in ev_low) else 0
         non_ab_keywords = ['walk', 'hit by pitch', 'hbp', 'sacrifice', 'sac fly', 'sac bunt', 'intent_walk', 'catcher interference']
-        is_ab = 0 if any(k in ev_low for k in non_ab_keywords) else 1
+        # Catcher interference can also appear as 'field_error' with interference in description
+        desc_text = (result.get('description') or '').lower()
+        is_catcher_interference = ('field_error' in ev_low and 'interference' in desc_text)
+        is_ab = 0 if (any(k in ev_low for k in non_ab_keywords) or is_catcher_interference) else 1
         total_bases = 0
         if is_single:
             total_bases = 1
@@ -308,7 +350,19 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
         # compute outs recorded and earned runs from runners array
         runners = play.get('runners') or []
         outs_on_play = sum(1 for r in runners if r.get('movement', {}).get('isOut'))
-        earned_runs = sum(1 for r in runners if r.get('details', {}).get('earned'))
+        # Only count earned runs charged to THIS pitcher (not inherited runner ER)
+        earned_runs = sum(
+            1 for r in runners
+            if r.get('details', {}).get('earned')
+            and (r.get('details', {}).get('responsiblePitcher') or {}).get('id') == pitcher_id
+        )
+        # Track inherited-runner ER to redistribute after all PAs are parsed
+        for r in runners:
+            rd = r.get('details') or {}
+            resp_id = (rd.get('responsiblePitcher') or {}).get('id')
+            if rd.get('earned') and resp_id and resp_id != pitcher_id:
+                _inherited_er.setdefault(resp_id, 0)
+                _inherited_er[resp_id] += 1
 
         play_events = play.get('playEvents') or []
 
@@ -442,6 +496,30 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'earned_runs': earned_runs,
         }
         out.append(row)
+
+    # Post-process: build pitcher → last PA index (used for both
+    # inherited ER and non-PA outs redistribution).
+    pitcher_last_pa: Dict[int, int] = {}
+    if _inherited_er or _non_pa_outs:
+        for i, pa in enumerate(out):
+            pid = pa.get('pitcher_id')
+            if pid:
+                pitcher_last_pa[pid] = i
+
+    # Redistribute inherited-runner earned runs to the responsible
+    # pitcher's LAST PA in this game.
+    for resp_pid, er_count in _inherited_er.items():
+        idx = pitcher_last_pa.get(resp_pid)
+        if idx is not None:
+            out[idx]['earned_runs'] = (out[idx].get('earned_runs') or 0) + er_count
+
+    # Redistribute outs from non-PA events (CS, pickoff, runner out)
+    # to the pitcher's last PA in this game.
+    for pid, extra_outs in _non_pa_outs.items():
+        idx = pitcher_last_pa.get(pid)
+        if idx is not None:
+            out[idx]['outs_recorded'] = (out[idx].get('outs_recorded') or 0) + extra_outs
+
     return out
 
 
@@ -591,10 +669,27 @@ def parse_stolen_events(feed: Dict[str, Any], season: int) -> List[Dict[str, Any
 
             event_type = None
             is_successful = None
+            movement = runner.get('movement') or {}
+            is_out = movement.get('isOut', False)
+            end_base = movement.get('end')
+
             if 'stolen_base' in low_et and 'caught' not in low_et:
+                # Verify the steal was actually successful:
+                # runner must not be out AND must have reached the target base
+                if is_out:
+                    continue
+                target_base = _parse_base(event_type_raw)
+                if target_base and end_base and end_base != target_base:
+                    # 'stolen_base_home' target is 'Home' but API end is 'score'
+                    if not (target_base == 'Home' and end_base == 'score'):
+                        # Runner didn't reach the target base (e.g. retreated)
+                        continue
                 event_type = 'stolen_base'
                 is_successful = 1
             elif 'caught_stealing' in low_et:
+                # Count CS regardless of isOut — MLB sometimes tags
+                # caught_stealing with isOut=False when the runner
+                # advances on a subsequent hit in the same AB.
                 event_type = 'caught_stealing'
                 is_successful = 0
             else:

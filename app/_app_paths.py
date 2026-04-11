@@ -11,6 +11,11 @@ import sys
 
 APP_VERSION = "1.1.0"
 
+# Database schema versions — bump these when tables/columns change.
+# The app checks these on startup and runs migrations or forces a recalc.
+RAW_DB_SCHEMA_VERSION = 2       # v1 = initial, v2 = added outs_recorded/earned_runs/statcast_at_bat_number/base + SB/CS parsing fixes
+CALC_DB_SCHEMA_VERSION = 2      # v1 = initial, v2 = aligned with raw v2 parsing fixes
+
 _frozen = getattr(sys, "frozen", False)
 
 # ── Root directories ─────────────────────────────────────────────────

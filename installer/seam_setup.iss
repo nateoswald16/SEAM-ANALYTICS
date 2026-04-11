@@ -10,6 +10,8 @@
 #define MyAppPublisher "Seam Analytics"
 #define MyAppExeName   "SeamAnalytics.exe"
 #define MyUpdaterExe   "SeamUpdater.exe"
+#define RawDBSchemaVersion   "2"
+#define CalcDBSchemaVersion  "2"
 
 [Setup]
 AppId={{B8A3D6F1-7C2E-4A91-9D0B-3E5F8C1A2B4D}
@@ -41,7 +43,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon";    Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "refreshdb";      Description: "Replace local databases with the latest bundled data"; GroupDescription: "Database:"; Flags: unchecked
+Name: "refreshdb";      Description: "Force replace ALL local databases (only use if your data is corrupted — your daily-updated data will be lost)"; GroupDescription: "Database Troubleshooting:"; Flags: unchecked
 Name: "scheduledupdate"; Description: "Schedule daily data updates (recommended)"; GroupDescription: "Automatic Updates:"; Flags: checkedonce
 
 [Files]
@@ -52,8 +54,15 @@ Source: "..\dist\SeamAnalytics\*"; DestDir: "{app}\SeamAnalytics"; Flags: ignore
 Source: "..\dist\SeamUpdater\*"; DestDir: "{app}\SeamUpdater"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; ── Pre-loaded databases → user data dir ──────────────────────────────
-Source: "..\app\mlb_raw.db";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallDB('mlb_raw.db')
-Source: "..\app\mlb_calculated.db"; DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallDB('mlb_calculated.db')
+; Raw DB: only install if missing or empty — the app migrates schema in-place
+;         so users keep their daily-updated data across upgrades.
+Source: "..\app\mlb_raw.db";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallRawDB('mlb_raw.db')
+; Calc DB: replace on schema mismatch — it's derived from raw and gets rebuilt.
+Source: "..\app\mlb_calculated.db"; DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall; Check: ShouldInstallCalcDB('mlb_calculated.db', '{#CalcDBSchemaVersion}')
+
+; ── Schema version markers (always overwritten) ──────────────────────
+Source: "..\app\mlb_raw.db.schema_version";        DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall
+Source: "..\app\mlb_calculated.db.schema_version";  DestDir: "{localappdata}\SeamAnalytics"; Flags: ignoreversion uninsneveruninstall
 
 [Dirs]
 Name: "{localappdata}\SeamAnalytics"
@@ -83,8 +92,10 @@ Type: files;          Name: "{localappdata}\SeamAnalytics\temp_lineups_cache.jso
 Type: files;          Name: "{localappdata}\SeamAnalytics\processed_dates.pkl"
 
 [Code]
-// Install a DB if it doesn't exist, is a 0-byte stub, or the user checked "Refresh databases"
-function ShouldInstallDB(DBName: String): Boolean;
+// ── Raw DB: only install if missing or 0-byte stub. ──────────────────
+// Schema migrations (ALTER TABLE) run in-place via create_db() on first
+// app launch or daily update, so we never overwrite the user's data.
+function ShouldInstallRawDB(DBName: String): Boolean;
 var
   Path: String;
   FindRec: TFindRec;
@@ -97,12 +108,59 @@ begin
   Path := ExpandConstant('{localappdata}\SeamAnalytics\') + DBName;
   if FindFirst(Path, FindRec) then
   begin
-    // File exists — install only if it's a 0-byte stub from a failed run
     Result := (FindRec.SizeHigh = 0) and (FindRec.SizeLow = 0);
     FindClose(FindRec);
   end
   else
-    // File doesn't exist — install it
+    Result := True;
+end;
+
+// ── Calc DB: replace when schema version changes. ────────────────────
+// The calc DB is derived entirely from the raw DB and can be rebuilt,
+// so it's safe to overwrite on upgrade. This avoids column-shift crashes
+// when the calculated table structure changes between versions.
+function ShouldInstallCalcDB(DBName: String; RequiredVersion: String): Boolean;
+var
+  Path, VersionPath, InstalledVersion: String;
+  FindRec: TFindRec;
+  Lines: TArrayOfString;
+begin
+  if WizardIsTaskSelected('refreshdb') then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Path := ExpandConstant('{localappdata}\SeamAnalytics\') + DBName;
+  if FindFirst(Path, FindRec) then
+  begin
+    if (FindRec.SizeHigh = 0) and (FindRec.SizeLow = 0) then
+    begin
+      Result := True;
+      FindClose(FindRec);
+      Exit;
+    end;
+    FindClose(FindRec);
+
+    // Check schema version marker file
+    VersionPath := Path + '.schema_version';
+    if LoadStringsFromFile(VersionPath, Lines) and (GetArrayLength(Lines) > 0) then
+    begin
+      InstalledVersion := Trim(Lines[0]);
+      if InstalledVersion <> RequiredVersion then
+      begin
+        Log('Calc DB ' + DBName + ': installed schema v' + InstalledVersion + ' < required v' + RequiredVersion + ' — replacing');
+        Result := True;
+        Exit;
+      end;
+      Result := False;
+    end
+    else
+    begin
+      Log('Calc DB ' + DBName + ': no schema version marker found — replacing');
+      Result := True;
+    end;
+  end
+  else
     Result := True;
 end;
 

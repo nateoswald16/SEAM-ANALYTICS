@@ -380,6 +380,32 @@ class DataManager:
                 return None
             try:
                 conn = sqlite3.connect(self.calc_db_path, timeout=30)
+                conn.row_factory = sqlite3.Row
+                # Check schema version.  Only clear stale data when the DB
+                # has an *explicit* older version stamp.  If the schema_version
+                # table doesn't exist yet (pre-versioning DB), leave data alone
+                # — the next calc rebuild will stamp it properly.
+                try:
+                    cur = conn.cursor()
+                    cur.execute("SELECT value FROM schema_version WHERE key = 'version'")
+                    row = cur.fetchone()
+                    db_ver = int(row["value"]) if row else None
+                except Exception:
+                    db_ver = None   # table doesn't exist — pre-versioning DB
+                if db_ver is not None and db_ver < _app_paths.CALC_DB_SCHEMA_VERSION:
+                    # Schema is outdated — stamp the new version so the app
+                    # doesn't re-check every connection.  We do NOT wipe data
+                    # here; the next calc rebuild (daily updater or manual)
+                    # cleans each season individually before recalculating.
+                    log.warning("Calc DB schema v%s < expected v%s — stamping new version (rebuild recommended)",
+                                db_ver, _app_paths.CALC_DB_SCHEMA_VERSION)
+                    try:
+                        conn.execute("CREATE TABLE IF NOT EXISTS schema_version (key TEXT PRIMARY KEY, value INTEGER)")
+                        conn.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
+                                     (_app_paths.CALC_DB_SCHEMA_VERSION,))
+                        conn.commit()
+                    except Exception:
+                        log.exception("Failed to stamp calc schema version")
                 _thread_local.calc_conn = conn
                 self._thread_conns.append(conn)
             except Exception:
@@ -596,7 +622,7 @@ class DataManager:
                     f"WHERE season = ? AND matchup = 'all' AND window = 'season' "
                     f"AND player_id IN ({ph2})",
                     [season] + player_ids).fetchall()
-                names = {r[0]: r[1] for r in name_rows}
+                names = {r["player_id"]: r["player_name"] for r in name_rows}
             except Exception:
                 log.exception("get_streak_leaderboard")
 
@@ -662,7 +688,7 @@ class DataManager:
                     f"WHERE season = ? AND matchup = 'all' AND window = 'season' "
                     f"AND player_id IN ({ph2})",
                     [season] + player_ids).fetchall()
-                names = {r[0]: r[1] for r in name_rows}
+                names = {r["player_id"]: r["player_name"] for r in name_rows}
             except Exception:
                 pass
 
@@ -1100,33 +1126,33 @@ class DataManager:
                     )
                     crow = cur_calc.fetchone()
                     if crow is not None:
-                        pa = int(crow[0] or 0)
-                        ab = int(crow[1] or 0)
-                        hits = int(crow[2] or 0)
-                        singles = int(crow[3] or 0)
-                        doubles = int(crow[4] or 0)
-                        triples = int(crow[5] or 0)
-                        hrs = int(crow[6] or 0)
-                        runs = int(crow[7] or 0)
-                        rbi = int(crow[8] or 0)
-                        total_bases = int(crow[9] or 0)
-                        walks = int(crow[10] or 0)
-                        so = int(crow[11] or 0)
-                        avg = round(float(crow[12]), 3) if crow[12] is not None else None
-                        slg = round(float(crow[13]), 3) if crow[13] is not None else None
-                        obp = round(float(crow[14]), 3) if crow[14] is not None else None
-                        k_pct = round(float(crow[15]), 2) if crow[15] is not None else None
-                        bb_pct = round(float(crow[16]), 2) if crow[16] is not None else None
-                        barrel_pct = round(float(crow[17]), 3) if crow[17] is not None else None
-                        pull_pct = round(float(crow[18]), 3) if crow[18] is not None else None
-                        iso = round(float(crow[19]), 3) if crow[19] is not None else None
-                        avg_la = round(float(crow[20]), 1) if crow[20] is not None else None
-                        avg_ev = round(float(crow[21]), 1) if crow[21] is not None else None
-                        max_ev = round(float(crow[22]), 1) if crow[22] is not None else None
+                        pa = int(crow["plate_appearances"] or 0)
+                        ab = int(crow["at_bats"] or 0)
+                        hits = int(crow["hits"] or 0)
+                        singles = int(crow["singles"] or 0)
+                        doubles = int(crow["doubles"] or 0)
+                        triples = int(crow["triples"] or 0)
+                        hrs = int(crow["home_runs"] or 0)
+                        runs = int(crow["runs"] or 0)
+                        rbi = int(crow["rbis"] or 0)
+                        total_bases = int(crow["total_bases"] or 0)
+                        walks = int(crow["walks"] or 0)
+                        so = int(crow["strikeouts"] or 0)
+                        avg = round(float(crow["avg"]), 3) if crow["avg"] is not None else None
+                        slg = round(float(crow["slg"]), 3) if crow["slg"] is not None else None
+                        obp = round(float(crow["obp"]), 3) if crow["obp"] is not None else None
+                        k_pct = round(float(crow["k_pct"]), 2) if crow["k_pct"] is not None else None
+                        bb_pct = round(float(crow["bb_pct"]), 2) if crow["bb_pct"] is not None else None
+                        barrel_pct = round(float(crow["barrel_pct"]), 3) if crow["barrel_pct"] is not None else None
+                        pull_pct = round(float(crow["pull_pct"]), 3) if crow["pull_pct"] is not None else None
+                        iso = round(float(crow["iso"]), 3) if crow["iso"] is not None else None
+                        avg_la = round(float(crow["avg_launch_angle"]), 1) if crow["avg_launch_angle"] is not None else None
+                        avg_ev = round(float(crow["avg_ev"]), 1) if crow["avg_ev"] is not None else None
+                        max_ev = round(float(crow["max_ev"]), 1) if crow["max_ev"] is not None else None
                     # only treat calc DB as used when we actually found non-zero calculated batting
                     # (fall back to raw aggregation for batting when calc PAs are zero)
                     try:
-                        if crow is not None and int(crow[0] or 0) > 0:
+                        if crow is not None and int(crow["plate_appearances"] or 0) > 0:
                             used_calc = True
                     except Exception:
                         used_calc = False
@@ -1391,19 +1417,23 @@ class DataManager:
                             p_throws = r[0]
                     except Exception:
                         log.exception("_build_pitcher_row")
-            # Resolve full name from cache, then DB
+            # Resolve full name — always prefer raw DB (has full names)
+            # over cache (may have initial-format from schedule data)
             if pid:
-                cached = _PITCHER_CACHE.get(pid)
-                if cached and cached.get('name'):
-                    pname = cached['name']
+                db_name = None
+                try:
+                    cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
+                    r = cur.fetchone()
+                    if r and r[0]:
+                        db_name = r[0]
+                except Exception:
+                    pass
+                if db_name:
+                    pname = db_name
                 else:
-                    try:
-                        cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            pname = r[0]
-                    except Exception:
-                        pass
+                    cached = _PITCHER_CACHE.get(pid)
+                    if cached and cached.get('name'):
+                        pname = cached['name']
             # Update cache with resolved values
             _cache_pitcher(pid, pname, p_throws)
 
@@ -1433,31 +1463,31 @@ class DataManager:
                         WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
                     """, (eff_season, pid, eff_matchup, eff_window))
                     crow = cur_calc.fetchone()
-                    if crow and int(crow[0] or 0) > 0:
-                        outs = int(crow[1] or 0)
-                        k = int(crow[3] or 0)
-                        bb = int(crow[4] or 0)
-                        hits = int(crow[5] or 0)
-                        singles = int(crow[6] or 0)
-                        doubles = int(crow[7] or 0)
-                        triples = int(crow[8] or 0)
-                        hrs = int(crow[9] or 0)
-                        k_pct = float(crow[11]) if crow[11] is not None else None
-                        bb_pct = float(crow[12]) if crow[12] is not None else None
-                        era = float(crow[13]) if crow[13] is not None else None
-                        whiff_pct = float(crow[14]) if crow[14] is not None else None
-                        slg_ag = float(crow[15]) if crow[15] is not None else None
-                        hard_p = float(crow[16]) if crow[16] is not None else None
-                        xoba_ag = float(crow[17]) if crow[17] is not None else None
-                        babip_ag = float(crow[18]) if crow[18] is not None else None
-                        whip_v = float(crow[19]) if crow[19] is not None else None
-                        barrel_p = float(crow[20]) if crow[20] is not None else None
-                        ld_p = float(crow[21]) if crow[21] is not None else None
-                        soft_p = float(crow[22]) if crow[22] is not None else None
-                        contact_p = float(crow[23]) if crow[23] is not None else None
-                        zone_p = float(crow[24]) if crow[24] is not None else None
-                        avg_velo_v = float(crow[25]) if crow[25] is not None else None
-                        top_velo_v = float(crow[26]) if crow[26] is not None else None
+                    if crow and int(crow["plate_appearances"] or 0) > 0:
+                        outs = int(crow["outs_recorded"] or 0)
+                        k = int(crow["strikeouts"] or 0)
+                        bb = int(crow["walks"] or 0)
+                        hits = int(crow["hits_allowed"] or 0)
+                        singles = int(crow["singles_allowed"] or 0)
+                        doubles = int(crow["doubles_allowed"] or 0)
+                        triples = int(crow["triples_allowed"] or 0)
+                        hrs = int(crow["home_runs_allowed"] or 0)
+                        k_pct = float(crow["k_pct"]) if crow["k_pct"] is not None else None
+                        bb_pct = float(crow["bb_pct"]) if crow["bb_pct"] is not None else None
+                        era = float(crow["era"]) if crow["era"] is not None else None
+                        whiff_pct = float(crow["whiff_pct"]) if crow["whiff_pct"] is not None else None
+                        slg_ag = float(crow["slg_against"]) if crow["slg_against"] is not None else None
+                        hard_p = float(crow["hard_pct"]) if crow["hard_pct"] is not None else None
+                        xoba_ag = float(crow["xoba_against"]) if crow["xoba_against"] is not None else None
+                        babip_ag = float(crow["babip_against"]) if crow["babip_against"] is not None else None
+                        whip_v = float(crow["whip"]) if crow["whip"] is not None else None
+                        barrel_p = float(crow["barrel_pct"]) if crow["barrel_pct"] is not None else None
+                        ld_p = float(crow["ld_pct"]) if crow["ld_pct"] is not None else None
+                        soft_p = float(crow["soft_pct"]) if crow["soft_pct"] is not None else None
+                        contact_p = float(crow["contact_pct"]) if crow["contact_pct"] is not None else None
+                        zone_p = float(crow["zone_pct"]) if crow["zone_pct"] is not None else None
+                        avg_velo_v = float(crow["avg_velo"]) if crow["avg_velo"] is not None else None
+                        top_velo_v = float(crow["top_velo"]) if crow["top_velo"] is not None else None
                         fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
                         return [display_name, _fmt_ip(outs), str(outs), str(k),
                                 fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
@@ -1733,10 +1763,10 @@ class DataManager:
                     """, (eff_season, pid, eff_matchup, eff_window))
                     crow = cur_calc.fetchone()
                     if crow:
-                        att = int(crow[0] or 0)
-                        pk = int(crow[1] or 0)
-                        sb = int(crow[2] or 0)
-                        sb_avg = float(crow[3]) if crow[3] is not None else None
+                        att = int(crow["sb_attempts_against"] or 0)
+                        pk = int(crow["pickoffs"] or 0)
+                        sb = int(crow["sb_allowed"] or 0)
+                        sb_avg = float(crow["sb_allowed_avg"]) if crow["sb_allowed_avg"] is not None else None
                         return [display_name, str(att), str(pk), str(sb), fmt_pct(sb_avg)]
                 except Exception:
                     log.exception("_build_pitcher_br_row")
@@ -1761,10 +1791,10 @@ class DataManager:
                     """, (eff_season, pid, eff_matchup, eff_window))
                     crow = cur_calc.fetchone()
                     if crow:
-                        att = int(crow[0] or 0)
-                        cs = int(crow[1] or 0)
-                        sb = int(crow[2] or 0)
-                        sb_avg = float(crow[3]) if crow[3] is not None else None
+                        att = int(crow["sb_attempts_against"] or 0)
+                        cs = int(crow["caught_stealing"] or 0)
+                        sb = int(crow["sb_allowed"] or 0)
+                        sb_avg = float(crow["sb_allowed_avg"]) if crow["sb_allowed_avg"] is not None else None
                         return [pname or '', str(att), str(cs), str(sb), fmt_pct(sb_avg)]
                 except Exception:
                     log.exception("_build_catcher_br_row")
@@ -1793,15 +1823,15 @@ class DataManager:
                     """, (eff_season, pid, eff_matchup, eff_window))
                     crow = cur_calc.fetchone()
                     if crow:
-                        att = int(crow[0] or 0)
-                        sb = int(crow[1] or 0)
-                        s2b = int(crow[4] or 0)
-                        s3b = int(crow[5] or 0)
-                        obp = float(crow[6]) if crow[6] is not None else None
-                        sprint = crow[7]
-                        bolts = int(crow[8] or 0)
-                        comp_runs = int(crow[9] or 0)
-                        bolt_pct = float(crow[10]) if crow[10] is not None else None
+                        att = int(crow["steal_attempts"] or 0)
+                        sb = int(crow["stolen_bases"] or 0)
+                        s2b = int(crow["stole_2b"] or 0)
+                        s3b = int(crow["stole_3b"] or 0)
+                        obp = float(crow["obp"]) if crow["obp"] is not None else None
+                        sprint = crow["sprint_speed"]
+                        bolts = int(crow["bolts"] or 0)
+                        comp_runs = int(crow["competitive_runs"] or 0)
+                        bolt_pct = float(crow["bolt_pct"]) if crow["bolt_pct"] is not None else None
                         sprint_str = f"{sprint:.1f}" if sprint is not None else ""
                         return [pos, display_name, fmt3(obp), str(att), str(sb),
                                 str(s2b), str(s3b), sprint_str, str(bolts),
@@ -1820,8 +1850,8 @@ class DataManager:
                         WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
                     """, (eff_season, pid, eff_matchup, eff_window))
                     brow = cur_calc.fetchone()
-                    if brow and brow[0] is not None:
-                        obp_str = fmt3(float(brow[0]))
+                    if brow and brow["obp"] is not None:
+                        obp_str = fmt3(float(brow["obp"]))
                 except Exception:
                     log.exception("_build_runner_br_row")
             return [pos, display_name, obp_str, "0", "0", "0", "0", "", "0", "0", ""]

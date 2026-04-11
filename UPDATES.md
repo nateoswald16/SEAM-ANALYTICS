@@ -71,6 +71,43 @@ All notable changes to Seam Analytics are documented here.
 - If the database is already up to date, the notification reports "Database is already up to date"
 - Notification is best-effort — failures are silently ignored to avoid disrupting the update process
 
+### Database Upgrade Safety
+
+**Schema Version Tracking**
+- Added a `schema_version` table to both `mlb_raw.db` and `mlb_calculated.db` to track the database schema version
+- `build_raw_db.py` stamps the raw schema version after all column migrations complete
+- `build_calculated_db.py` checks the stored version on startup — if stale, all calculated tables are cleared and rebuilt from scratch
+- Version constants (`RAW_DB_SCHEMA_VERSION`, `CALC_DB_SCHEMA_VERSION`) defined in `_app_paths.py` as the single source of truth
+
+**Name-Based Column Access**
+- Converted all calculated DB reads in `seam_app.py` from fragile index-based access (`crow[0]`, `crow[1]`, …) to name-based access (`crow["column_name"]`)
+- Applies to batting stats (23 columns), pitching stats (27 columns), pitcher/catcher/runner baserunning stats, and leaderboard name lookups
+- `calc_connect()` now sets `conn.row_factory = sqlite3.Row` so all queries return dict-like rows
+- Adding or reordering columns in the calculated DB no longer breaks the app
+
+**Stale Database Detection**
+- `seam_app.py` validates the calc DB schema version on first connection each session
+- If the installed DB is from an older app version, stale calculated data is cleared automatically so the app falls back to raw aggregation instead of crashing
+- Prevents column-shift errors when users upgrade without replacing their databases
+
+**Version-Aware Installer**
+- `.schema_version` marker files are now written alongside each database after builds
+- Installer's `ShouldInstallDB()` reads the marker file and forces DB replacement when the schema version doesn't match the bundled version
+- Legacy installs with no marker file are also detected and replaced
+- Eliminates the need for users to manually check "Replace local databases" after an upgrade with schema changes
+
+### Stolen Base & Caught Stealing Fixes
+
+**Stolen Base Home Fix**
+- Fixed stolen bases of home plate not being recorded in the database
+- Root cause: `_parse_base()` returns `'Home'` as the target base, but the MLB API sets `movement.end` to `'score'` for home steals — these never matched
+- Added an exception so `target_base == 'Home'` matches `end_base == 'score'`
+
+**Caught Stealing Edge Cases**
+- Fixed caught stealing events being skipped when the MLB API reports `isOut=False`
+- MLB marks some CS plays as `isOut=False` when the runner is initially caught but advances on the same play (e.g. error, subsequent hit in the same at-bat)
+- These are still counted as caught stealing in official stats — removed the `isOut` requirement for CS events
+
 ---
 
 ## v1.0.5-beta — 2026-04-09
