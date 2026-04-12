@@ -28,6 +28,7 @@ import csv
 import logging
 import requests
 import requests.adapters
+from html import escape as _h
 from pathlib import Path
 import datetime as dt
 import threading
@@ -133,10 +134,11 @@ def _fade_switch(stack, new_index, duration=150):
             fade_in.setStartValue(0.0)
             fade_in.setEndValue(1.0)
             fade_in.setEasingCurve(QEasingCurve.Type.OutQuad)
-            fade_in.finished.connect(lambda: (
-                (new_w.setGraphicsEffect(None), _cleanup_anim(stack))
-                if getattr(stack, '_fade_tag', None) is tag else None
-            ))
+            def _on_fade_in_done():
+                if getattr(stack, '_fade_tag', None) is tag:
+                    new_w.setGraphicsEffect(None)
+                    _cleanup_anim(stack)
+            fade_in.finished.connect(_on_fade_in_done)
             stack._fade_anim = fade_in
             fade_in.start()
         else:
@@ -157,41 +159,45 @@ _http.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
 _http.mount("http://", requests.adapters.HTTPAdapter(max_retries=_retry))
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Design tokens
+# Design tokens  (shared palette — single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════════
-C = {
-    "bg0":  "#0a0a0a",
-    "bg1":  "#111111",
-    "bg2":  "#1a1a1a",
-    "bg3":  "#242424",
-    "bdr":  "#2a2a2a",
-    "bdrl": "#333333",
-    "t1":   "#f0f0ee",
-    "t2":   "#888885",
-    "t3":   "#555550",
-    "ora":  "#f07020",
-    "red":  "#e85d3a",
-    "grn":  "#4ade80",
-    "amb":  "#f59e0b",
-}
+from _app_theme import C
 ROW_H = 32
 PIT_SECTION_H = 42 + 40 + ROW_H + 2  # section header + table header + 1 row + border
 
 # ── Reusable format helpers (avoid lambda re-creation per cell) ──────────────
-_fmt3   = lambda v: f"{v:.3f}" if v is not None else ""
-_fmt2   = lambda v: f"{v:.2f}" if v is not None else ""
-_fmt1   = lambda v: f"{v:.1f}" if v is not None else ""
-_fmt_pct = lambda v: f"{v * 100:.1f}%" if v is not None else ""
-_fmt_deg = lambda v: f"{v:.1f}°" if v is not None else ""
-_fmt_era = lambda v: f"{v:.2f}" if v is not None else ""
+_fmt3   = lambda v: f"{v:.3f}" if v is not None else ""   # AVG / OBP / SLG  (.321)
+_fmt2   = lambda v: f"{v:.2f}" if v is not None else ""   # ERA / FIP          (3.42)
+_fmt1   = lambda v: f"{v:.1f}" if v is not None else ""   # EV / distance      (98.3)
+_fmt_pct = lambda v: f"{v * 100:.1f}%" if v is not None else ""  # rates 0-1 → %  (24.5%)
+_fmt_deg = lambda v: f"{v:.1f}°" if v is not None else ""  # launch angle       (12.4°)
+_fmt_era = lambda v: f"{v:.2f}" if v is not None else ""   # ERA (alias of _fmt2)
 
 # ── Pre-compiled regex for handedness suffix on player names ─────────────────
 import re as _re
+from collections import OrderedDict as _OrderedDict
 _HAND_RE = _re.compile(r'^(.*\S)\s+([RLBS])$')
 
+
+class _BoundedCache(_OrderedDict):
+    """OrderedDict with a max size — evicts oldest entries when full."""
+    __slots__ = ('_maxsize',)
+
+    def __init__(self, maxsize=512):
+        super().__init__()
+        self._maxsize = maxsize
+
+    def __setitem__(self, key, value):
+        if key in self:
+            self.move_to_end(key)
+        elif len(self) >= self._maxsize:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+
 # ── Pitcher info cache (pitcher_id → {name, throws}) — avoids repeated DB lookups
-_PITCHER_CACHE: dict[int, dict] = {}   # {pid: {'name': str, 'throws': str}}
-_PITCHER_NAME_CACHE: dict[str, int] = {}  # {pitcher_name: pid}
+_PITCHER_CACHE: _BoundedCache = _BoundedCache(512)   # {pid: {'name': str, 'throws': str}}
+_PITCHER_NAME_CACHE: _BoundedCache = _BoundedCache(512)  # {pitcher_name: pid}
 
 def _cache_pitcher(pid, pname=None, throws=None):
     """Add or update pitcher info in the module-level cache."""
@@ -242,7 +248,7 @@ _CB_VIEW_STYLE = f"""
 # ═══════════════════════════════════════════════════════════════════════════════
 _LOGO_DIR = _app_paths.LOGO_DIR
 _LOGO_MAP: dict[str, str] = {}  # abbr → local svg path
-_LOGO_PIXMAPS: dict[tuple[str, int], QPixmap] = {}  # (abbr, size) → QPixmap
+_LOGO_PIXMAPS: _BoundedCache = _BoundedCache(128)  # (abbr, size) → QPixmap
 
 def _init_logos():
     """Read CSV, download any missing SVGs to assets/logos/."""
@@ -359,9 +365,9 @@ class DataManager:
 
     def close(self):
         """Close all tracked connections (main + thread-local)."""
-        for c in self._thread_conns:
+        for conn in self._thread_conns:
             try:
-                c.close()
+                conn.close()
             except sqlite3.ProgrammingError:
                 pass  # connection created in another thread — expected at shutdown
             except Exception:
@@ -419,7 +425,8 @@ class DataManager:
         cached = self._season_cache.get(game_id)
         if cached is not None:
             return cached
-        for tbl in ("plate_appearances", "games"):
+        _SEASON_TABLES = ("plate_appearances", "games")
+        for tbl in _SEASON_TABLES:
             try:
                 cur.execute(f"SELECT season FROM {tbl} WHERE game_id = ? LIMIT 1", (game_id,))
                 r = cur.fetchone()
@@ -451,8 +458,8 @@ class DataManager:
                 with open(cache_file, 'r') as f:
                     data = json.load(f)
                 for side, team in [('away', away_team), ('home', home_team)]:
-                    for p in data.get('players', {}).get(side, []):
-                        pid = p.get('player_id')
+                    for player in data.get('players', {}).get(side, []):
+                        pid = player.get('player_id')
                         if pid:
                             player_teams[pid] = team
             except Exception:
@@ -702,6 +709,99 @@ class DataManager:
             result.append((name, team, cnt))
         return result
 
+    def get_hr_allowed_table(self, games):
+        """Build HR-allowed table using data since the start of the previous season.
+
+        Returns (cols, data, hi_cols) or None if no data available.
+        """
+        import datetime as _dt
+        # Build pitcher → (name, team, opponent) from today's games
+        pitcher_info = {}
+        for g in games:
+            away, home = g.get('away', ''), g.get('home', '')
+            away_pid, home_pid = g.get('away_p_id'), g.get('home_p_id')
+            away_name, home_name = g.get('away_p', ''), g.get('home_p', '')
+            if away_pid:
+                pitcher_info[away_pid] = (away_name, away, home)
+            if home_pid:
+                pitcher_info[home_pid] = (home_name, home, away)
+        if not pitcher_info:
+            return None
+
+        conn_calc = self.calc_connect()
+        conn_raw = self.connect()
+        if not conn_calc or not conn_raw:
+            return None
+
+        pids = list(pitcher_info.keys())
+        ph = ','.join('?' * len(pids))
+
+        # Window: since start of previous season (season >= current_year - 1)
+        prev_season = _dt.date.today().year - 1
+
+        # BF, HR, Hits from raw DB
+        raw_rows = conn_raw.execute(
+            f"SELECT pitcher_id, "
+            f"  COUNT(*) AS bf, "
+            f"  SUM(COALESCE(is_home_run,0)) AS hr, "
+            f"  SUM(COALESCE(is_hit,0)) AS h "
+            f"FROM plate_appearances "
+            f"WHERE season >= ? "
+            f"  AND pitcher_id IN ({ph}) "
+            f"GROUP BY pitcher_id",
+            [prev_season] + pids
+        ).fetchall()
+        raw_map = {r[0]: (r[1] or 0, r[2] or 0, r[3] or 0) for r in raw_rows}
+
+        # Pitches from calc DB (sum same seasons)
+        pitch_rows = conn_calc.execute(
+            f"SELECT player_id, player_name, SUM(pitches_thrown) AS pitches "
+            f"FROM calculated_pitching_stats "
+            f"WHERE season >= ? AND matchup = 'all' AND window = 'season' "
+            f"  AND player_id IN ({ph}) "
+            f"GROUP BY player_id",
+            [prev_season] + pids
+        ).fetchall()
+        pitch_map = {r["player_id"]: (r["player_name"], r["pitches"] or 0) for r in pitch_rows}
+
+        # Pull-air % from raw DB (pulled BBE with launch_angle >= 25°)
+        pull_air_rows = conn_raw.execute(
+            f"SELECT pitcher_id, "
+            f"  SUM(CASE WHEN pull = 1 AND launch_angle >= 25 THEN 1 ELSE 0 END), "
+            f"  SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) "
+            f"FROM plate_appearances "
+            f"WHERE season >= ? AND pitcher_id IN ({ph}) "
+            f"GROUP BY pitcher_id",
+            [prev_season] + pids
+        ).fetchall()
+        pull_air_map = {}
+        for row in pull_air_rows:
+            pid, pa_cnt, bbe = row[0], row[1] or 0, row[2] or 0
+            if bbe > 0:
+                pull_air_map[pid] = round(pa_cnt / bbe * 100, 1)
+
+        cols = ["PITCHER", "TEAM", "OPP", "H", "HR", "BF",
+                "HR:BF%", "Pull Air%", "Pitches", "HR:P%"]
+        hi = {6, 7, 9}
+        data = []
+        for pid in pids:
+            info = pitcher_info.get(pid)
+            if not info or pid not in raw_map:
+                continue
+            name, team, opp = info
+            bf, hr, hits = raw_map[pid]
+            db_name, pitches = pitch_map.get(pid, (name, 0))
+
+            hr_bf = f"{hr / bf * 100:.1f}%" if bf > 0 else "--"
+            hr_p = f"{hr / pitches * 100:.2f}%" if pitches > 0 else "--"
+            pa_pct = f"{pull_air_map[pid]:.1f}%" if pid in pull_air_map else "--"
+
+            data.append([db_name or name, team, opp, str(hits), str(hr), str(bf),
+                         hr_bf, pa_pct, str(pitches), hr_p])
+
+        data.sort(key=lambda r: int(r[4]) if r[4] != '--' else 0, reverse=True)
+        return cols, data, hi
+
     def get_most_recent_game_date(self):
         conn = self.connect()
         if not conn:
@@ -897,35 +997,57 @@ class DataManager:
             return []
         cur = conn.cursor()
         try:
-            cur.execute("SELECT DISTINCT game_id, home_team, away_team FROM plate_appearances WHERE game_date = ? ORDER BY game_id", (date_str,))
-            rows = cur.fetchall()
+            # Single query: scores + starting pitchers per game (avoids N+1)
+            cur.execute("""
+                SELECT
+                    game_id, home_team, away_team,
+                    SUM(CASE WHEN batter_is_home=1 THEN COALESCE(runs,0) ELSE 0 END) AS home_score,
+                    SUM(CASE WHEN batter_is_home=0 THEN COALESCE(runs,0) ELSE 0 END) AS away_score
+                FROM plate_appearances
+                WHERE game_date = ?
+                GROUP BY game_id, home_team, away_team
+                ORDER BY game_id
+            """, (date_str,))
+            game_rows = cur.fetchall()
+
+            # Batch fetch starting pitchers for all games in one query
+            game_ids = [r[0] for r in game_rows]
+            sp_map = {}  # game_id → {home_p, away_p, ...}
+            if game_ids:
+                placeholders = ','.join('?' for _ in game_ids)
+                cur.execute(f"""
+                    SELECT game_id, batter_is_home, pitcher_name, p_throws
+                    FROM plate_appearances
+                    WHERE game_id IN ({placeholders})
+                      AND at_bat_number = (
+                          SELECT MIN(at_bat_number)
+                          FROM plate_appearances p2
+                          WHERE p2.game_id = plate_appearances.game_id
+                            AND p2.batter_is_home = plate_appearances.batter_is_home
+                      )
+                    GROUP BY game_id, batter_is_home
+                """, game_ids)
+                for gid, is_home, pname, throws in cur.fetchall():
+                    if gid not in sp_map:
+                        sp_map[gid] = {}
+                    if is_home == 0:
+                        sp_map[gid]['home_p'] = pname or 'TBD'
+                        sp_map[gid]['away_p_throws'] = throws or ''
+                    else:
+                        sp_map[gid]['away_p'] = pname or 'TBD'
+                        sp_map[gid]['home_p_throws'] = throws or ''
+
+            today = dt.date.today().isoformat()
             out = []
-            for r in rows:
-                game_id = r[0]
-                home = r[1] or ''
-                away = r[2] or ''
-                # scores
-                cur.execute("SELECT SUM(COALESCE(runs,0)) FROM plate_appearances WHERE game_id=? AND batter_is_home=1", (game_id,))
-                home_score = cur.fetchone()[0] or 0
-                cur.execute("SELECT SUM(COALESCE(runs,0)) FROM plate_appearances WHERE game_id=? AND batter_is_home=0", (game_id,))
-                away_score = cur.fetchone()[0] or 0
-                # starting pitchers (first PA for each side) — home pitcher faces away batters
-                cur.execute("SELECT pitcher_name, p_throws FROM plate_appearances WHERE game_id=? AND batter_is_home=0 ORDER BY at_bat_number LIMIT 1", (game_id,))
-                rowp = cur.fetchone()
-                away_p = rowp[0] if rowp and rowp[0] else 'TBD'
-                home_p_throws = rowp[1] if rowp and rowp[1] else ''
-                cur.execute("SELECT pitcher_name, p_throws FROM plate_appearances WHERE game_id=? AND batter_is_home=1 ORDER BY at_bat_number LIMIT 1", (game_id,))
-                rowp = cur.fetchone()
-                home_p = rowp[0] if rowp and rowp[0] else 'TBD'
-                away_p_throws = rowp[1] if rowp and rowp[1] else ''
-                # time / live flag: conservative defaults
-                today = dt.date.today().isoformat()
+            for r in game_rows:
+                game_id, home, away, home_score, away_score = r[0], r[1] or '', r[2] or '', r[3] or 0, r[4] or 0
+                sp = sp_map.get(game_id, {})
                 live = (date_str == today)
                 time_str = 'LIVE' if live else ('FINAL' if (home_score or away_score) else 'TBD')
                 out.append({
                     'game_id': str(game_id), 'away': away, 'home': home,
-                    'away_p': away_p, 'home_p': home_p,
-                    'away_p_throws': away_p_throws, 'home_p_throws': home_p_throws,
+                    'away_p': sp.get('away_p', 'TBD'), 'home_p': sp.get('home_p', 'TBD'),
+                    'away_p_throws': sp.get('away_p_throws', ''), 'home_p_throws': sp.get('home_p_throws', ''),
                     'time': time_str, 'live': live,
                     'away_score': int(away_score or 0), 'home_score': int(home_score or 0),
                 })
@@ -974,7 +1096,7 @@ class DataManager:
             return {}
 
         def _fetch_event_odds(eid):
-            odds_url = (f"http://sports.core.api.espn.com/v2/sports/baseball/"
+            odds_url = (f"https://sports.core.api.espn.com/v2/sports/baseball/"
                         f"leagues/mlb/events/{eid}/competitions/{eid}/odds")
             try:
                 resp = _http.get(odds_url, timeout=8)
@@ -2708,8 +2830,8 @@ class StatsTable(QTableWidget):
             QHeaderView::section {{
                 background:{C['bg0']}; color:{C['t2']};
                 font-family:'Segoe UI','Inter','Roboto',sans-serif;
-                font-size:10px; text-transform:uppercase; letter-spacing:1px; font-weight:600;
-                border:none; border-bottom:1px solid {C['bdr']}; padding:6px 6px;
+                font-size:9px; text-transform:uppercase; letter-spacing:1px; font-weight:600;
+                border:none; border-bottom:1px solid {C['bdr']}; padding:6px 2px;
             }}
             QHeaderView::section:hover {{
                 color:{C['t1']};
@@ -2733,28 +2855,20 @@ class StatsTable(QTableWidget):
                 break
         _order_col = cols.index("#") if "#" in cols else -1
         _pos_col = cols.index("POS") if "POS" in cols else -1
-        _wide_cols = {"SB Allowed", "Stole 2nd", "Stole 3rd", "Comp Runs"}
-        _medium_cols = {"Contact%", "Barrel%"}
-        _narrow_cols = {"IP", "K", "BB", "H", "1B", "2B", "3B", "HR",
-                        "R", "RBI", "PA", "SB", "CS"}
+        header = self.horizontalHeader()
+        header.setStretchLastSection(False)
         for c in range(self.columnCount()):
             if c == _order_col:
                 self.setColumnWidth(c, 30)
+                header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             elif c == _pos_col:
                 self.setColumnWidth(c, 40)
+                header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             elif c == _name_col:
                 self.setColumnWidth(c, name_col_wide)
-            elif c < len(cols) and cols[c] in _wide_cols:
-                self.setColumnWidth(c, 90)
-            elif c < len(cols) and cols[c] in _medium_cols:
-                self.setColumnWidth(c, 72)
-            elif c < len(cols) and cols[c] in _narrow_cols:
-                self.setColumnWidth(c, 42)
+                header.setSectionResizeMode(c, QHeaderView.ResizeMode.Fixed)
             else:
-                self.setColumnWidth(c, 62)
-
-        # Let last column stretch to fill remaining space
-        self.horizontalHeader().setStretchLastSection(True)
+                header.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
 
         # Expand table to show all rows (no internal vertical scrollbar)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -2788,11 +2902,11 @@ class StatsTable(QTableWidget):
                 if c == _name_col:
                     m = _HAND_RE.match(str(val))
                     if m:
-                        html = (f'<span style="color:{C["t1"]}; font-weight:600;">{m.group(1)}</span>'
-                                f' <span style="color:{C["t3"]}; font-weight:400;">{m.group(2)}</span>')
+                        _lbl_html = (f'<span style="color:{C["t1"]}; font-weight:600;">{_h(m.group(1))}</span>'
+                                f' <span style="color:{C["t3"]}; font-weight:400;">{_h(m.group(2))}</span>')
                     else:
-                        html = f'<span style="color:{C["t1"]}; font-weight:600;">{val}</span>'
-                    lbl = QLabel(html)
+                        _lbl_html = f'<span style="color:{C["t1"]}; font-weight:600;">{_h(str(val))}</span>'
+                    lbl = QLabel(_lbl_html)
                     lbl.setStyleSheet(f"background:transparent; border:none; margin:0; padding-left:4px; font-family:'Segoe UI','Inter',sans-serif; font-size:11px;")
                     lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
                     self.setCellWidget(r, c, lbl)
@@ -2809,9 +2923,7 @@ class StatsTable(QTableWidget):
 
                 item = QTableWidgetItem(display)
                 item.setTextAlignment(
-                    (Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-                    if c <= 1 else
-                    (Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter))
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
                 if _is_empty:
                     item.setForeground(_qc_t3)
                 else:
@@ -2966,6 +3078,8 @@ def lineup_pair(away_team, home_team, cols, hi, away_rows, home_rows, name_col_w
 # Filter bar
 # ═══════════════════════════════════════════════════════════════════════════════
 class FilterBar(QWidget):
+    changed = pyqtSignal(int)  # emits index of activated button
+
     def __init__(self, options, parent=None):
         super().__init__(parent)
         self._btns = []
@@ -2997,9 +3111,11 @@ class FilterBar(QWidget):
         """)
  
     def _activate(self, ab):
-        for b in self._btns:
+        for i, b in enumerate(self._btns):
             b.setChecked(b is ab)
             self._style(b, b is ab)
+            if b is ab:
+                self.changed.emit(i)
  
  
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4671,9 +4787,9 @@ class GameDetailPanel(QWidget):
             self._pit_stack = QStackedWidget()
             self._pit_stack.setStyleSheet(f"background:{C['bg0']};")
             self._pit_stack.addWidget(table_section(
-                f"{away}  PITCHING", "[ ©SA ]", pit_cols, pit_away, pit_hi, 170))
+                f"{away}  PITCHING", "[ ©SA ]", pit_cols, pit_away, pit_hi, 140))
             self._pit_stack.addWidget(table_section(
-                f"{home}  PITCHING", "[ ©SA ]", pit_cols, pit_home, pit_hi, 170))
+                f"{home}  PITCHING", "[ ©SA ]", pit_cols, pit_home, pit_hi, 140))
             self._pit_stack.setCurrentIndex(0)
             self._pit_stack.setFixedHeight(PIT_SECTION_H)
             self._pit_cols = pit_cols
@@ -4708,12 +4824,12 @@ class GameDetailPanel(QWidget):
                     sec = table_section(
                         f"{team_name}  PITCHER SB", "[ ©SA ]",
                         br_data['pit_cols'], br_data[f'pit_{side_key}'],
-                        br_data['pit_hi'], 170)
+                        br_data['pit_hi'], 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{team_name}  CATCHER SB", "[ ©SA ]",
                         br_data['cat_cols'], br_data[f'cat_{side_key}'],
-                        br_data['cat_hi'], 170)
+                        br_data['cat_hi'], 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{opp_name}  BASE RUNNING", "[ ©SA ]",
@@ -4723,11 +4839,11 @@ class GameDetailPanel(QWidget):
                 else:
                     sec = table_section(
                         f"{team_name}  PITCHER SB", "[ ©SA ]",
-                        ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%"], [], set(), 170)
+                        ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%"], [], set(), 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{team_name}  CATCHER SB", "[ ©SA ]",
-                        ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%"], [], set(), 170)
+                        ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%"], [], set(), 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{opp_name}  BASE RUNNING", "[ ©SA ]",
@@ -4772,7 +4888,7 @@ class GameDetailPanel(QWidget):
                     sec = table_section(
                         f"{pitcher_team} SP  vs  {opp_team} Lineup",
                         "[ SINCE 2021 ]", bvp_data['pit_cols'], sd['pit_rows'],
-                        bvp_data['pit_hi'], 170)
+                        bvp_data['pit_hi'], 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{opp_team} BATTERS  vs  {pitcher_name}  ({pitcher_team} SP)",
@@ -4786,12 +4902,12 @@ class GameDetailPanel(QWidget):
                     sec = table_section(
                         f"{pitcher_team} SP  BASERUNNING", "[ SINCE 2021 ]",
                         bvp_data['pit_br_cols'], sd['pit_br_rows'],
-                        bvp_data['pit_br_hi'], 170)
+                        bvp_data['pit_br_hi'], 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{pitcher_team} C  BASERUNNING", "[ SINCE 2021 ]",
                         bvp_data['cat_br_cols'], sd['cat_br_rows'],
-                        bvp_data['cat_br_hi'], 170)
+                        bvp_data['cat_br_hi'], 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{opp_team} LINEUP  BASERUNNING  vs  {pitcher_name}",
@@ -4803,7 +4919,7 @@ class GameDetailPanel(QWidget):
                         f"{pitcher_team} SP  vs  {opp_team} Lineup",
                         "[ SINCE 2021 ]",
                         ["PITCHER", "IP", "K", "K%", "Velo", "Top", "Whiff%", "BB", "BB%",
-                         "H", "1B", "2B", "3B", "HR", "ERA"], [], {3, 6}, 170)
+                         "H", "1B", "2B", "3B", "HR", "ERA"], [], {3, 6}, 140)
                     svl.addWidget(sec); side_tables.append(sec._table)
                     sec = table_section(
                         f"{opp_team} BATTERS  vs  {pitcher_name}  ({pitcher_team} SP)",
@@ -4834,9 +4950,9 @@ class GameDetailPanel(QWidget):
             if bp_data:
                 bp_cols, bp_hi, bp_away, bp_home = bp_data
                 self._bullpen_stack.addWidget(table_section(
-                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, bp_away, bp_hi, 170))
+                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, bp_away, bp_hi, 140))
                 self._bullpen_stack.addWidget(table_section(
-                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, bp_home, bp_hi, 170))
+                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, bp_home, bp_hi, 140))
             else:
                 bp_cols = ["PITCHER", "IP", "K", "K%", "BB", "BB%",
                            "H", "1B", "2B", "3B", "HR", "ERA", "WHIP",
@@ -4844,9 +4960,9 @@ class GameDetailPanel(QWidget):
                            "Barrel%", "Soft%", "LD%", "Hard%", "Contact%", "Velo", "Top", "Whiff%"]
                 bp_hi = {3, 24}
                 self._bullpen_stack.addWidget(table_section(
-                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 170))
+                    f"{away}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 140))
                 self._bullpen_stack.addWidget(table_section(
-                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 170))
+                    f"{home}  BULLPEN", "[ ©SA ]", bp_cols, [], bp_hi, 140))
             self._bullpen_stack.setCurrentIndex(0)
             self._bp_cols = bp_cols if bp_data else bp_cols
             self._bp_hi = bp_hi if bp_data else bp_hi
@@ -5110,9 +5226,9 @@ class GameDetailPanel(QWidget):
                 away_name = getattr(self, '_pit_away_name', 'AWAY')
                 home_name = getattr(self, '_pit_home_name', 'HOME')
                 stack.addWidget(table_section(
-                    f"{away_name}  PITCHING", "[ ©SA ]", new_cols, new_away, new_hi, 170))
+                    f"{away_name}  PITCHING", "[ ©SA ]", new_cols, new_away, new_hi, 140))
                 stack.addWidget(table_section(
-                    f"{home_name}  PITCHING", "[ ©SA ]", new_cols, new_home, new_hi, 170))
+                    f"{home_name}  PITCHING", "[ ©SA ]", new_cols, new_home, new_hi, 140))
             stack.setCurrentIndex(cur_idx)
             stack.setFixedHeight(PIT_SECTION_H)
             stack.updateGeometry()
@@ -5167,9 +5283,9 @@ class GameDetailPanel(QWidget):
                 away_name = getattr(self, '_bp_away_name', 'AWAY')
                 home_name = getattr(self, '_bp_home_name', 'HOME')
                 stack.addWidget(table_section(
-                    f"{away_name}  BULLPEN", "[ ©SA ]", new_cols, new_away, new_hi, 170))
+                    f"{away_name}  BULLPEN", "[ ©SA ]", new_cols, new_away, new_hi, 140))
                 stack.addWidget(table_section(
-                    f"{home_name}  BULLPEN", "[ ©SA ]", new_cols, new_home, new_hi, 170))
+                    f"{home_name}  BULLPEN", "[ ©SA ]", new_cols, new_home, new_hi, 140))
             stack.setCurrentIndex(cur_idx)
             cur_w = stack.currentWidget()
             if cur_w:
@@ -5251,14 +5367,14 @@ class GameDetailPanel(QWidget):
                 sec = table_section(
                     f"{team_name}  PITCHER SB", "[ ©SA ]",
                     br_data['pit_cols'], br_data[f'pit_{side_key}'],
-                    br_data['pit_hi'], 170)
+                    br_data['pit_hi'], 140)
                 svl.addWidget(sec)
                 side_tables.append(sec._table)
 
                 sec = table_section(
                     f"{team_name}  CATCHER SB", "[ ©SA ]",
                     br_data['cat_cols'], br_data[f'cat_{side_key}'],
-                    br_data['cat_hi'], 170)
+                    br_data['cat_hi'], 140)
                 svl.addWidget(sec)
                 side_tables.append(sec._table)
 
@@ -5355,7 +5471,7 @@ class GameDetailPanel(QWidget):
                 sec = table_section(
                     f"{pitcher_team} SP  vs  {opp_team} Lineup",
                     "[ SINCE 2021 ]", bvp_data['pit_cols'], sd.get('pit_rows', []),
-                    bvp_data['pit_hi'], 170)
+                    bvp_data['pit_hi'], 140)
                 svl.addWidget(sec)
                 side_tables.append(sec._table)
 
@@ -5374,14 +5490,14 @@ class GameDetailPanel(QWidget):
                 sec = table_section(
                     f"{pitcher_team} SP  BASERUNNING", "[ SINCE 2021 ]",
                     bvp_data['pit_br_cols'], sd.get('pit_br_rows', []),
-                    bvp_data['pit_br_hi'], 170)
+                    bvp_data['pit_br_hi'], 140)
                 svl.addWidget(sec)
                 side_tables.append(sec._table)
 
                 sec = table_section(
                     f"{pitcher_team} C  BASERUNNING", "[ SINCE 2021 ]",
                     bvp_data['cat_br_cols'], sd.get('cat_br_rows', []),
-                    bvp_data['cat_br_hi'], 170)
+                    bvp_data['cat_br_hi'], 140)
                 svl.addWidget(sec)
                 side_tables.append(sec._table)
 
@@ -5627,10 +5743,11 @@ class LeaderboardCard(QFrame):
         return QSize(260, 34 + self._ROW_H * self._visible_rows + 4)
 
 
-def build_top_stats_page(title, subtitle, leaderboards=None):
+def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None):
     """Build a top-stats page with leaderboard cards.
 
     leaderboards : list of (title, rows, fmt[, unit]) tuples for LeaderboardCard widgets
+    stat_table   : optional (section_title, badge, cols, data, hi_cols) for a table_section
     """
     page = QWidget()
     page.setStyleSheet(f"background:{C['bg0']};")
@@ -5647,6 +5764,17 @@ def build_top_stats_page(title, subtitle, leaderboards=None):
     sub = mk_label(subtitle, color=C["t2"], size=13)
     sub.setContentsMargins(0, 3, 0, 14)
     vl.addWidget(sub)
+
+    # ── optional stats table (e.g. HR Allowed) ──
+    if stat_table:
+        st_title, st_badge, st_cols, st_data, st_hi = stat_table
+        st_label = mk_label(st_title.upper(), color=C["t3"], size=10, mono=True)
+        st_label.setContentsMargins(0, 0, 0, 6)
+        vl.addWidget(st_label)
+
+        sec = table_section(st_title, st_badge, st_cols, st_data, st_hi, name_col_wide=140)
+        vl.addWidget(sec)
+        vl.addSpacing(20)
 
     # ── leaderboard cards (flow grid) ──
     if leaderboards:
@@ -6551,22 +6679,14 @@ class SeamStatsApp(QMainWindow):
         # Clean up the temp installer in the background.
         tmp = getattr(self, '_update_tmp_file', '')
         tmp_dir = getattr(self, '_update_tmp_dir', '')
-        if sys.platform == "win32":
-            cleanup_cmd = (
-                f'cmd /c ping -n 3 127.0.0.1 >nul '
-                f'& del /q "{tmp}" '
-                f'& rmdir /q "{tmp_dir}"'
-            )
-            subprocess.Popen(cleanup_cmd, shell=True,
-                             creationflags=subprocess.CREATE_NO_WINDOW)
-        else:
-            try:
-                if tmp and os.path.isfile(tmp):
-                    os.remove(tmp)
-                if tmp_dir and os.path.isdir(tmp_dir):
-                    os.rmdir(tmp_dir)
-            except Exception:
-                pass
+        try:
+            if tmp and os.path.isfile(tmp):
+                os.remove(tmp)
+            if tmp_dir and os.path.isdir(tmp_dir):
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
         self.set_status("Installing update — app will restart automatically…", timeout=0)
 
@@ -6968,7 +7088,15 @@ class SeamStatsApp(QMainWindow):
                     ]
             except Exception:
                 log.exception("_fetch_lb")
-            self._lb_notifier.ready.emit((hit_lbs, pit_lbs, br_lbs))
+
+            # HR Allowed table for pitching page (rolling 365-day window)
+            hr_tbl = None
+            try:
+                hr_tbl = _DM.get_hr_allowed_table(self._games)
+            except Exception:
+                log.exception("_fetch_lb hr_table")
+
+            self._lb_notifier.ready.emit((hit_lbs, pit_lbs, br_lbs, hr_tbl))
 
         self._fetch_lb = _fetch_lb
         self._lb_fetched = False  # defer until user navigates to a leaderboard page
@@ -7534,23 +7662,33 @@ class SeamStatsApp(QMainWindow):
     def _on_leaderboards_ready(self, result):
         """Replace placeholder leaderboard pages with real data."""
         try:
-            hit_lbs, pit_lbs, br_lbs = result
+            hit_lbs, pit_lbs, br_lbs = result[:3]
+            hr_tbl = result[3] if len(result) > 3 else None
             # If all empty, allow retry on next tab visit
             if not hit_lbs and not pit_lbs and not br_lbs:
                 self._lb_fetched = False
                 return
+
+            # Build HR Allowed stat_table tuple for pitching page
+            pit_stat_table = None
+            if hr_tbl:
+                hr_cols, hr_data, hr_hi = hr_tbl
+                pit_stat_table = ("HR Allowed", "[ ©SA ]",
+                                  hr_cols, hr_data, hr_hi)
+
             replacements = [
                 (self.IDX_HIT,   "Top Stats - Hitting",
-                 "2026 season · all qualified hitters", hit_lbs),
+                 "2026 season · all qualified hitters", hit_lbs, None),
                 (self.IDX_PITCH, "Top Stats - Pitching",
-                 "2026 season · starters & relievers", pit_lbs),
+                 "2026 season · starters & relievers", pit_lbs, pit_stat_table),
                 (self.IDX_BR,    "Top Stats - Base Running",
-                 "2026 season · speed & baserunning", br_lbs),
+                 "2026 season · speed & baserunning", br_lbs, None),
             ]
             cur = self._stack.currentIndex()
-            for idx, title, subtitle, lbs in replacements:
+            for idx, title, subtitle, lbs, st in replacements:
                 new_page = build_top_stats_page(title, subtitle,
-                                                leaderboards=lbs or None)
+                                                leaderboards=lbs or None,
+                                                stat_table=st)
                 old = self._stack.widget(idx)
                 self._stack.removeWidget(old)
                 old.deleteLater()

@@ -4,6 +4,89 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.1.1 — 2026-04-12
+
+### Top Pitching
+
+**HR Allowed Table**
+- Added a new HR Allowed stat table to the Top Pitching page
+- Columns: PITCHER, TEAM, OPP, H, HR, BF, HR:BF%, Pull Air%, Pitches, HR:P%
+- Uses a rolling "since previous season" time window (`season >= current_year − 1`) to match industry-standard leaderboards
+- BF, HR, and H are sourced from the raw plate appearances database for exact date coverage
+- Pitches are sourced from the calculated pitching stats database
+- Pull Air% shows the percentage of batted balls pulled in the air (launch angle ≥ 25°) — a strong HR predictor
+- Sorted by HR descending with color grading on HR:BF%, Pull Air%, and HR:P% columns
+
+### Player Card
+
+**Spray Chart Venue Resolution**
+- Spray charts now resolve the correct stadium overlay using schedule-based venue lookup
+- `resolve_venue_team()` checks today's schedule for the player's upcoming game, falls back to the most recent raw DB game, then the player's own team
+- Fixed a crash caused by NaN venue values being passed to `drawText()` — now safely skipped with a `pd.notna()` guard
+
+### Data Pipeline
+
+**Pitches Thrown Fallback**
+- `build_calculated_db.py` now falls back to counting pitches from the `pitching_appearances` table when Statcast pickle data returns zero pitches for a pitcher
+- Ensures pitch counts are populated even when Statcast data is incomplete
+
+### Tables
+
+**Column Layout & Alignment**
+- All stat table data columns now use stretch layout to evenly fill available width — eliminates dead space on the right
+- All non-name columns are now center-aligned for a cleaner, more consistent look
+- Header font reduced from 10px to 9px to prevent clipping on dense tables (e.g. "Contact%")
+
+### Security Hardening
+
+- Upgraded ESPN odds API from HTTP to HTTPS
+- Player names rendered in table cells are now HTML-escaped to prevent injection via malicious data
+- Removed `shell=True` from subprocess cleanup — uses safe `os.remove()` / `shutil.rmtree()` instead
+- SQL table and column names are now validated against whitelists before interpolation in queries
+- Parameterized the stolen-bases matchup handedness filter (previously string-interpolated)
+- Replaced `pickle.load()` cache files with JSON for player IDs and processed dates (auto-migrates old pickle files)
+- `weatherapi_key.txt` confirmed in `.gitignore`
+
+### Performance
+
+**Database Indexes**
+- Added 9 new indexes to the raw database for common query patterns
+- Composite indexes on `(game_id, batter_is_home)`, `(game_date, pitcher_id)`, `(game_date, batter_id)`, `(season, pitcher_id)`, `(season, batter_id)` and more
+
+**Batch Game Queries**
+- Sidebar game loading reduced from 4N+1 queries to 2 total queries (scores via GROUP BY, starting pitchers via batch IN clause)
+
+**Bounded Caches**
+- Pitcher info, name lookup, and logo pixmap caches now use LRU eviction (max 512/512/128 entries) to prevent unbounded memory growth
+
+**DataFrame Optimization**
+- Removed 4 unnecessary `.copy()` calls in the Statcast data pipeline, reducing memory allocations during database builds
+
+### Code Quality
+
+**Shared Design Tokens**
+- Extracted the color palette (`C` dict) into a single `_app_theme.py` module — `seam_app.py`, `player_card.py`, and `park_factors.py` now import from one source of truth instead of each defining their own copy
+
+**Accent-Insensitive Player Search**
+- Typing "Jose Ramirez" now matches "José Ramírez" — search strips diacritical marks via Unicode normalization before comparing
+- Display names retain their proper accented characters
+
+**Error Handling Standardization**
+- Replaced 17 bare `except:` blocks in `mlb_data_engine.py` with typed catches (`except Exception:`, `except (ValueError, TypeError):`, `except (ValueError, IndexError):`)
+- Added logging to previously silent cache save failures
+
+**HTTP Timeout Constants**
+- Defined `_TIMEOUT_DEFAULT`, `_TIMEOUT_SHORT`, `_TIMEOUT_LONG` constants in `mlb_data_engine.py` — all 9 HTTP calls now reference named constants instead of magic numbers
+
+**Readability Improvements**
+- Replaced nested lambda in `_fade_switch()` with a named `_on_fade_in_done()` function
+- Added inline comments to format helper lambdas (`_fmt3`, `_fmt2`, `_fmt_pct`, etc.) documenting their intended stat types
+- Renamed single-letter loop variables in complex contexts (`c` → `conn`, `p` → `player`, `b` → `batter_id`, etc.)
+- Flattened deeply nested `_fetch_player_handedness()` with early returns
+- Deduplicated handedness fetch logic — boxscore parser now reuses `_fetch_player_handedness()` instead of inlining its own copy
+
+---
+
 ## v1.1.0 — 2026-04-10
 
 > **Action Required:** This update includes a critical fix to the outs and earned runs data pipeline. We recommend all users rebuild their database using the bundled database included with this release, then on first app launch click **Update Data** in the title bar to run the manual data updater. This ensures all historical data is populated with correct values.

@@ -8,6 +8,7 @@ roster CSV.  Selecting a result opens the PlayerProfileDialog.
 import os
 import csv as _csv
 import logging
+import unicodedata
 from datetime import datetime
 
 from PyQt6.QtWidgets import (
@@ -112,15 +113,21 @@ def _placeholder_thumb(w: int = _THUMB_W, h: int = _THUMB_H, r: int = _THUMB_R) 
     return pm
 
 
+def _strip_accents(text: str) -> str:
+    """Remove diacritical marks so 'José' matches a search for 'Jose'."""
+    nfkd = unicodedata.normalize('NFKD', text)
+    return ''.join(ch for ch in nfkd if unicodedata.category(ch) != 'Mn')
+
+
 def _search_roster(keyword: str) -> list[dict]:
-    """Return roster rows whose name or team matches *keyword*."""
+    """Return roster rows whose name or team matches *keyword* (accent-insensitive)."""
     roster = _get_roster_list()
-    kw = keyword.lower().strip()
+    kw = _strip_accents(keyword).lower().strip()
     if not kw:
         return []
     results = []
     for row in roster:
-        name = row.get("name_full", "").lower()
+        name = _strip_accents(row.get("name_full", "")).lower()
         team = row.get("team", "").lower()
         if kw in name or kw in team:
             results.append(row)
@@ -441,6 +448,9 @@ class PlayerSearchWidget(QWidget):
         hand = f"Throws {throws}" if is_pitcher else f"Bats {bats}"
         stand = bats
 
+        # Get schedule games from main window for venue resolution
+        games = getattr(self.window(), '_games', None)
+
         show_player_profile({
             "id": pid,
             "name": name,
@@ -449,6 +459,7 @@ class PlayerSearchWidget(QWidget):
             "hand": hand,
             "stand": stand,
             "is_pitcher": is_pitcher,
+            "games": games,
         }, parent=self.window())
 
 

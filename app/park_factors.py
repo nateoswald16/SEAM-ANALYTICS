@@ -42,14 +42,9 @@ from PyQt6.QtGui import (
 import _app_paths
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Design tokens  (mirrored from seam_app – kept local to avoid circular import)
+# Design tokens  (shared palette — single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════════
-C = {
-    "bg0": "#0a0a0a", "bg1": "#111111", "bg2": "#1a1a1a", "bg3": "#242424",
-    "bdr": "#2a2a2a", "bdrl": "#333333",
-    "t1": "#f0f0ee", "t2": "#888885", "t3": "#555550",
-    "ora": "#f07020", "red": "#e85d3a", "grn": "#4ade80", "amb": "#f59e0b",
-}
+from _app_theme import C
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

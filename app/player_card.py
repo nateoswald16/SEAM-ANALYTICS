@@ -30,13 +30,8 @@ from PyQt6.QtGui import (
 
 log = logging.getLogger("seam.player_card")
 
-# ── Theme (mirrors seam_app.py) ─────────────────────────────────────
-C = {
-    "bg0": "#0a0a0a", "bg1": "#111111", "bg2": "#1a1a1a", "bg3": "#242424",
-    "bdr": "#2a2a2a", "bdrl": "#333333",
-    "t1": "#f0f0ee", "t2": "#888885", "t3": "#555550",
-    "ora": "#f07020", "red": "#e85d3a", "grn": "#4ade80", "amb": "#f59e0b",
-}
+# ── Theme (shared palette — single source of truth) ─────────────────
+from _app_theme import C
 
 # ── HTTP session ────────────────────────────────────────────────────
 _retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504])
@@ -80,6 +75,40 @@ def get_player_roster_info(player_id: int) -> dict | None:
     return _load_roster().get(player_id)
 
 
+def resolve_venue_team(player_team: str, games: list | None = None) -> str:
+    """Determine the stadium team for a player based on their next game.
+
+    1. Check schedule games (today + tomorrow) for the player's team → home team.
+    2. Fallback: query raw DB for the most recent game the team played in → home team.
+    3. Final fallback: player's own team (home stadium).
+    """
+    if not player_team:
+        return 'generic'
+
+    # ── Schedule lookup ──
+    if games:
+        for g in games:
+            away, home = g.get('away', ''), g.get('home', '')
+            if player_team in (away, home):
+                return home  # venue is always the home team's park
+
+    # ── DB fallback: most recent game this team played in ──
+    try:
+        conn = sqlite3.connect(_app_paths.RAW_DB)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT home_team FROM plate_appearances "
+            "WHERE (home_team = ? OR away_team = ?) "
+            "ORDER BY game_date DESC LIMIT 1",
+            (player_team, player_team)
+        ).fetchone()
+        conn.close()
+        if row and row["home_team"]:
+            return row["home_team"]
+    except Exception:
+        pass
+
+    return player_team
 # ═════════════════════════════════════════════════════════════════════
 # Headshot loader
 # ═════════════════════════════════════════════════════════════════════
@@ -423,7 +452,11 @@ def _get_stadium_segments(team_abbrev):
     segs = {}
     for seg, grp in tdf.groupby("segment"):
         segs[seg] = list(zip(grp["x"].values, grp["y"].values))
-    venue = tdf["name"].iloc[0] if "name" in tdf.columns and not tdf.empty else None
+    venue = None
+    if "name" in tdf.columns and not tdf.empty:
+        v = tdf["name"].iloc[0]
+        if pd.notna(v):
+            venue = str(v)
     return segs, venue
 
 
@@ -1618,13 +1651,13 @@ class PlayerProfileDialog(QDialog):
         """)
         spray_layout = QVBoxLayout(spray_panel)
         spray_layout.setContentsMargins(10, 8, 10, 8)
-        team = pi.get('team', 'generic')
+        venue_team = resolve_venue_team(pi.get('team', ''), pi.get('games'))
         if is_pitcher:
-            self._spray = PitcherSprayChartWidget(pi['id'], team=team)
+            self._spray = PitcherSprayChartWidget(pi['id'], team=venue_team)
         else:
             stand = pi.get('stand', 'R')
             self._spray = SprayChartWidget(
-                pi['id'], stand, team=team,
+                pi['id'], stand, team=venue_team,
                 vs_pitcher=pi.get('vs_pitcher'))
         spray_layout.addWidget(self._spray)
         charts_row.addWidget(spray_panel)

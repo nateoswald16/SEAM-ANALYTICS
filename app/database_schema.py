@@ -236,6 +236,17 @@ CREATE INDEX IF NOT EXISTS idx_pa_batter_pitcher ON plate_appearances(batter_id,
 CREATE INDEX IF NOT EXISTS idx_pa_is_vs_lefty ON plate_appearances(is_vs_lefty);
 CREATE INDEX IF NOT EXISTS idx_pa_events ON plate_appearances(events);
 
+-- Composite indexes for common multi-column query patterns
+CREATE INDEX IF NOT EXISTS idx_pa_game_id ON plate_appearances(game_id);
+CREATE INDEX IF NOT EXISTS idx_pa_game_batter_home ON plate_appearances(game_id, batter_is_home);
+CREATE INDEX IF NOT EXISTS idx_pa_game_date_pitcher ON plate_appearances(game_date, pitcher_id);
+CREATE INDEX IF NOT EXISTS idx_pa_game_date_batter ON plate_appearances(game_date, batter_id);
+CREATE INDEX IF NOT EXISTS idx_pa_season_pitcher ON plate_appearances(season, pitcher_id);
+CREATE INDEX IF NOT EXISTS idx_pa_season_batter ON plate_appearances(season, batter_id);
+CREATE INDEX IF NOT EXISTS idx_stolen_game_id ON stolen_bases(game_id);
+CREATE INDEX IF NOT EXISTS idx_games_home_away ON games(home_team, away_team);
+CREATE INDEX IF NOT EXISTS idx_pitch_pitcher_season ON pitching_appearances(pitcher_id, season);
+
 CREATE INDEX IF NOT EXISTS idx_pitch_game_date ON pitching_appearances(game_date);
 CREATE INDEX IF NOT EXISTS idx_pitch_season ON pitching_appearances(season);
 CREATE INDEX IF NOT EXISTS idx_pitch_pitcher_id ON pitching_appearances(pitcher_id);

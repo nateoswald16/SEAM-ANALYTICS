@@ -167,7 +167,7 @@ def _load_statcast_season(season: int, conn_raw: Optional[sqlite3.Connection] = 
     dedup_cols = ['game_pk', 'batter', 'at_bat_number']
     if all(c in merged.columns for c in dedup_cols):
         before = len(merged)
-        merged = merged.drop_duplicates(subset=dedup_cols, keep='first').copy()
+        merged = merged.drop_duplicates(subset=dedup_cols, keep='first')
         dupes = before - len(merged)
         if dupes:
             print(f'  Deduplicated: removed {dupes} duplicate rows')
@@ -231,7 +231,7 @@ def _load_statcast_all_pitches(season: int, conn_raw: Optional[sqlite3.Connectio
     merged = pd.concat(frames, ignore_index=True)
     dedup_cols = ['game_pk', 'at_bat_number', 'pitch_number']
     if all(c in merged.columns for c in dedup_cols):
-        merged = merged.drop_duplicates(subset=dedup_cols, keep='first').copy()
+        merged = merged.drop_duplicates(subset=dedup_cols, keep='first')
 
     _statcast_pitches_cache[season] = merged
     print(f'  Loaded {len(candidates)} Statcast pitch file(s): {len(merged)} regular-season pitches')
@@ -767,7 +767,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
 
     # ── Statcast PA-level overrides (when pkl covers more data) ─────────
     if sc_df is not None:
-        pf = sc_df[sc_df['pitcher'] == player_id].copy()
+        pf = sc_df[sc_df['pitcher'] == player_id]
         if matchup == 'vs_lefty':
             pf = pf[pf['stand'] == 'L']
         elif matchup == 'vs_righty':
@@ -795,7 +795,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
 
     # ── Statcast pitch-level overrides: Whiff%, Contact%, Zone% ─────────
     if sc_pitches is not None:
-        pp = sc_pitches[sc_pitches['pitcher'] == player_id].copy()
+        pp = sc_pitches[sc_pitches['pitcher'] == player_id]
         if matchup == 'vs_lefty':
             pp = pp[pp['stand'] == 'L']
         elif matchup == 'vs_righty':
@@ -843,6 +843,17 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
         if raw_whiff and raw_whiff[0] is not None:
             whiff_pct = round(raw_whiff[0] / raw_swings, 3)
 
+    # ── Raw DB pitches_thrown fallback (when pkl is unavailable) ──────────
+    if pitches_thrown == 0:
+        raw_pitch_count_sql = f"""
+            SELECT COUNT(*)
+            FROM pitching_appearances
+            WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
+        """
+        raw_pc = cur_raw.execute(raw_pitch_count_sql, raw_params).fetchone()
+        if raw_pc and raw_pc[0]:
+            pitches_thrown = raw_pc[0]
+
     cur_calc.execute('''
         INSERT OR REPLACE INTO calculated_pitching_stats(
             season, player_id, player_name, matchup, window,
@@ -888,9 +899,11 @@ def _insert_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Con
 
     # matchup: check pitcher's handedness from pitchers table (authoritative)
     matchup_sql = ''
+    matchup_params = []
     if matchup in ('vs_lefty', 'vs_righty'):
         want = 'L' if matchup == 'vs_lefty' else 'R'
-        matchup_sql = f" AND (SELECT p_throws FROM pitchers WHERE pitcher_id = sb.pitcher_id LIMIT 1) = '{want}'"
+        matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = sb.pitcher_id LIMIT 1) = ?"
+        matchup_params = [want]
 
     sql = f"""SELECT
         SUM(CASE WHEN sb.event_type IN ('stolen_base','caught_stealing') THEN 1 ELSE 0 END) as attempts,
@@ -901,7 +914,7 @@ def _insert_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Con
         SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 AND sb.base='3B' THEN 1 ELSE 0 END) as stole_3b
     FROM stolen_bases sb WHERE sb.season = ? AND sb.runner_id = ? {matchup_sql} {date_sql}"""
 
-    params = [season, player_id] + date_params
+    params = [season, player_id] + matchup_params + date_params
     cur_raw.execute(sql, params)
     row = cur_raw.fetchone()
     if not row:
@@ -1113,28 +1126,28 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
     _calc_done = 0
 
     # Batters
-    for b in batter_ids:
+    for batter_id in batter_ids:
         if progress_cb:
             progress_cb('calc_player', _calc_done, _calc_total, 'batters')
-        cur_raw.execute('SELECT batter_name FROM plate_appearances WHERE season = ? AND batter_id = ? AND batter_name IS NOT NULL ORDER BY game_date DESC LIMIT 1', (season, b))
+        cur_raw.execute('SELECT batter_name FROM plate_appearances WHERE season = ? AND batter_id = ? AND batter_name IS NOT NULL ORDER BY game_date DESC LIMIT 1', (season, batter_id))
         pr = cur_raw.fetchone()
         name = pr[0] if pr else ''
         for matchup in ('all', 'vs_lefty', 'vs_righty'):
             for window in WINDOWS.keys():
-                _insert_batting_agg(conn_raw, conn_calc, season, b, name, matchup, window, sc_df=sc_df)
+                _insert_batting_agg(conn_raw, conn_calc, season, batter_id, name, matchup, window, sc_df=sc_df)
         _calc_done += 1
     conn_calc.commit()
 
     # Pitchers
-    for p in pitcher_ids:
+    for pitcher_id in pitcher_ids:
         if progress_cb:
             progress_cb('calc_player', _calc_done, _calc_total, 'pitchers')
-        cur_raw.execute('SELECT pitcher_name FROM plate_appearances WHERE season = ? AND pitcher_id = ? AND pitcher_name IS NOT NULL ORDER BY game_date DESC LIMIT 1', (season, p))
+        cur_raw.execute('SELECT pitcher_name FROM plate_appearances WHERE season = ? AND pitcher_id = ? AND pitcher_name IS NOT NULL ORDER BY game_date DESC LIMIT 1', (season, pitcher_id))
         pr = cur_raw.fetchone()
         name = pr[0] if pr else ''
         for matchup in ('all', 'vs_lefty', 'vs_righty'):
             for window in WINDOWS.keys():
-                _insert_pitching_agg(conn_raw, conn_calc, season, p, name, matchup, window,
+                _insert_pitching_agg(conn_raw, conn_calc, season, pitcher_id, name, matchup, window,
                                      sc_df=sc_df, sc_pitches=sc_pitches)
         _calc_done += 1
     conn_calc.commit()
@@ -1230,9 +1243,10 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
 
         # Clean stale rows for this season before rebuilding
         cur_calc = conn_calc.cursor()
-        for tbl in ('calculated_batting_stats', 'calculated_pitching_stats',
+        _CALC_TABLES = ('calculated_batting_stats', 'calculated_pitching_stats',
                      'calculated_baserunning_stats', 'calculated_pitcher_baserunning_stats',
-                     'calculated_catcher_baserunning_stats'):
+                     'calculated_catcher_baserunning_stats')
+        for tbl in _CALC_TABLES:
             cur_calc.execute(f'DELETE FROM {tbl} WHERE season = ?', (season,))
         conn_calc.commit()
 

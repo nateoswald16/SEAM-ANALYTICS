@@ -66,6 +66,8 @@ def create_db(db_path: str = DB_PATH):
     # WAL mode allows concurrent readers during writes
     cur.execute('PRAGMA journal_mode=WAL')
     for v in view_names:
+        if v not in _VALID_VIEW_NAMES:
+            continue
         try:
             cur.execute(f"DROP VIEW IF EXISTS {v}")
         except Exception as e:
@@ -134,6 +136,24 @@ def create_db(db_path: str = DB_PATH):
     print('Database created/updated.')
 
 
+_VALID_VIEW_NAMES = frozenset({
+    'vw_batting_summary', 'vw_pitching_summary', 'vw_game_summary',
+})
+
+_VALID_TABLES = frozenset({
+    'games', 'pitchers', 'batters', 'plate_appearances', 'stolen_bases',
+    'pitching_appearances', 'schema_version',
+})
+
+_VALID_PA_COLS = frozenset({
+    'pitcher_name', 'batter_name',
+})
+
+_VALID_PA_IDCOLS = frozenset({
+    'pitcher_id', 'batter_id',
+})
+
+
 def fetch_schedule(start_date: str, end_date: str, only_completed: bool = False) -> List[Dict[str, Any]]:
     """Fetch schedule from the MLB Stats API and return regular-season games.
 
@@ -183,6 +203,8 @@ def fetch_game_feed(game_pk: int) -> Dict[str, Any]:
 
 
 def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
+    if table not in _VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table}")
     cur = conn.execute(f"PRAGMA table_info({table})")
     return [row[1] for row in cur.fetchall()]
 
@@ -190,6 +212,8 @@ def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
 def insert_rows(conn: sqlite3.Connection, table: str, rows: List[Dict[str, Any]], commit: bool = True):
     if not rows:
         return
+    if table not in _VALID_TABLES:
+        raise ValueError(f"Invalid table name: {table}")
     cols = get_table_columns(conn, table)
     col_clause = ','.join(cols)
     placeholders = ','.join('?' for _ in cols)
@@ -758,6 +782,8 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             return None
         col = 'pitcher_name' if role == 'pitcher' else 'batter_name'
         idcol = 'pitcher_id' if role == 'pitcher' else 'batter_id'
+        if col not in _VALID_PA_COLS or idcol not in _VALID_PA_IDCOLS:
+            return f"id_{int(player_id)}"
         cur = conn.execute(f"SELECT {col} FROM plate_appearances WHERE game_id = ? AND {idcol} = ? LIMIT 1", (str(game_id), int(player_id)))
         r = cur.fetchone()
         if r and r[0]:

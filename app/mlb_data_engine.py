@@ -16,6 +16,11 @@ import _app_paths
 
 _log = logging.getLogger("seam.engine")
 
+# ── HTTP timeout defaults (seconds) ─────────────────────────────────
+_TIMEOUT_DEFAULT = 10   # schedule, live feed, boxscore
+_TIMEOUT_SHORT   = 5    # single-player endpoints (people, handedness)
+_TIMEOUT_LONG    = 30   # bulk / slow endpoints (statcast, backfill)
+
 # Shared session with automatic retries on transient failures
 _retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[502, 503, 504, 429])
 _session = requests.Session()
@@ -49,22 +54,36 @@ class MLBDataEngine:
         self._cache_lock = threading.Lock()  # Protects shared caches from concurrent access
     
     def _load_cache(self):
-        """Load player ID cache from disk."""
+        """Load player ID cache from disk (JSON preferred, pickle fallback for migration)."""
+        json_path = self.id_cache_file.replace('.pkl', '.json')
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                return {}
+        # Migrate old pickle cache if present
         if os.path.exists(self.id_cache_file):
             try:
                 with open(self.id_cache_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
+                    data = pickle.load(f)
+                # Save as JSON and remove pickle
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f)
+                os.remove(self.id_cache_file)
+                return data
+            except Exception:
                 return {}
         return {}
     
     def _save_cache(self):
-        """Save player ID cache to disk."""
+        """Save player ID cache to disk as JSON."""
+        json_path = self.id_cache_file.replace('.pkl', '.json')
         try:
-            with open(self.id_cache_file, 'wb') as f:
-                pickle.dump(self.id_cache, f)
-        except:
-            pass
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(self.id_cache, f)
+        except Exception:
+            _log.debug("Failed to save player ID cache")
     
 
     def _load_temp_lineup_cache(self):
@@ -73,7 +92,7 @@ class MLBDataEngine:
             try:
                 with open(self.temp_lineup_cache_file, 'r') as f:
                     return json.load(f)
-            except:
+            except Exception:
                 return {}
         return {}
     
@@ -82,8 +101,8 @@ class MLBDataEngine:
         try:
             with open(self.temp_lineup_cache_file, 'w') as f:
                 json.dump(self.temp_lineup_cache, f, indent=2)
-        except:
-            pass
+        except Exception:
+            _log.debug("Failed to save temp lineup cache")
     
     def _get_db_connection(self):
         """Get a reusable read-only database connection."""
@@ -132,22 +151,35 @@ class MLBDataEngine:
             _log.debug(f"Cleaned up {len(games_to_remove)} temp lineup(s)")
     
     def _load_processed_dates(self):
-        """Load set of dates that have been processed (archived)."""
+        """Load set of dates that have been processed (JSON preferred, pickle fallback)."""
+        json_path = self.processed_dates_file.replace('.pkl', '.json')
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, 'r', encoding='utf-8') as f:
+                    return set(json.load(f))
+            except Exception:
+                return set()
+        # Migrate old pickle cache if present
         if os.path.exists(self.processed_dates_file):
             try:
                 with open(self.processed_dates_file, 'rb') as f:
-                    return pickle.load(f)
-            except:
+                    data = pickle.load(f)
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(list(data), f)
+                os.remove(self.processed_dates_file)
+                return data
+            except Exception:
                 return set()
         return set()
     
     def _save_processed_dates(self):
-        """Save processed dates to disk."""
+        """Save processed dates to disk as JSON."""
+        json_path = self.processed_dates_file.replace('.pkl', '.json')
         try:
-            with open(self.processed_dates_file, 'wb') as f:
-                pickle.dump(self.processed_dates, f)
-        except:
-            pass
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(list(self.processed_dates), f)
+        except Exception:
+            _log.debug("Failed to save processed dates")
     
     def _load_team_abbreviations(self):
         """Load team name to abbreviation and logo mapping from CSV."""
@@ -207,7 +239,7 @@ class MLBDataEngine:
         try:
             url = f"{self.api_base}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,linescore,person"
             _log.debug(f"Fetching schedule for {date_str}...")
-            response = _session.get(url, timeout=10)
+            response = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             response.raise_for_status()
             games_data = response.json()
             
@@ -334,7 +366,7 @@ class MLBDataEngine:
         }
         try:
             url = f"{self.api_base.replace('/v1', '/v1.1')}/game/{game_id}/feed/live"
-            resp = _session.get(url, timeout=10)
+            resp = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             resp.raise_for_status()
             data = resp.json()
             all_plays = data.get('liveData', {}).get('plays', {}).get('allPlays', [])
@@ -463,25 +495,28 @@ class MLBDataEngine:
         
         try:
             url = f"{self.api_base}/people/{player_id}"
-            response = _session.get(url, timeout=5)
-            if response.status_code == 200:
-                people_data = response.json()
-                if 'people' in people_data and len(people_data['people']) > 0:
-                    person_profile = people_data['people'][0]
-                    # Try batSide first (for batters), then pitchHand (for pitchers)
-                    if 'batSide' in person_profile:
-                        hand = person_profile['batSide'].get('code', 'U')
-                        # API uses 'S' for switch hitters, we display as 'B'
-                        result = 'L' if hand == 'L' else 'R' if hand == 'R' else 'B' if hand == 'S' else 'Unknown'
-                    elif 'pitchHand' in person_profile:
-                        hand = person_profile['pitchHand'].get('code', 'U')
-                        result = 'L' if hand == 'L' else 'R' if hand == 'R' else 'Unknown'
-                    else:
-                        result = 'Unknown'
-                    with self._cache_lock:
-                        self._handedness_cache[player_id] = result
-                    return result
-        except:
+            response = _session.get(url, timeout=_TIMEOUT_SHORT)
+            if response.status_code != 200:
+                return 'Unknown'
+            people_data = response.json()
+            people = people_data.get('people', [])
+            if not people:
+                return 'Unknown'
+            person_profile = people[0]
+            # Try batSide first (for batters), then pitchHand (for pitchers)
+            if 'batSide' in person_profile:
+                hand = person_profile['batSide'].get('code', 'U')
+                # API uses 'S' for switch hitters, we display as 'B'
+                result = 'L' if hand == 'L' else 'R' if hand == 'R' else 'B' if hand == 'S' else 'Unknown'
+            elif 'pitchHand' in person_profile:
+                hand = person_profile['pitchHand'].get('code', 'U')
+                result = 'L' if hand == 'L' else 'R' if hand == 'R' else 'Unknown'
+            else:
+                result = 'Unknown'
+            with self._cache_lock:
+                self._handedness_cache[player_id] = result
+            return result
+        except Exception:
             pass
         return 'Unknown'
 
@@ -501,7 +536,7 @@ class MLBDataEngine:
         try:
             url = f"{self.api_base}/people/{player_id}/stats"
             params = {'stats': 'season', 'season': int(season), 'group': group}
-            r = _session.get(url, params=params, timeout=8)
+            r = _session.get(url, params=params, timeout=_TIMEOUT_SHORT)
             r.raise_for_status()
             data = r.json()
             stats_list = data.get('stats', [])
@@ -679,7 +714,7 @@ class MLBDataEngine:
                 # Extract player ID
                 try:
                     player_id = int(player_id_str.replace('ID', '')) if 'ID' in player_id_str else int(player_id_str)
-                except:
+                except (ValueError, TypeError):
                     player_id = None
                 
                 if player_id:
@@ -791,7 +826,7 @@ class MLBDataEngine:
                 # Extract player ID
                 try:
                     player_id = int(player_id_str.replace('ID', '')) if 'ID' in player_id_str else int(player_id_str)
-                except:
+                except (ValueError, TypeError):
                     player_id = None
                 
                 if player_id:
@@ -878,7 +913,7 @@ class MLBDataEngine:
             # Extract player ID (format: "ID123456")
             try:
                 player_id = int(player_id_str.replace('ID', ''))
-            except:
+            except (ValueError, TypeError):
                 player_id = None
             
             # Extract handedness
@@ -886,25 +921,9 @@ class MLBDataEngine:
             person = player_info.get('person', {})
             player_id = person.get('id')
             
-            # Fetch handedness from the people endpoint
+            # Reuse the shared handedness fetcher (with caching)
             if player_id:
-                try:
-                    url = f"{self.api_base}/people/{player_id}"
-                    response = _session.get(url, timeout=5)
-                    if response.status_code == 200:
-                        people_data = response.json()
-                        if 'people' in people_data and len(people_data['people']) > 0:
-                            person_profile = people_data['people'][0]
-                            # Try batSide first (for batters), then pitchHand (for pitchers)
-                            if 'batSide' in person_profile:
-                                hand = person_profile['batSide'].get('code', 'U')
-                                # API uses 'S' for switch hitters, we display as 'B'
-                                handedness = 'L' if hand == 'L' else 'R' if hand == 'R' else 'B' if hand == 'S' else 'Unknown'
-                            elif 'pitchHand' in person_profile:
-                                hand = person_profile['pitchHand'].get('code', 'U')
-                                handedness = 'L' if hand == 'L' else 'R' if hand == 'R' else 'Unknown'
-                except:
-                    pass  # Keep handedness as 'Unknown' if API fails
+                handedness = self._fetch_player_handedness(player_id)
             
             # Cache player ID by name
             if player_id and name not in self.id_cache:
@@ -1036,7 +1055,7 @@ class MLBDataEngine:
             
             # Fetch boxscore for live/completed games, or as fallback for upcoming
             url = f"{self.api_base}/game/{game_id}/boxscore"
-            response = _session.get(url, timeout=10)
+            response = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             response.raise_for_status()
             boxscore = response.json()
             
@@ -1097,13 +1116,13 @@ class MLBDataEngine:
         
         try:
             url = f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live"
-            response = _session.get(url, timeout=5)
+            response = _session.get(url, timeout=_TIMEOUT_SHORT)
             if response.status_code == 200:
                 game_data = response.json()
                 status = game_data.get('gameData', {}).get('status', {}).get('detailedState', '')
                 self._game_status_cache[game_id] = (status, now)
                 return status
-        except:
+        except Exception:
             pass
         return ''
     
@@ -1271,7 +1290,7 @@ class MLBDataEngine:
         """
         try:
             url = f"{self.api_base}/people/{player_id}"
-            response = _session.get(url, timeout=10)
+            response = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             response.raise_for_status()
             data = response.json()
             
@@ -1413,7 +1432,7 @@ class MLBDataEngine:
                     try:
                         url = f"{self.api_base}/people/{pitcher_id}/stats"
                         params = {'stats': 'season', 'season': season, 'group': 'pitching'}
-                        r = _session.get(url, params=params, timeout=5)
+                        r = _session.get(url, params=params, timeout=_TIMEOUT_SHORT)
                         r.raise_for_status()
                         data = r.json()
                         stats_list = data.get('stats', [])
@@ -2066,7 +2085,7 @@ class MLBDataEngine:
             else:
                 try:
                     window_num = int(time_window.split('_')[1])
-                except:
+                except (ValueError, IndexError):
                     window_num = None
                 if window_num is None:
                     filtered = rows
@@ -2093,7 +2112,7 @@ class MLBDataEngine:
                         else:
                             # Fallback to API lookup
                             pitcher_hand_map[pid] = self._lookup_handedness(pid, is_pitcher=True)
-                    except:
+                    except Exception:
                         pitcher_hand_map[pid] = self._lookup_handedness(pid, is_pitcher=True)
 
             # Compute stats
@@ -2170,7 +2189,7 @@ class MLBDataEngine:
             try:
                 mod_time = os.path.getmtime(self.id_cache_file)
                 last_updated = datetime.fromtimestamp(mod_time).strftime('%B %d, %Y at %I:%M %p')
-            except:
+            except Exception:
                 pass
         
         return {

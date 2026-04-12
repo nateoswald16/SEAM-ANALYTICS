@@ -48,6 +48,10 @@ MLB_BENCHMARKS = {
     "LD%":      {"avg": 22.0,  "threshold": 3.0,   "higher_is_better": False},
     "Hard%":    {"avg": 40.0,  "threshold": 4.0,   "higher_is_better": False},
     "Contact%": {"avg": 77.0,  "threshold": 3.0,   "higher_is_better": False},
+    # ── HR-Allowed table (pitching) ──
+    "HR:BF%":     {"avg": 3.0,   "threshold": 0.8,   "higher_is_better": False},
+    "Pull Air%":  {"avg": 17.0,  "threshold": 3.0,   "higher_is_better": False},
+    "HR:P%":      {"avg": 0.80,  "threshold": 0.20,  "higher_is_better": False},
     # ── Baserunning ──
     "OBP":    {"avg": 0.315, "threshold": 0.020, "higher_is_better": True},
     "Sprint": {"avg": 27.0,  "threshold": 1.0,   "higher_is_better": True},
@@ -64,9 +68,9 @@ _PITCHING_BENCHMARKS = {
 
 # Columns that are never graded (info / counting stats)
 _SKIP = {"#", "POS", "PLAYER", "PITCHER", "CATCHER", "PA", "H", "1B", "2B", "3B", "HR", "R",
-         "RBI", "TB", "Pull%", "IP", "K", "BB", "HAND",
+         "RBI", "TB", "Pull%", "IP", "K", "BB", "HAND", "TEAM", "OPP",
          "SB Att", "SB", "SB Allowed", "Stole 2nd", "Stole 3rd", "Bolts",
-         "Comp Runs", "CS", "Pickoffs"}
+         "Comp Runs", "CS", "Pickoffs", "BF", "Pitches"}
 
 
 def _parse_cell(col: str, cell: str) -> float | None:
