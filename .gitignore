@@ -47,6 +47,9 @@ nul
 *.swp
 *.swo
 
+# ── Dev docs (local only) ────────────────────────────────────
+DevUpdate.md
+
 # ── One-time repair / utility scripts ─────────────────────────
 app/backfill_*.py
 app/verify_2025.py
