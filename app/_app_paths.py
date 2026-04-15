@@ -9,12 +9,12 @@ Frozen    – read-only assets come from the PyInstaller bundle;
 import os
 import sys
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # Database schema versions — bump these when tables/columns change.
 # The app checks these on startup and runs migrations or forces a recalc.
 RAW_DB_SCHEMA_VERSION = 2       # v1 = initial, v2 = added outs_recorded/earned_runs/statcast_at_bat_number/base + SB/CS parsing fixes
-CALC_DB_SCHEMA_VERSION = 2      # v1 = initial, v2 = aligned with raw v2 parsing fixes
+CALC_DB_SCHEMA_VERSION = 3      # v1 = initial, v2 = aligned with raw v2 parsing fixes, v3 = added h_per_9 to pitching stats
 
 _frozen = getattr(sys, "frozen", False)
 
@@ -45,6 +45,7 @@ SCHEMA_FILE     = os.path.join(APP_DIR, "database_schema.py")
 MAPPING_FILE    = os.path.join(APP_DIR, "pybaseball_to_schema_mapping.json")
 LOGO_DIR        = os.path.join(ASSETS_DIR, "logos")
 LOGO_PNG        = os.path.join(ASSETS_DIR, "Logo.png")
+PLAYERS_CSV     = os.path.join(ASSETS_DIR, "players.csv")
 
 # ── Writable databases ──────────────────────────────────────────────
 RAW_DB    = os.path.join(DATA_DIR, "mlb_raw.db")

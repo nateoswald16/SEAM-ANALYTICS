@@ -17,21 +17,17 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
 import _app_paths
+from _http_utils import create_http_session
 
 # ── Paths ────────────────────────────────────────────────────────────
-PLAYERS_CSV = os.path.join(_app_paths.ASSETS_DIR, "players.csv")
+PLAYERS_CSV = _app_paths.PLAYERS_CSV
 HEADSHOT_DIR = _app_paths.HEADSHOT_CACHE_DIR
 os.makedirs(HEADSHOT_DIR, exist_ok=True)
 
 # ── HTTP session ─────────────────────────────────────────────────────
-_session = requests.Session()
-_retry = Retry(total=3, backoff_factor=0.3, status_forcelist=[429, 500, 502, 503, 504])
-_session.mount("https://", HTTPAdapter(max_retries=_retry))
+_session = create_http_session(total_retries=3, backoff_factor=0.3,
+                               status_forcelist=[429, 500, 502, 503, 504])
 
 TEAMS_URL = "https://statsapi.mlb.com/api/v1/teams?sportId=1&season={season}"
 ROSTER_URL = "https://statsapi.mlb.com/api/v1/teams/{team_id}/roster?rosterType=40Man&season={season}"

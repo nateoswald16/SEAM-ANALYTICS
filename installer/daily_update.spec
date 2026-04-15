@@ -26,6 +26,7 @@ a = Analysis(
     ],
     hiddenimports=[
         '_app_paths',
+        '_http_utils',
         'build_raw_db',
         'build_calculated_db',
         # pybaseball (lazy imports)

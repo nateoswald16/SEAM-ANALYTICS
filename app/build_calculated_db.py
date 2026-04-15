@@ -302,6 +302,7 @@ def _create_calc_tables(cur):
         bb_pct REAL,
         k_per_9 REAL,
         bb_per_9 REAL,
+        h_per_9 REAL,
         era REAL,
         whiff_pct REAL,
         pitches_thrown INTEGER,
@@ -376,15 +377,14 @@ def _create_calc_tables(cur):
 
 def ensure_calc_schema(conn: sqlite3.Connection) -> bool:
     """Create/migrate calc DB schema. Returns True if schema structure changed."""
-    cur = conn.cursor()
 
     # Create tables if they don't exist yet
-    _create_calc_tables(cur)
+    _create_calc_tables(conn.cursor())
+    conn.commit()
 
     # ── Schema version tracking ──────────────────────────────────────
-    cur.execute("CREATE TABLE IF NOT EXISTS schema_version (key TEXT PRIMARY KEY, value INTEGER)")
-    cur.execute("SELECT value FROM schema_version WHERE key = 'version'")
-    row = cur.fetchone()
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_version (key TEXT PRIMARY KEY, value INTEGER)")
+    row = conn.execute("SELECT value FROM schema_version WHERE key = 'version'").fetchone()
     old_version = row[0] if row else 0
     schema_changed = False
 
@@ -395,15 +395,16 @@ def ensure_calc_schema(conn: sqlite3.Connection) -> bool:
             # build_calculated_db() processes each requested season.
             print(f'  Calc DB schema version {old_version} → {_app_paths.CALC_DB_SCHEMA_VERSION}: recreating table structures...')
             for tbl in _CALC_TABLES:
-                cur.execute(f'DROP TABLE IF EXISTS {tbl}')
+                conn.execute(f'DROP TABLE IF EXISTS {tbl}')
             conn.commit()
-            _create_calc_tables(cur)
+            _create_calc_tables(conn.cursor())
+            conn.commit()
             schema_changed = True
-        cur.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
+        conn.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
                     (_app_paths.CALC_DB_SCHEMA_VERSION,))
 
     # Enable WAL mode for concurrent read/write access
-    cur.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA journal_mode=WAL')
     conn.commit()
     return schema_changed
 
@@ -452,12 +453,15 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         date_sql = ' AND game_date IN ({})'.format(','.join('?' for _ in dates))
         date_params = dates
 
-    # matchup filter: use authoritative pitcher handedness from pitchers table
+    # matchup filter: JOIN with pitchers table for handedness (avoids correlated subquery)
+    matchup_join = ''
     matchup_sql = ''
     if matchup == 'vs_lefty':
-        matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = plate_appearances.pitcher_id LIMIT 1) = 'L'"
+        matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = plate_appearances.pitcher_id'
+        matchup_sql = " AND pit.p_throws = 'L'"
     elif matchup == 'vs_righty':
-        matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = plate_appearances.pitcher_id LIMIT 1) = 'R'"
+        matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = plate_appearances.pitcher_id'
+        matchup_sql = " AND pit.p_throws = 'R'"
 
     sql = f"""
     SELECT
@@ -475,7 +479,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
       SUM(COALESCE(is_strikeout,0)) as so,
       SUM(COALESCE(is_sac_fly,0)) as sf,
       SUM(COALESCE(is_hbp,0)) as hbp
-    FROM plate_appearances
+    FROM plate_appearances{matchup_join}
     WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
     """
 
@@ -501,7 +505,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_angle IS NOT NULL THEN launch_angle END) AS avg_la,
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
             MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev
-        FROM plate_appearances
+        FROM plate_appearances{matchup_join}
         WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
     """
     raw_bb = cur_raw.execute(raw_bb_sql, params).fetchone()
@@ -667,6 +671,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     bb_pct = safe_rate(bb, pa)
     k_per_9 = safe_rate(k, innings, 9.0) if innings > 0 else None
     bb_per_9 = safe_rate(bb, innings, 9.0) if innings > 0 else None
+    h_per_9 = safe_rate(hits_allowed, innings, 9.0) if innings > 0 else None
     era = safe_rate(earned_runs, innings, 9.0) if innings > 0 else None
 
     # ── New advanced stats: SLG-against, Hard%, xOBA, BABIP ──────────────
@@ -860,17 +865,17 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             plate_appearances, outs_recorded, innings_pitched, strikeouts, walks,
             hits_allowed, singles_allowed, doubles_allowed, triples_allowed,
             home_runs_allowed, runs_allowed, earned_runs,
-            k_pct, bb_pct, k_per_9, bb_per_9, era, whiff_pct, pitches_thrown,
+            k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
             slg_against, hard_pct, xoba_against, babip_against,
             whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
             avg_velo, top_velo
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         season, player_id, player_name or '', matchup, window,
         pa, outs_recorded, innings, k, bb,
         hits_allowed, singles_allowed, doubles_allowed, triples_allowed,
         hrs_allowed, runs_allowed, earned_runs,
-        k_pct, bb_pct, k_per_9, bb_per_9, era, whiff_pct, pitches_thrown,
+        k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
         slg_against, hard_pct, xoba_against, babip_against,
         whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
         avg_velo, top_velo
@@ -897,12 +902,14 @@ def _insert_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Con
         date_sql = ' AND sb.game_date IN ({})'.format(','.join('?' for _ in dates))
         date_params = dates
 
-    # matchup: check pitcher's handedness from pitchers table (authoritative)
+    # matchup: JOIN with pitchers table for handedness (avoids correlated subquery)
+    matchup_join = ''
     matchup_sql = ''
     matchup_params = []
     if matchup in ('vs_lefty', 'vs_righty'):
         want = 'L' if matchup == 'vs_lefty' else 'R'
-        matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = sb.pitcher_id LIMIT 1) = ?"
+        matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = sb.pitcher_id'
+        matchup_sql = ' AND pit.p_throws = ?'
         matchup_params = [want]
 
     sql = f"""SELECT
@@ -912,7 +919,7 @@ def _insert_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Con
         SUM(CASE WHEN sb.event_type='pickoff' THEN 1 ELSE 0 END) as pickoffs,
         SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 AND sb.base='2B' THEN 1 ELSE 0 END) as stole_2b,
         SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 AND sb.base='3B' THEN 1 ELSE 0 END) as stole_3b
-    FROM stolen_bases sb WHERE sb.season = ? AND sb.runner_id = ? {matchup_sql} {date_sql}"""
+    FROM stolen_bases sb{matchup_join} WHERE sb.season = ? AND sb.runner_id = ? {matchup_sql} {date_sql}"""
 
     params = [season, player_id] + matchup_params + date_params
     cur_raw.execute(sql, params)
@@ -932,17 +939,20 @@ def _insert_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Con
         if pa_dates:
             pa_date_sql = ' AND game_date IN ({})'.format(','.join('?' for _ in pa_dates))
             pa_date_params = pa_dates
+    pa_matchup_join = ''
     pa_matchup_sql = ''
     if matchup == 'vs_lefty':
-        pa_matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = plate_appearances.pitcher_id LIMIT 1) = 'L'"
+        pa_matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = plate_appearances.pitcher_id'
+        pa_matchup_sql = " AND pit.p_throws = 'L'"
     elif matchup == 'vs_righty':
-        pa_matchup_sql = " AND (SELECT p_throws FROM pitchers WHERE pitcher_id = plate_appearances.pitcher_id LIMIT 1) = 'R'"
+        pa_matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = plate_appearances.pitcher_id'
+        pa_matchup_sql = " AND pit.p_throws = 'R'"
 
     cur_raw.execute(f"""SELECT
         SUM(COALESCE(is_ab,0)), SUM(COALESCE(is_hit,0)),
         SUM(COALESCE(is_walk,0)), SUM(COALESCE(is_hbp,0)),
         SUM(COALESCE(is_sac_fly,0))
-    FROM plate_appearances WHERE season = ? AND batter_id = ? {pa_matchup_sql} {pa_date_sql}""",
+    FROM plate_appearances{pa_matchup_join} WHERE season = ? AND batter_id = ? {pa_matchup_sql} {pa_date_sql}""",
         [season, player_id] + pa_date_params)
     pa_row = cur_raw.fetchone()
     if pa_row:
@@ -995,16 +1005,18 @@ def _insert_pitcher_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sql
         date_sql = ' AND sb.game_date IN ({})'.format(','.join('?' for _ in dates))
         date_params = dates
 
+    matchup_join = ''
     matchup_sql = ''
     if matchup in ('vs_lefty', 'vs_righty'):
         want = 'L' if matchup == 'vs_lefty' else 'R'
-        matchup_sql = f" AND (SELECT p_throws FROM pitchers WHERE pitcher_id = sb.pitcher_id LIMIT 1) = '{want}'"
+        matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = sb.pitcher_id'
+        matchup_sql = f" AND pit.p_throws = '{want}'"
 
     sql = f"""SELECT
         SUM(CASE WHEN sb.event_type IN ('stolen_base','caught_stealing') THEN 1 ELSE 0 END),
         SUM(CASE WHEN sb.event_type='pickoff' THEN 1 ELSE 0 END),
         SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 THEN 1 ELSE 0 END)
-    FROM stolen_bases sb WHERE sb.season = ? AND sb.pitcher_id = ? {matchup_sql} {date_sql}"""
+    FROM stolen_bases sb{matchup_join} WHERE sb.season = ? AND sb.pitcher_id = ? {matchup_sql} {date_sql}"""
 
     cur_raw.execute(sql, [season, player_id] + date_params)
     row = cur_raw.fetchone()
@@ -1046,16 +1058,18 @@ def _insert_catcher_baserunning_agg(conn_raw: sqlite3.Connection, conn_calc: sql
         date_sql = ' AND sb.game_date IN ({})'.format(','.join('?' for _ in dates))
         date_params = dates
 
+    matchup_join = ''
     matchup_sql = ''
     if matchup in ('vs_lefty', 'vs_righty'):
         want = 'L' if matchup == 'vs_lefty' else 'R'
-        matchup_sql = f" AND (SELECT p_throws FROM pitchers WHERE pitcher_id = sb.pitcher_id LIMIT 1) = '{want}'"
+        matchup_join = ' JOIN pitchers pit ON pit.pitcher_id = sb.pitcher_id'
+        matchup_sql = f" AND pit.p_throws = '{want}'"
 
     sql = f"""SELECT
         SUM(CASE WHEN sb.event_type IN ('stolen_base','caught_stealing') THEN 1 ELSE 0 END),
         SUM(CASE WHEN sb.event_type='caught_stealing' THEN 1 ELSE 0 END),
         SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 THEN 1 ELSE 0 END)
-    FROM stolen_bases sb WHERE sb.season = ? AND sb.catcher_id = ? {matchup_sql} {date_sql}"""
+    FROM stolen_bases sb{matchup_join} WHERE sb.season = ? AND sb.catcher_id = ? {matchup_sql} {date_sql}"""
 
     cur_raw.execute(sql, [season, player_id] + date_params)
     row = cur_raw.fetchone()

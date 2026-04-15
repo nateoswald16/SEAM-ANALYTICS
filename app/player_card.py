@@ -9,14 +9,12 @@ import math
 import os
 import logging
 import sqlite3
-import requests
-import requests.adapters
-from urllib3.util.retry import Retry
 from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 import pybaseball
 import _app_paths
+from _http_utils import create_http_session, TIMEOUT_DEFAULT
 
 from PyQt6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
@@ -34,9 +32,7 @@ log = logging.getLogger("seam.player_card")
 from _app_theme import C
 
 # ── HTTP session ────────────────────────────────────────────────────
-_retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504])
-_http = requests.Session()
-_http.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
+_http = create_http_session(total_retries=2, backoff_factor=0.3)
 
 _pool = ThreadPoolExecutor(max_workers=2)
 
@@ -50,7 +46,7 @@ HEADSHOT_DIR = _app_paths.HEADSHOT_CACHE_DIR
 os.makedirs(HEADSHOT_DIR, exist_ok=True)
 
 # ── Player roster CSV ───────────────────────────────────────────────
-PLAYERS_CSV = os.path.join(_app_paths.ASSETS_DIR, "players.csv")
+PLAYERS_CSV = _app_paths.PLAYERS_CSV
 _roster_cache: dict | None = None
 
 def _load_roster() -> dict:
@@ -174,7 +170,7 @@ def fetch_headshot(player_id, callback_label=None):
     def _download():
         try:
             url = HEADSHOT_URL.format(pid=player_id)
-            resp = _http.get(url, timeout=8)
+            resp = _http.get(url, timeout=TIMEOUT_DEFAULT)
             if resp.status_code == 200 and len(resp.content) > 500:
                 with open(cache_path, "wb") as f:
                     f.write(resp.content)
