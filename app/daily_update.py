@@ -232,7 +232,9 @@ def main(argv: list[str] | None = None, gui_cb=None):
         return run_daily(start, end, season, calc_seasons, gui_cb=gui_cb)
 
     # Default behavior: determine missing range from DB and fetch all missing games
-    yesterday = date.today() - timedelta(days=1)
+    # Use today (not yesterday) so completed games are ingested immediately;
+    # statcast enrichment will backfill once data becomes available (24-48 h).
+    today = date.today()
     last_game = _get_last_game_date(DB_PATH)
 
     ingested_new = False
@@ -241,11 +243,11 @@ def main(argv: list[str] | None = None, gui_cb=None):
 
     if last_game is None:
         # DB empty or missing → fall back to days_back window (preserve previous default)
-        start_dt = (yesterday - timedelta(days=args.days_back - 1))
+        start_dt = (today - timedelta(days=args.days_back))
     else:
         start_dt = last_game + timedelta(days=1)
 
-    end_dt = yesterday
+    end_dt = today
 
     if start_dt > end_dt:
         print(f"No missing games to ingest (last game in DB: {last_game.isoformat() if last_game else 'none'}).")

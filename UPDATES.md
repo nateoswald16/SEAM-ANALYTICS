@@ -4,6 +4,134 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.1.2 — 2026-04-15
+
+### Top Pitching
+
+**HR Allowed / Hits Allowed Filter**
+- Added a filter bar on the Top Pitching page to toggle between HR Allowed and Hits Allowed stat table views
+- HR Allowed table: PITCHER, TEAM, OPP, H, HR, BF, HR:BF%, Pull Air%, Pitches, HR:P%
+- Hits Allowed table: PITCHER, TEAM, OPP, H, BF, H:BF%, Pitches, H:P%
+- Filter bar sits between leaderboard cards and the stat table stack
+
+**Leaderboard Layout Reorder**
+- Moved pitching leaderboard cards above the stat tables for better visual hierarchy
+- Order: Title → "TODAY'S LEADERS" → leaderboard card grid → filter bar → stat tables
+
+**Three New Pitching Leaderboard Widgets**
+- Contact% — percentage of pitches put in play (lower is better for pitchers)
+- K/9 — strikeouts per 9 innings
+- H/9 — hits per 9 innings
+
+**Two-Way Player Filtering**
+- `get_todays_player_info()` now returns a separate `pitcher_teams` dict containing only probable/starting pitcher IDs
+- Pitching leaderboards use `pitcher_teams` so two-way players like Ohtani only appear when scheduled to pitch
+- Batting and baserunning leaderboards continue to use the full `player_teams` dict
+
+### Game Tracker
+
+**Due Up / On Deck / In the Hole**
+- Live game cards now show a row above the box score with the next batters due up
+- During inning transitions: displays "Due Up" and "On Deck" batters
+- Mid-inning: displays "On Deck" and "In the Hole" batters
+- Styled with muted labels (t3) and bright player names (t1) with batter handedness
+
+**Play-by-Play Substitutions**
+- Pitching changes, pinch hitters, and pinch runners now appear in the play-by-play log
+- Substitution events render in bold amber text to distinguish from regular plays
+
+**AB:/P: Label Styling**
+- Current batter and pitcher labels use rich text HTML with styled spans
+- Label tags ("AB:", "P:") in muted color (t3), player names in bright color (t1)
+- Player names are HTML-escaped to prevent injection
+
+### Tables
+
+**Benchmark-Based Color Grading**
+- Migrated HR Allowed and Hits Allowed table grading from inline percentile-based grade_map to the MLB_AVG.py benchmark system
+- New benchmarks added: H:P% (avg 4.75%, threshold ±0.75%), H:BF% (avg 20.5%, threshold ±2.5%)
+- Adjusted HR:BF% benchmark to avg 2.75%, threshold ±0.75% (≥3.5% red, ≤2.0% green)
+- All grade_map dicts removed from HR/Hits tables — every column now falls through to `grade_stat()`
+- Grading colors: values beyond avg + threshold show red (above) or green (below) based on `higher_is_better` direction
+
+### Park & Weather
+
+**Humidity Data**
+- Added humidity percentage to all three weather providers:
+  - NWS: `relativeHumidity` from forecast periods
+  - WeatherAPI: `humidity` from current and hourly data
+  - Open-Meteo: `relative_humidity_2m` from current and hourly data
+- Humidity displayed on mini park widget as "XX% humid" below precipitation row
+- New third scale bar in the carry legend: "HUMIDITY → CARRY" showing effect on ball carry (humid air is less dense → slightly more carry)
+- Legend spacing increased from 30px to 50px between the three bars
+
+**Retractable Roof Status**
+- Live/final games: reads `weather.condition` from the MLB API — `"Roof Closed"` or `"Dome"` → `"Retractable (CLOSED)"`, any other condition → `"Retractable (OPEN)"`
+- Closed retractable roofs receive dome treatment (wind/carry factors suppressed)
+
+**Predictive Retractable Roof Model**
+- Pre-game retractable venues now show a predicted OPEN/CLOSED status with an asterisk (e.g. `"Retractable (CLOSED)*"`)
+- Per-venue rules based on MLB operational guidelines:
+  - **MIL**: closed if temp < 60°F, precip ≥ 15%, or wind ≥ 25 mph (comfort-focused, monitors hourly)
+  - **HOU**: closed if temp < 55°F or > 95°F, precip ≥ 10%, wind ≥ 25 mph, or humid heat (zero-tolerance rain)
+  - **SEA**: closed if temp < 60°F, precip ≥ 50%, or wind ≥ 25 mph ("carport" design — stays open as long as possible)
+  - **ARI**: closed if temp > 85°F or < 60°F, precip ≥ 20%, or wind ≥ 25 mph (desert heat)
+  - **TEX**: closed if temp > 80°F or < 60°F, precip ≥ 10%, or wind ≥ 25 mph (zero-tolerance rain, sensitive equipment)
+  - **TOR**: closed if temp < 60°F, precip ≥ 20%, or wind ≥ 25 mph
+  - **MIA**: closed if temp > 78°F or < 65°F, humidity > 60%, precip ≥ 15%, or wind ≥ 25 mph (almost always closed)
+
+**Retractable Roof Filter Fix**
+- Park filter for "RETRACTABLE" now uses `startswith("Retractable")` instead of exact match
+- Correctly matches all variants: `"Retractable (OPEN)"`, `"Retractable (CLOSED)"`, and predicted statuses with asterisk
+
+### Notepad
+
+**In-App Notepad**
+- Added a floating notepad panel accessible via a button in the title bar (after the search bar)
+- Auto-saves to `assets/notepad.txt` with 500ms debounce on text changes
+- Clear button to wipe content; close button to dismiss
+- Panel is draggable from the top 32px header area and resizable from all edges/corners
+- Custom `_DragResizeFrame` subclass handles edge detection, resize cursors, and drag logic
+- Default size 380×420, minimum 260×200; monospace font (Cascadia Mono)
+
+### Data Pipeline
+
+**Baserunning Date Range Fix**
+- Fixed `daily_update.py` using yesterday as `end_dt` for baserunning stats — now correctly uses today
+- Ensures same-day baserunning data is included in incremental rebuilds
+
+**Pitching Leaderboard ID Fix**
+- Fixed pitching leaderboard missing pitcher IDs sourced from game dicts
+- Ensures all probable/starting pitchers appear in leaderboard calculations
+
+### Performance
+
+**Correlated Subquery Elimination**
+- Replaced 7 correlated subqueries in `build_calculated_db.py` with JOIN-based pitcher handedness lookups
+- Batting, runner baserunning, pitcher baserunning, and catcher baserunning aggregation functions all used `(SELECT p_throws FROM pitchers WHERE pitcher_id = ...)` per row
+- Now uses `JOIN pitchers pit ON pit.pitcher_id = ...` for a single index scan per query instead of one per row
+- Affects all vs_lefty/vs_righty matchup calculations during database rebuilds
+
+**Database Indexes**
+- Added 4 composite indexes on `stolen_bases` for season-scoped baserunning queries: `(season, runner_id)`, `(season, pitcher_id)`, `(season, catcher_id)`, and `(game_date)`
+- Eliminates full table scans on `stolen_bases` during calculated stats rebuilds
+
+**HR Table Query Consolidation**
+- Merged two separate raw DB queries (BF/HR/Hits + Pull Air%) into a single query on the Top Pitching page
+- Reduces plate_appearances table scans from 2 to 1 per page load
+
+**Pitcher Row Query Consolidation**
+- Consolidated 3 sequential per-pitcher DB queries (resolve ID, resolve handedness, resolve name) into a single query in `_build_pitcher_row()`
+- Reduces per-pitcher DB round trips from 3 to 1 when building pitching stat tables
+
+**Bounded Player Data Cache**
+- `_player_data_cache` in `mlb_data_engine.py` now evicts the oldest entry when exceeding 256 items
+- Prevents unbounded memory growth from cached DataFrames during long sessions
+
+**Bounded Label Style Cache**
+- `_label_style_cache` in `seam_app.py` capped at 128 entries with FIFO eviction
+- Prevents minor memory leak from accumulated stylesheet strings
+
 ## v1.1.1 — 2026-04-12
 
 ### Top Pitching

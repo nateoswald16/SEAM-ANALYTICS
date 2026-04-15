@@ -13,22 +13,15 @@ import json
 import math
 import os
 import threading
-import requests
-import requests.adapters
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
-from urllib3.util.retry import Retry
 
-# Shared session with automatic retries on transient failures
-_retry = Retry(total=2, backoff_factor=0.3, status_forcelist=[502, 503, 504, 429])
-_http = requests.Session()
-_http.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
-_http.mount("http://", requests.adapters.HTTPAdapter(max_retries=_retry))
+from _http_utils import create_http_session
+
+_http = create_http_session(total_retries=2, backoff_factor=0.3)
 
 # Separate fast session for Open-Meteo (no retries — fail fast if down)
-_http_om = requests.Session()
-_http_om.mount("https://", requests.adapters.HTTPAdapter(max_retries=0))
-_http_om.mount("http://", requests.adapters.HTTPAdapter(max_retries=0))
+_http_om = create_http_session(total_retries=0, backoff_factor=0)
 
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
@@ -45,6 +38,7 @@ import _app_paths
 # Design tokens  (shared palette — single source of truth)
 # ═══════════════════════════════════════════════════════════════════════════════
 from _app_theme import C
+from _ui_utils import mk_label as _mk
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -85,19 +79,6 @@ VENUE_PARK_FACTORS: dict[int, int] = {
 }
 
 
-def _mk(text, color=None, size=10, bold=False, align=None):
-    """Minimal label factory (avoids importing seam_app.mk_label)."""
-    lbl = QLabel(str(text))
-    lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-    w = "700" if bold else "400"
-    lbl.setStyleSheet(
-        f"color:{color or C['t1']}; background:transparent;"
-        f"font-family:'Segoe UI'; font-size:{size}px; font-weight:{w};")
-    if align:
-        lbl.setAlignment(align)
-    return lbl
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # Carry-effect legend  (altitude + air pressure scale bars)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -118,10 +99,17 @@ _PRESS_TICKS = [        # (hPa, label, carry_pct)  lower pressure → more carry
     (990,  "990",       +2),
     (975,  "975",       +4),
 ]
+_HUMID_TICKS = [        # (%, label, carry_pct)  humid air is lighter → more carry
+    (0,   "0%",         0),
+    (25,  "25%",      +0.2),
+    (50,  "50%",      +0.5),
+    (75,  "75%",      +0.8),
+    (100, "100%",     +1.0),
+]
 
 
 class _CarryLegend(QWidget):
-    """Full-width legend with two side-by-side scale bars."""
+    """Full-width legend with three side-by-side scale bars."""
 
     _H = 64
 
@@ -138,9 +126,9 @@ class _CarryLegend(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
         pad = 30                   # internal padding so edge labels aren't clipped
-        gap = 40                   # space between the two bars
+        gap = 50                   # space between bars
         usable = w - 2 * pad
-        half = (usable - gap) / 2
+        third = (usable - gap * 2) / 3
         bar_h = 6
         y_bar = 32                 # vertical position of gradient bar
 
@@ -189,10 +177,12 @@ class _CarryLegend(QWidget):
                 p.drawText(QRectF(tx - 28, y_bar + bar_h + 2, 56, 13),
                            Qt.AlignmentFlag.AlignCenter, lbl)
 
-        draw_bar(pad, half, "ALTITUDE  →  BALL CARRY",
+        draw_bar(pad, third, "ALTITUDE  →  CARRY",
                  _ALT_TICKS, (0, 5200))
-        draw_bar(pad + half + gap, half, "AIR PRESSURE  →  BALL CARRY",
+        draw_bar(pad + third + gap, third, "AIR PRESSURE  →  CARRY",
                  _PRESS_TICKS, (1030, 975))
+        draw_bar(pad + 2 * (third + gap), third, "HUMIDITY  →  CARRY",
+                 _HUMID_TICKS, (0, 100))
 
         p.end()
 
@@ -377,12 +367,14 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
         if not periods:
             return {}
 
-        result: dict = {"precip_pct": None, "pressure_hpa": None}
+        result: dict = {"precip_pct": None, "pressure_hpa": None, "humidity_pct": None}
 
         # Current-hour precip: use the first period (closest to now)
         first = periods[0]
         result["precip_pct"] = (
             first.get("probabilityOfPrecipitation", {}).get("value") or 0)
+        result["humidity_pct"] = (
+            first.get("relativeHumidity", {}).get("value"))
 
         # ── Game-window hourly forecast ──────────────────────────────────
         if game_utc_iso:
@@ -428,6 +420,10 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
 
                 # Pressure from observation (already set above)
                 result["forecast_pressure"] = result.get("pressure_hpa")
+
+                # Humidity from first-pitch hour
+                result["forecast_humidity"] = (
+                    first_pitch.get("relativeHumidity", {}).get("value"))
 
                 # Precip: max across game window
                 window_precip = [
@@ -576,9 +572,9 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
         url = (
             f"https://api.open-meteo.com/v1/forecast?"
             f"latitude={lat}&longitude={lon}"
-            f"&current=precipitation_probability,surface_pressure"
+            f"&current=precipitation_probability,surface_pressure,relative_humidity_2m"
             f"&hourly=temperature_2m,wind_speed_10m,wind_direction_10m,"
-            f"precipitation_probability,surface_pressure,weather_code"
+            f"precipitation_probability,surface_pressure,weather_code,relative_humidity_2m"
             f"&temperature_unit=fahrenheit&wind_speed_unit=mph"
             f"&forecast_days=2&timezone=auto"
         )
@@ -590,6 +586,7 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
         result = {
             "precip_pct": cur.get("precipitation_probability", 0) or 0,
             "pressure_hpa": round(cur.get("surface_pressure", 0) or 0, 1),
+            "humidity_pct": cur.get("relative_humidity_2m"),
         }
 
         # Pick hourly slots covering the game window (start → +3 h)
@@ -629,6 +626,9 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     "wind_direction_10m", [None]*(idx+1))[idx]
                 result["forecast_pressure"] = hourly.get(
                     "surface_pressure", [None]*(idx+1))[idx]
+                _rh_vals = hourly.get("relative_humidity_2m", [])
+                result["forecast_humidity"] = (
+                    _rh_vals[idx] if idx < len(_rh_vals) else None)
 
                 # Precip: max chance across the game window
                 precip_vals = hourly.get("precipitation_probability", [])
@@ -749,6 +749,7 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
         result = {
             "precip_pct": None,
             "pressure_hpa": round(cur.get("pressure_mb", 0) or 0, 1),
+            "humidity_pct": cur.get("humidity"),
         }
 
         # Build a flat list of all hourly slots across forecast days
@@ -817,6 +818,7 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 result["forecast_wind_speed"] = match.get("wind_mph")
                 result["forecast_wind_deg"] = match.get("wind_degree")
                 result["forecast_pressure"] = match.get("pressure_mb")
+                result["forecast_humidity"] = match.get("humidity")
 
                 # Precip: max chance across the game window
                 window_precip = [h.get("chance_of_rain") for h in window
@@ -876,6 +878,68 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
     except Exception:
         _wa_fail_count += 1
         return {}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Retractable roof prediction (pregame, before MLB provides official status)
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-venue rules based on MLB operational guidelines and historical patterns.
+# General: teams prefer open at 60°F+; high winds 25+ mph close roof.
+# Rain policies vary by venue — TEX/HOU are "zero tolerance" (close at ≥10%),
+# MIL monitors hourly (close if any rain in window), SEA is a "carport"
+# (stays open longer, closes when rain imminent).  Home team decides pregame;
+# roof can only move once mid-game.
+# Venue IDs:  MIL=32, HOU=2392, SEA=680, ARI=15, TEX=5325, TOR=14, MIA=4169
+
+def _predict_retractable_roof(game: dict) -> str:
+    """Return predicted roof_type string for a retractable venue.
+
+    Uses forecast temperature, precipitation, humidity, and wind to
+    estimate whether the roof will be open or closed.  Returns a label
+    with a trailing asterisk to indicate the status is predicted.
+    """
+    vid = game.get("venue_id")
+    try:
+        temp = float(game.get("temp") or 0)
+    except (ValueError, TypeError):
+        temp = 0
+    precip = game.get("precip_pct") or 0
+    humid = game.get("humidity_pct") or 0
+    wind = game.get("wind_speed") or 0
+
+    high_wind = wind >= 25
+
+    closed = False
+    if vid == 32:       # MIL — American Family Field
+        # Staff monitors hourly forecasts; any rain → closed.  Comfort-focused.
+        closed = temp < 60 or precip >= 15 or high_wind
+    elif vid == 2392:   # HOU — Daikin Park (Minute Maid)
+        # Zero-tolerance rain policy (close at even 10%).
+        # MLB-specific: close below 55°F or above 95°F.
+        closed = (temp < 55 or temp > 95 or precip >= 10 or high_wind
+                  or (temp > 88 and humid > 65))
+    elif vid == 680:    # SEA — T-Mobile Park
+        # "Carport" exception: roof acts as umbrella, stays open as long as
+        # possible.  Closes only when rain is imminent (higher threshold).
+        closed = temp < 60 or precip >= 50 or high_wind
+    elif vid == 15:     # ARI — Chase Field
+        # Desert heat; close for heat (>85°F), cold (<60°F), rain, wind
+        # Typically closed May through September
+        closed = temp > 85 or temp < 60 or precip >= 20 or high_wind
+    elif vid == 5325:   # TEX — Globe Life Field
+        # Zero-tolerance rain policy (close at even 10%).
+        # Sensitive equipment (massive video boards).  Close for heat (>80°F).
+        closed = temp > 80 or temp < 60 or precip >= 10 or high_wind
+    elif vid == 14:     # TOR — Rogers Centre
+        # Conservative; close for cold (<60°F), moderate rain risk, wind
+        closed = temp < 60 or precip >= 20 or high_wind
+    elif vid == 4169:   # MIA — loanDepot park
+        # Almost always closed due to heat + humidity;
+        # open only for mild, dry, low-humidity evenings
+        closed = temp > 78 or temp < 65 or humid > 60 or precip >= 15 or high_wind
+
+    tag = "CLOSED" if closed else "OPEN"
+    return f"Retractable ({tag})*"
 
 
 def fetch_park_weather(date_str: str) -> list[dict]:
@@ -942,7 +1006,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             "temp": weather.get("temp"),
             "condition": weather.get("condition", ""),
             "wind_speed": ws, "wind_dir": wd, "wind_angle": wa,
-            "precip_pct": None, "pressure_hpa": None,
+            "precip_pct": None, "pressure_hpa": None, "humidity_pct": None,
         }
 
         # Venue coords may be missing from schedule; grab from game feed
@@ -974,10 +1038,21 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             except Exception:
                 pass
 
-        # Retractable roofs: MLB often reports condition as "Dome" even when
-        # the roof may be open.  Clear it so Open-Meteo outdoor weather fills in.
-        if result["roof_type"] == "Retractable" and result["condition"].lower() in ("dome", ""):
-            result["condition"] = ""
+        # Retractable roofs: determine open/closed from MLB condition field
+        _is_retractable = result["roof_type"] == "Retractable"
+        _roof_confirmed = False
+        if _is_retractable:
+            cond_lower = result["condition"].lower()
+            if cond_lower in ("roof closed", "dome"):
+                result["roof_type"] = "Retractable (CLOSED)"
+                _roof_confirmed = True
+            elif cond_lower:
+                # Non-empty weather condition = game started with roof open
+                result["roof_type"] = "Retractable (OPEN)"
+                _roof_confirmed = True
+            # Clear dome/roof-closed condition so real weather can fill in
+            if cond_lower in ("dome", "roof closed", ""):
+                result["condition"] = ""
 
         # NWS primary → WeatherAPI fallback → Open-Meteo fallback
         if result["lat"] and result["lon"]:
@@ -993,6 +1068,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
 
             result["precip_pct"] = om.get("precip_pct")
             result["pressure_hpa"] = om.get("pressure_hpa")
+            result["humidity_pct"] = om.get("humidity_pct")
 
             # Fill missing MLB weather from hourly forecast
             if not result["temp"] and om.get("forecast_temp") is not None:
@@ -1010,8 +1086,14 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["precip_pct"] = om["forecast_precip"]
             if om.get("forecast_pressure") is not None:
                 result["pressure_hpa"] = round(om["forecast_pressure"], 1)
+            if om.get("forecast_humidity") is not None:
+                result["humidity_pct"] = om["forecast_humidity"]
             if om.get("hourly_conditions"):
                 result["hourly_conditions"] = om["hourly_conditions"]
+
+        # Predictive roof status for retractable venues (pregame only)
+        if _is_retractable and not _roof_confirmed:
+            result["roof_type"] = _predict_retractable_roof(result)
 
         return result
 
@@ -1335,7 +1417,8 @@ class MiniParkWidget(QWidget):
         p.drawRect(QRectF(cx - bsz, cy - bsz, bsz * 2, bsz * 2))
 
         # ── 3) wind arrows (skip for domes) ──
-        is_dome = self.d.get("roof_type", "Open") == "Dome"
+        _roof = self.d.get("roof_type", "Open")
+        is_dome = _roof == "Dome" or "CLOSED" in _roof
         angle = self.d.get("wind_angle")
         if angle is not None and not is_dome:
             wd = self.d.get("wind_dir", "")
@@ -1402,6 +1485,11 @@ class MiniParkWidget(QWidget):
         pr_txt = f"{precip:.0f}% precip" if precip is not None else "-- % precip"
         p.drawText(QRectF(self.W - 90, 48, 82, 14),
                     Qt.AlignmentFlag.AlignRight, pr_txt)
+
+        humid = self.d.get("humidity_pct")
+        hm_txt = f"{humid:.0f}% humid" if humid is not None else "-- % humid"
+        p.drawText(QRectF(self.W - 90, 62, 82, 14),
+                    Qt.AlignmentFlag.AlignRight, hm_txt)
 
         p.end()
         self._cached_pm = pm
@@ -1551,6 +1639,7 @@ class ParkWeatherCard(QFrame):
     def _detail_text(self, idx: int) -> str:
         """Build the temp · wind summary string for hour *idx*."""
         roof = self.d.get("roof_type", "Open")
+        _is_dome = roof == "Dome" or "CLOSED" in roof
         if self._hourly and 0 <= idx < len(self._hourly):
             slot = self._hourly[idx]
             t = slot.get("temp")
@@ -1563,7 +1652,7 @@ class ParkWeatherCard(QFrame):
         parts = []
         if t is not None:
             parts.append(f"{int(t)}°")
-        if roof == "Dome":
+        if _is_dome:
             parts.append("Dome")
         else:
             parts.append(f"{ws}mph {wd}" if ws else "Calm")
@@ -1994,7 +2083,7 @@ class ParkFactorsPage(QWidget):
                         if g.get("roof_type", "Open") == "Dome"]
         elif self._roof_label == "RETRACTABLE":
             filtered = [g for g in filtered
-                        if g.get("roof_type", "Open") == "Retractable"]
+                        if g.get("roof_type", "Open").startswith("Retractable")]
 
         # Park bias filter
         if self._bias_label == "HITTER FRIENDLY":

@@ -1,5 +1,3 @@
-import requests
-import requests.adapters
 import csv
 from datetime import datetime
 import logging
@@ -10,36 +8,80 @@ import sqlite3
 import threading
 import time as _time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib3.util.retry import Retry
 
 import _app_paths
+from _http_utils import (
+    create_http_session,
+    TIMEOUT_DEFAULT  as _TIMEOUT_DEFAULT,
+    TIMEOUT_SHORT    as _TIMEOUT_SHORT,
+    TIMEOUT_LONG     as _TIMEOUT_LONG,
+)
 
 _log = logging.getLogger("seam.engine")
 
-# ── HTTP timeout defaults (seconds) ─────────────────────────────────
-_TIMEOUT_DEFAULT = 10   # schedule, live feed, boxscore
-_TIMEOUT_SHORT   = 5    # single-player endpoints (people, handedness)
-_TIMEOUT_LONG    = 30   # bulk / slow endpoints (statcast, backfill)
-
-# Shared session with automatic retries on transient failures
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[502, 503, 504, 429])
-_session = requests.Session()
-_session.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
-_session.mount("http://", requests.adapters.HTTPAdapter(max_retries=_retry))
+_session = create_http_session()
 
 
 class MLBDataEngine:
     """Simplified API-only interface for MLB data."""
     
+    # ── Generic JSON-on-disk cache with optional pickle migration ────
+    class _JsonCache:
+        __slots__ = ('_json_path', '_pkl_path', '_default_factory',
+                     '_as_set', '_indent')
+
+        def __init__(self, path, *, default_factory=dict, as_set=False,
+                     migrate_pickle=False, indent=None):
+            self._json_path = (path.replace('.pkl', '.json')
+                               if path.endswith('.pkl') else path)
+            self._pkl_path = path if migrate_pickle else None
+            self._default_factory = default_factory
+            self._as_set = as_set
+            self._indent = indent
+
+        def load(self):
+            if os.path.exists(self._json_path):
+                try:
+                    with open(self._json_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    return set(data) if self._as_set else data
+                except Exception:
+                    return self._default_factory()
+            if self._pkl_path and os.path.exists(self._pkl_path):
+                try:
+                    with open(self._pkl_path, 'rb') as f:
+                        data = pickle.load(f)
+                    self.save(data)
+                    os.remove(self._pkl_path)
+                    return data
+                except Exception:
+                    return self._default_factory()
+            return self._default_factory()
+
+        def save(self, data):
+            try:
+                payload = list(data) if self._as_set else data
+                with open(self._json_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=self._indent)
+            except Exception:
+                _log.debug("Failed to save cache %s", self._json_path)
+
     def __init__(self):
         self.api_base = "https://statsapi.mlb.com/api/v1"
         self.id_cache_file = _app_paths.PLAYER_IDS_CACHE
-        self.id_cache = self._load_cache()
+        self._id_cache_mgr = self._JsonCache(
+            self.id_cache_file, migrate_pickle=True)
+        self.id_cache = self._id_cache_mgr.load()
         self.team_abbreviations = self._load_team_abbreviations()
         self.temp_lineup_cache_file = _app_paths.TEMP_LINEUP_CACHE
-        self.temp_lineup_cache = self._load_temp_lineup_cache()
+        self._lineup_cache_mgr = self._JsonCache(
+            self.temp_lineup_cache_file, indent=2)
+        self.temp_lineup_cache = self._lineup_cache_mgr.load()
         self.processed_dates_file = _app_paths.PROCESSED_DATES_CACHE
-        self.processed_dates = self._load_processed_dates()
+        self._dates_cache_mgr = self._JsonCache(
+            self.processed_dates_file, default_factory=set,
+            as_set=True, migrate_pickle=True)
+        self.processed_dates = self._dates_cache_mgr.load()
         self.raw_db_file = _app_paths.RAW_DB
         self.suppress_output = False  # Flag to suppress informational output during shutdown
         self.probable_pitchers = {}  # {game_id_str: {"away": {"name": "F. Last", "id": 123}, "home": {...}}}
@@ -48,67 +90,38 @@ class MLBDataEngine:
         self._handedness_cache = {}  # {player_id: handedness_code}
         self._id_cache_dirty = False  # Track whether id_cache needs saving
         self._cleanup_done = False  # Only run cleanup once per session
-        self._db_conn = None  # Reusable read-only DB connection
-        self._steals_conn = None  # Reusable steals DB connection
+        self._local = threading.local()  # Thread-local DB connections
         self._player_data_cache = {}  # {(player_id,is_pitcher,year): {'ts': monotonic, 'result': {...}}}
+        self._player_data_cache_max = 256  # Evict oldest entries beyond this limit
         self._cache_lock = threading.Lock()  # Protects shared caches from concurrent access
-    
+
+    def _put_player_data_cache(self, key, value):
+        """Insert into _player_data_cache with LRU-style eviction when over limit."""
+        self._player_data_cache[key] = value
+        if len(self._player_data_cache) > self._player_data_cache_max:
+            # Evict the oldest entry by timestamp
+            oldest_key = min(self._player_data_cache, key=lambda k: self._player_data_cache[k].get('ts', 0))
+            self._player_data_cache.pop(oldest_key, None)
+
     def _load_cache(self):
-        """Load player ID cache from disk (JSON preferred, pickle fallback for migration)."""
-        json_path = self.id_cache_file.replace('.pkl', '.json')
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        # Migrate old pickle cache if present
-        if os.path.exists(self.id_cache_file):
-            try:
-                with open(self.id_cache_file, 'rb') as f:
-                    data = pickle.load(f)
-                # Save as JSON and remove pickle
-                with open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(data, f)
-                os.remove(self.id_cache_file)
-                return data
-            except Exception:
-                return {}
-        return {}
-    
+        return self._id_cache_mgr.load()
+
     def _save_cache(self):
-        """Save player ID cache to disk as JSON."""
-        json_path = self.id_cache_file.replace('.pkl', '.json')
-        try:
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(self.id_cache, f)
-        except Exception:
-            _log.debug("Failed to save player ID cache")
-    
+        self._id_cache_mgr.save(self.id_cache)
 
     def _load_temp_lineup_cache(self):
-        """Load temporarily cached lineups from disk."""
-        if os.path.exists(self.temp_lineup_cache_file):
-            try:
-                with open(self.temp_lineup_cache_file, 'r') as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
-    
+        return self._lineup_cache_mgr.load()
+
     def _save_temp_lineup_cache(self):
-        """Save temporarily cached lineups to disk."""
-        try:
-            with open(self.temp_lineup_cache_file, 'w') as f:
-                json.dump(self.temp_lineup_cache, f, indent=2)
-        except Exception:
-            _log.debug("Failed to save temp lineup cache")
+        self._lineup_cache_mgr.save(self.temp_lineup_cache)
     
     def _get_db_connection(self):
-        """Get a reusable read-only database connection."""
-        if self._db_conn is None and os.path.exists(self.raw_db_file):
-            self._db_conn = sqlite3.connect(self.raw_db_file, check_same_thread=False)
-        return self._db_conn
+        """Get a thread-local reusable read-only database connection."""
+        conn = getattr(self._local, 'db_conn', None)
+        if conn is None and os.path.exists(self.raw_db_file):
+            conn = sqlite3.connect(self.raw_db_file, check_same_thread=False)
+            self._local.db_conn = conn
+        return conn
     
     def _game_exists_in_database(self, game_id):
         """Check if a game_id exists in the raw data database."""
@@ -151,35 +164,10 @@ class MLBDataEngine:
             _log.debug(f"Cleaned up {len(games_to_remove)} temp lineup(s)")
     
     def _load_processed_dates(self):
-        """Load set of dates that have been processed (JSON preferred, pickle fallback)."""
-        json_path = self.processed_dates_file.replace('.pkl', '.json')
-        if os.path.exists(json_path):
-            try:
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    return set(json.load(f))
-            except Exception:
-                return set()
-        # Migrate old pickle cache if present
-        if os.path.exists(self.processed_dates_file):
-            try:
-                with open(self.processed_dates_file, 'rb') as f:
-                    data = pickle.load(f)
-                with open(json_path, 'w', encoding='utf-8') as f:
-                    json.dump(list(data), f)
-                os.remove(self.processed_dates_file)
-                return data
-            except Exception:
-                return set()
-        return set()
-    
+        return self._dates_cache_mgr.load()
+
     def _save_processed_dates(self):
-        """Save processed dates to disk as JSON."""
-        json_path = self.processed_dates_file.replace('.pkl', '.json')
-        try:
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(list(self.processed_dates), f)
-        except Exception:
-            _log.debug("Failed to save processed dates")
+        self._dates_cache_mgr.save(self.processed_dates)
     
     def _load_team_abbreviations(self):
         """Load team name to abbreviation and logo mapping from CSV."""
@@ -294,6 +282,8 @@ class MLBDataEngine:
                         # Current batter / pitcher from linescore
                         _batter = offense.get('batter', {})
                         _pitcher = defense.get('pitcher', {})
+                        _ondeck = offense.get('onDeck', {})
+                        _inhole = offense.get('inHole', {})
                         # Per-inning scores
                         innings_detail = []
                         for inn in ls.get('innings', []):
@@ -330,6 +320,10 @@ class MLBDataEngine:
                             "current_batter_hand": {'S': 'B'}.get((_batter.get('batSide') or {}).get('code', ''), (_batter.get('batSide') or {}).get('code', '')),
                             "current_pitcher_name": _pitcher.get('fullName', ''),
                             "current_pitcher_hand": (_pitcher.get('pitchHand') or {}).get('code', ''),
+                            "ondeck_batter_name": _ondeck.get('fullName', ''),
+                            "ondeck_batter_hand": {'S': 'B'}.get((_ondeck.get('batSide') or {}).get('code', ''), (_ondeck.get('batSide') or {}).get('code', '')),
+                            "inhole_batter_name": _inhole.get('fullName', ''),
+                            "inhole_batter_hand": {'S': 'B'}.get((_inhole.get('batSide') or {}).get('code', ''), (_inhole.get('batSide') or {}).get('code', '')),
                         })
                     except Exception as e:
                         _log.warning(f"  Warning: Could not parse game: {e}")
@@ -363,6 +357,9 @@ class MLBDataEngine:
             'pickoff_caught_stealing_2b', 'pickoff_caught_stealing_3b',
             'pickoff_caught_stealing_home',
             'error',
+            # Substitutions
+            'pitching_substitution', 'offensive_substitution',
+            'defensive_substitution', 'defensive_switch',
         }
         try:
             url = f"{self.api_base.replace('/v1', '/v1.1')}/game/{game_id}/feed/live"
@@ -390,6 +387,10 @@ class MLBDataEngine:
                     if not pe_event and not pe_desc:
                         continue
                     pe_scoring = pe_details.get('isScoringPlay', False)
+                    _is_sub = pe_event_type.lower() in (
+                        'pitching_substitution', 'offensive_substitution',
+                        'defensive_substitution', 'defensive_switch',
+                    )
                     result.append({
                         'inning': inning,
                         'half': half,
@@ -400,6 +401,7 @@ class MLBDataEngine:
                         'home_score': pe_details.get('homeScore', 0),
                         'is_scoring': pe_scoring,
                         'is_action': True,
+                        'is_substitution': _is_sub,
                     })
 
                 # At-bat result
@@ -544,11 +546,11 @@ class MLBDataEngine:
                 splits = stats_list[0].get('splits', [])
                 if splits:
                     stat = splits[0].get('stat', {})
-                    self._player_data_cache[key] = {'ts': _time.time(), 'result': stat}
+                    self._put_player_data_cache(key, {'ts': _time.time(), 'result': stat})
                     return stat
         except Exception:
             pass
-        self._player_data_cache[key] = {'ts': _time.time(), 'result': None}
+        self._put_player_data_cache(key, {'ts': _time.time(), 'result': None})
         return None
     
     def get_lineup(self, game_id, force_fresh=False):
@@ -608,7 +610,7 @@ class MLBDataEngine:
         try:
             url = f"{self.api_base}/game/{game_id}/boxscore"
             _log.debug(f"Fetching lineup for game {game_id}...")
-            response = _session.get(url, timeout=10)
+            response = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             response.raise_for_status()
             boxscore = response.json()
             
@@ -1271,7 +1273,7 @@ class MLBDataEngine:
             
             result = {"df": df, "handedness": handedness}
             if key is not None:
-                self._player_data_cache[key] = {'ts': _time.monotonic(), 'result': result}
+                self._put_player_data_cache(key, {'ts': _time.monotonic(), 'result': result})
             return result
         
         except Exception as e:
@@ -1928,12 +1930,14 @@ class MLBDataEngine:
             return empty
 
     def _get_steals_db_connection(self):
-        """Get a reusable connection to the steals database."""
-        if self._steals_conn is None:
+        """Get a thread-local reusable connection to the steals database."""
+        conn = getattr(self._local, 'steals_conn', None)
+        if conn is None:
             steals_db = _app_paths.STEALS_DB
             if os.path.exists(steals_db):
-                self._steals_conn = sqlite3.connect(steals_db, check_same_thread=False)
-        return self._steals_conn
+                conn = sqlite3.connect(steals_db, check_same_thread=False)
+                self._local.steals_conn = conn
+        return conn
 
     def get_pitcher_baserunning_stats(self, pitcher_id, season, time_window='overall'):
         """Get pre-calculated baserunning defense stats for a pitcher.
@@ -2168,19 +2172,15 @@ class MLBDataEngine:
             return None
 
     def close(self):
-        """Close open database connections."""
-        if self._db_conn is not None:
-            try:
-                self._db_conn.close()
-            except Exception:
-                pass
-            self._db_conn = None
-        if self._steals_conn is not None:
-            try:
-                self._steals_conn.close()
-            except Exception:
-                pass
-            self._steals_conn = None
+        """Close open database connections (current thread)."""
+        for attr in ('db_conn', 'steals_conn'):
+            conn = getattr(self._local, attr, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                setattr(self._local, attr, None)
 
     def get_database_stats(self):
         """Get statistics about cached data (stub for compatibility)."""

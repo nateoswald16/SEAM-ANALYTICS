@@ -37,6 +37,9 @@ a = Analysis(
     hiddenimports=[
         # ── Local modules ────────────────────────────────────
         '_app_paths',
+        '_app_theme',
+        '_http_utils',
+        '_ui_utils',
         'mlb_data_engine',
         'MLB_AVG',
         'park_factors',

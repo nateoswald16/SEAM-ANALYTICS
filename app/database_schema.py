@@ -251,6 +251,12 @@ CREATE INDEX IF NOT EXISTS idx_pitch_game_date ON pitching_appearances(game_date
 CREATE INDEX IF NOT EXISTS idx_pitch_season ON pitching_appearances(season);
 CREATE INDEX IF NOT EXISTS idx_pitch_pitcher_id ON pitching_appearances(pitcher_id);
 
+-- Composite indexes on stolen_bases for season-scoped baserunning queries
+CREATE INDEX IF NOT EXISTS idx_stolen_season_runner ON stolen_bases(season, runner_id);
+CREATE INDEX IF NOT EXISTS idx_stolen_season_pitcher ON stolen_bases(season, pitcher_id);
+CREATE INDEX IF NOT EXISTS idx_stolen_season_catcher ON stolen_bases(season, catcher_id);
+CREATE INDEX IF NOT EXISTS idx_stolen_game_date ON stolen_bases(game_date);
+
 -- Aggregated views (conservative/simple implementations)
 CREATE VIEW IF NOT EXISTS batting_stats_season AS
 SELECT

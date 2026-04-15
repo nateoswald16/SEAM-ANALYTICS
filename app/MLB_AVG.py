@@ -49,9 +49,11 @@ MLB_BENCHMARKS = {
     "Hard%":    {"avg": 40.0,  "threshold": 4.0,   "higher_is_better": False},
     "Contact%": {"avg": 77.0,  "threshold": 3.0,   "higher_is_better": False},
     # ── HR-Allowed table (pitching) ──
-    "HR:BF%":     {"avg": 3.0,   "threshold": 0.8,   "higher_is_better": False},
+    "HR:BF%":     {"avg": 2.75,  "threshold": 0.75,  "higher_is_better": False},
     "Pull Air%":  {"avg": 17.0,  "threshold": 3.0,   "higher_is_better": False},
-    "HR:P%":      {"avg": 0.80,  "threshold": 0.20,  "higher_is_better": False},
+    "HR:P%":      {"avg": 0.75,  "threshold": 0.25,  "higher_is_better": False},
+    "H:P%":       {"avg": 4.75,  "threshold": 0.75,  "higher_is_better": False},
+    "H:BF%":      {"avg": 20.5,   "threshold": 2.5,   "higher_is_better": False},
     # ── Baserunning ──
     "OBP":    {"avg": 0.315, "threshold": 0.020, "higher_is_better": True},
     "Sprint": {"avg": 27.0,  "threshold": 1.0,   "higher_is_better": True},

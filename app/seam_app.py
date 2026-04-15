@@ -26,8 +26,6 @@ import sqlite3
 import json
 import csv
 import logging
-import requests
-import requests.adapters
 from html import escape as _h
 from pathlib import Path
 import datetime as dt
@@ -35,8 +33,8 @@ import threading
 import threading as _threading_mod
 _thread_local = _threading_mod.local()
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib3.util.retry import Retry
 
+from _http_utils import create_http_session, TIMEOUT_DEFAULT, TIMEOUT_DOWNLOAD
 from mlb_data_engine import MLBDataEngine
 from MLB_AVG import grade_stat
 from park_factors import ParkFactorsPage, prefetch_weather
@@ -153,10 +151,7 @@ from PyQt6.QtSvg import QSvgRenderer
 _bg_pool = ThreadPoolExecutor(max_workers=4)
 
 # Shared HTTP session with automatic retries on transient failures
-_retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[502, 503, 504, 429])
-_http = requests.Session()
-_http.mount("https://", requests.adapters.HTTPAdapter(max_retries=_retry))
-_http.mount("http://", requests.adapters.HTTPAdapter(max_retries=_retry))
+_http = create_http_session()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Design tokens  (shared palette — single source of truth)
@@ -171,7 +166,18 @@ _fmt2   = lambda v: f"{v:.2f}" if v is not None else ""   # ERA / FIP          (
 _fmt1   = lambda v: f"{v:.1f}" if v is not None else ""   # EV / distance      (98.3)
 _fmt_pct = lambda v: f"{v * 100:.1f}%" if v is not None else ""  # rates 0-1 → %  (24.5%)
 _fmt_deg = lambda v: f"{v:.1f}°" if v is not None else ""  # launch angle       (12.4°)
-_fmt_era = lambda v: f"{v:.2f}" if v is not None else ""   # ERA (alias of _fmt2)
+
+# ── Safe DB-row cast helpers ─────────────────────────────────────────
+_si = lambda v: int(v) if v else 0        # safe int  (NULL/0 → 0)
+_sf = lambda v: float(v) if v is not None else None  # safe float (NULL → None)
+
+def _fmt_ip(outs):
+    """Format outs recorded as conventional IP (e.g. 18 outs → 6.0)."""
+    if outs is None or outs == 0:
+        return "0.0"
+    full = outs // 3
+    remainder = outs % 3
+    return f"{full}.{remainder}"
 
 # ── Pre-compiled regex for handedness suffix on player names ─────────────────
 import re as _re
@@ -266,7 +272,7 @@ def _init_logos():
             _LOGO_MAP[abbr] = local
             if not os.path.exists(local):
                 try:
-                    r = _http.get(url, timeout=10)
+                    r = _http.get(url, timeout=TIMEOUT_DEFAULT)
                     if r.status_code == 200:
                         with open(local, "wb") as fp:
                             fp.write(r.content)
@@ -443,17 +449,29 @@ class DataManager:
 
     # ── Leaderboard helpers ──────────────────────────────────────────────
     def get_todays_player_info(self, games):
-        """Return {player_id: team_abbrev} for every player in today's lineup caches."""
+        """Return ({player_id: team_abbrev}, {pitcher_id: team_abbrev}).
+
+        The first dict contains every player in today's lineup caches plus
+        probable/starting pitchers.  The second dict contains *only* the
+        probable/starting pitcher IDs (used to scope the pitching leaderboard).
+        """
         player_teams = {}
+        pitcher_teams = {}
         for g in games:
             gid = g.get('id') or g.get('game_id')
             if not gid:
                 continue
+            away_team = g.get('away', '')
+            home_team = g.get('home', '')
+            # Include probable/starting pitchers from game dicts
+            for key, team in [('away_p_id', away_team), ('home_p_id', home_team)]:
+                pid = g.get(key)
+                if pid:
+                    player_teams[pid] = team
+                    pitcher_teams[pid] = team
             cache_file = os.path.join(self.cache_dir, f"{gid}.json")
             if not os.path.exists(cache_file):
                 continue
-            away_team = g.get('away', '')
-            home_team = g.get('home', '')
             try:
                 with open(cache_file, 'r') as f:
                     data = json.load(f)
@@ -464,7 +482,7 @@ class DataManager:
                             player_teams[pid] = team
             except Exception:
                 continue
-        return player_teams
+        return player_teams, pitcher_teams
 
     def get_leaderboard(self, table, column, player_teams, season=2026,
                         top_n=10, ascending=False, min_col=None, min_val=None):
@@ -739,19 +757,27 @@ class DataManager:
         # Window: since start of previous season (season >= current_year - 1)
         prev_season = _dt.date.today().year - 1
 
-        # BF, HR, Hits from raw DB
+        # BF, HR, Hits, and Pull Air% in a single raw DB query
         raw_rows = conn_raw.execute(
             f"SELECT pitcher_id, "
             f"  COUNT(*) AS bf, "
             f"  SUM(COALESCE(is_home_run,0)) AS hr, "
-            f"  SUM(COALESCE(is_hit,0)) AS h "
+            f"  SUM(COALESCE(is_hit,0)) AS h, "
+            f"  SUM(CASE WHEN pull = 1 AND launch_angle >= 25 THEN 1 ELSE 0 END) AS pull_air, "
+            f"  SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe "
             f"FROM plate_appearances "
             f"WHERE season >= ? "
             f"  AND pitcher_id IN ({ph}) "
             f"GROUP BY pitcher_id",
             [prev_season] + pids
         ).fetchall()
-        raw_map = {r[0]: (r[1] or 0, r[2] or 0, r[3] or 0) for r in raw_rows}
+        raw_map = {}
+        pull_air_map = {}
+        for r in raw_rows:
+            raw_map[r[0]] = (r[1] or 0, r[2] or 0, r[3] or 0)
+            bbe = r[5] or 0
+            if bbe > 0:
+                pull_air_map[r[0]] = round((r[4] or 0) / bbe * 100, 1)
 
         # Pitches from calc DB (sum same seasons)
         pitch_rows = conn_calc.execute(
@@ -764,26 +790,8 @@ class DataManager:
         ).fetchall()
         pitch_map = {r["player_id"]: (r["player_name"], r["pitches"] or 0) for r in pitch_rows}
 
-        # Pull-air % from raw DB (pulled BBE with launch_angle >= 25°)
-        pull_air_rows = conn_raw.execute(
-            f"SELECT pitcher_id, "
-            f"  SUM(CASE WHEN pull = 1 AND launch_angle >= 25 THEN 1 ELSE 0 END), "
-            f"  SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) "
-            f"FROM plate_appearances "
-            f"WHERE season >= ? AND pitcher_id IN ({ph}) "
-            f"GROUP BY pitcher_id",
-            [prev_season] + pids
-        ).fetchall()
-        pull_air_map = {}
-        for row in pull_air_rows:
-            pid, pa_cnt, bbe = row[0], row[1] or 0, row[2] or 0
-            if bbe > 0:
-                pull_air_map[pid] = round(pa_cnt / bbe * 100, 1)
-
-        cols = ["PITCHER", "TEAM", "OPP", "H", "HR", "BF",
-                "HR:BF%", "Pull Air%", "Pitches", "HR:P%"]
-        hi = {6, 7, 9}
-        data = []
+        # Build rows common to both HR and Hits views
+        rows = []
         for pid in pids:
             info = pitcher_info.get(pid)
             if not info or pid not in raw_map:
@@ -791,16 +799,37 @@ class DataManager:
             name, team, opp = info
             bf, hr, hits = raw_map[pid]
             db_name, pitches = pitch_map.get(pid, (name, 0))
-
-            hr_bf = f"{hr / bf * 100:.1f}%" if bf > 0 else "--"
-            hr_p = f"{hr / pitches * 100:.2f}%" if pitches > 0 else "--"
             pa_pct = f"{pull_air_map[pid]:.1f}%" if pid in pull_air_map else "--"
+            rows.append((db_name or name, team, opp, hits, hr, bf, pitches, pa_pct))
 
-            data.append([db_name or name, team, opp, str(hits), str(hr), str(bf),
-                         hr_bf, pa_pct, str(pitches), hr_p])
+        # HR Allowed view
+        hr_cols = ["PITCHER", "TEAM", "OPP", "H", "HR", "BF",
+                   "HR:BF%", "Pull Air%", "Pitches", "HR:P%"]
+        hr_hi = {6, 7, 9}
+        hr_data = []
+        for nm, tm, op, h, hr, bf, pit, pa_pct in rows:
+            hr_bf = f"{hr / bf * 100:.1f}%" if bf > 0 else "--"
+            hr_p = f"{hr / pit * 100:.2f}%" if pit > 0 else "--"
+            hr_data.append([nm, tm, op, str(h), str(hr), str(bf),
+                            hr_bf, pa_pct, str(pit), hr_p])
+        hr_data.sort(key=lambda r: int(r[4]) if r[4] != '--' else 0, reverse=True)
 
-        data.sort(key=lambda r: int(r[4]) if r[4] != '--' else 0, reverse=True)
-        return cols, data, hi
+        # Hits Allowed view
+        h_cols = ["PITCHER", "TEAM", "OPP", "H", "HR", "BF",
+                  "H:BF%", "Pull Air%", "Pitches", "H:P%"]
+        h_hi = {6, 7, 9}
+        h_data = []
+        for nm, tm, op, h, hr, bf, pit, pa_pct in rows:
+            h_bf = f"{h / bf * 100:.1f}%" if bf > 0 else "--"
+            h_p = f"{h / pit * 100:.2f}%" if pit > 0 else "--"
+            h_data.append([nm, tm, op, str(h), str(hr), str(bf),
+                           h_bf, pa_pct, str(pit), h_p])
+        h_data.sort(key=lambda r: int(r[3]) if r[3] != '--' else 0, reverse=True)
+
+        return {
+            "hr":   (hr_cols, hr_data, hr_hi, {}),
+            "hits": (h_cols,  h_data,  h_hi,  {}),
+        }
 
     def get_most_recent_game_date(self):
         conn = self.connect()
@@ -878,6 +907,10 @@ class DataManager:
                     'current_batter_hand': g.get('current_batter_hand', ''),
                     'current_pitcher_name': g.get('current_pitcher_name', ''),
                     'current_pitcher_hand': g.get('current_pitcher_hand', ''),
+                    'ondeck_batter_name': g.get('ondeck_batter_name', ''),
+                    'ondeck_batter_hand': g.get('ondeck_batter_hand', ''),
+                    'inhole_batter_name': g.get('inhole_batter_name', ''),
+                    'inhole_batter_hand': g.get('inhole_batter_hand', ''),
                 })
             return out
         except Exception:
@@ -1064,7 +1097,7 @@ class DataManager:
         ds = (date_str or dt.date.today().isoformat()).replace("-", "")
         url = f"https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/scoreboard?dates={ds}"
         try:
-            r = _http.get(url, timeout=10)
+            r = _http.get(url, timeout=TIMEOUT_DEFAULT)
             if r.status_code != 200:
                 return {}
             data = r.json()
@@ -1099,7 +1132,7 @@ class DataManager:
             odds_url = (f"https://sports.core.api.espn.com/v2/sports/baseball/"
                         f"leagues/mlb/events/{eid}/competitions/{eid}/odds")
             try:
-                resp = _http.get(odds_url, timeout=8)
+                resp = _http.get(odds_url, timeout=TIMEOUT_DEFAULT)
                 if resp.status_code != 200:
                     return None
                 od = resp.json()
@@ -1248,33 +1281,31 @@ class DataManager:
                     )
                     crow = cur_calc.fetchone()
                     if crow is not None:
-                        pa = int(crow["plate_appearances"] or 0)
-                        ab = int(crow["at_bats"] or 0)
-                        hits = int(crow["hits"] or 0)
-                        singles = int(crow["singles"] or 0)
-                        doubles = int(crow["doubles"] or 0)
-                        triples = int(crow["triples"] or 0)
-                        hrs = int(crow["home_runs"] or 0)
-                        runs = int(crow["runs"] or 0)
-                        rbi = int(crow["rbis"] or 0)
-                        total_bases = int(crow["total_bases"] or 0)
-                        walks = int(crow["walks"] or 0)
-                        so = int(crow["strikeouts"] or 0)
-                        avg = round(float(crow["avg"]), 3) if crow["avg"] is not None else None
-                        slg = round(float(crow["slg"]), 3) if crow["slg"] is not None else None
-                        obp = round(float(crow["obp"]), 3) if crow["obp"] is not None else None
-                        k_pct = round(float(crow["k_pct"]), 2) if crow["k_pct"] is not None else None
-                        bb_pct = round(float(crow["bb_pct"]), 2) if crow["bb_pct"] is not None else None
-                        barrel_pct = round(float(crow["barrel_pct"]), 3) if crow["barrel_pct"] is not None else None
-                        pull_pct = round(float(crow["pull_pct"]), 3) if crow["pull_pct"] is not None else None
-                        iso = round(float(crow["iso"]), 3) if crow["iso"] is not None else None
-                        avg_la = round(float(crow["avg_launch_angle"]), 1) if crow["avg_launch_angle"] is not None else None
-                        avg_ev = round(float(crow["avg_ev"]), 1) if crow["avg_ev"] is not None else None
-                        max_ev = round(float(crow["max_ev"]), 1) if crow["max_ev"] is not None else None
-                    # only treat calc DB as used when we actually found non-zero calculated batting
-                    # (fall back to raw aggregation for batting when calc PAs are zero)
+                        pa = _si(crow["plate_appearances"])
+                        ab = _si(crow["at_bats"])
+                        hits = _si(crow["hits"])
+                        singles = _si(crow["singles"])
+                        doubles = _si(crow["doubles"])
+                        triples = _si(crow["triples"])
+                        hrs = _si(crow["home_runs"])
+                        runs = _si(crow["runs"])
+                        rbi = _si(crow["rbis"])
+                        total_bases = _si(crow["total_bases"])
+                        walks = _si(crow["walks"])
+                        so = _si(crow["strikeouts"])
+                        avg = round(_sf(crow["avg"]), 3) if crow["avg"] is not None else None
+                        slg = round(_sf(crow["slg"]), 3) if crow["slg"] is not None else None
+                        obp = round(_sf(crow["obp"]), 3) if crow["obp"] is not None else None
+                        k_pct = round(_sf(crow["k_pct"]), 2) if crow["k_pct"] is not None else None
+                        bb_pct = round(_sf(crow["bb_pct"]), 2) if crow["bb_pct"] is not None else None
+                        barrel_pct = round(_sf(crow["barrel_pct"]), 3) if crow["barrel_pct"] is not None else None
+                        pull_pct = round(_sf(crow["pull_pct"]), 3) if crow["pull_pct"] is not None else None
+                        iso = round(_sf(crow["iso"]), 3) if crow["iso"] is not None else None
+                        avg_la = round(_sf(crow["avg_launch_angle"]), 1) if crow["avg_launch_angle"] is not None else None
+                        avg_ev = round(_sf(crow["avg_ev"]), 1) if crow["avg_ev"] is not None else None
+                        max_ev = round(_sf(crow["max_ev"]), 1) if crow["max_ev"] is not None else None
                     try:
-                        if crow is not None and int(crow["plate_appearances"] or 0) > 0:
+                        if crow is not None and _si(crow["plate_appearances"]) > 0:
                             used_calc = True
                     except Exception:
                         used_calc = False
@@ -1340,22 +1371,22 @@ class DataManager:
                     cur.execute(sql, params)
                     r = cur.fetchone()
                     if r:
-                        pa = int(r[0] or 0)
-                        ab = int(r[1] or 0)
-                        hits = int(r[2] or 0)
-                        singles = int(r[3] or 0)
-                        doubles = int(r[4] or 0)
-                        triples = int(r[5] or 0)
-                        hrs = int(r[6] or 0)
-                        runs = int(r[7] or 0)
-                        rbi = int(r[8] or 0)
-                        total_bases = int(r[9] or 0)
-                        walks = int(r[10] or 0)
-                        so = int(r[11] or 0)
-                        barrels = int(r[12] or 0)
-                        barrel_denom = int(r[13] or 0)
-                        pulls = int(r[14] or 0)
-                        pull_denom = int(r[15] or 0)
+                        pa = _si(r[0])
+                        ab = _si(r[1])
+                        hits = _si(r[2])
+                        singles = _si(r[3])
+                        doubles = _si(r[4])
+                        triples = _si(r[5])
+                        hrs = _si(r[6])
+                        runs = _si(r[7])
+                        rbi = _si(r[8])
+                        total_bases = _si(r[9])
+                        walks = _si(r[10])
+                        so = _si(r[11])
+                        barrels = _si(r[12])
+                        barrel_denom = _si(r[13])
+                        pulls = _si(r[14])
+                        pull_denom = _si(r[15])
 
                         avg = round(float(hits) / float(ab), 3) if ab and ab > 0 else None
                         slg = round(float(total_bases) / float(ab), 3) if ab and ab > 0 else None
@@ -1470,6 +1501,305 @@ class DataManager:
 
         return BAT_COLS, BAT_HI, away_rows, home_rows
 
+    # ── Extracted row builders (shared by pitching / baserunning) ────
+
+    def _build_pitcher_row(self, cur, pid, pname, p_throws, season, matchup, window):
+        """Build a single pitcher stats row from calc DB or raw PA fallback."""
+        # Resolve pid from name if missing — check cache first
+        if not pid and pname and pname != 'TBD':
+            cached_pid = _PITCHER_NAME_CACHE.get(pname)
+            if cached_pid:
+                pid = cached_pid
+            else:
+                try:
+                    cur.execute("SELECT pitcher_id FROM plate_appearances WHERE pitcher_name=? LIMIT 1", (pname,))
+                    r = cur.fetchone()
+                    if r and r[0]:
+                        pid = int(r[0])
+                except Exception:
+                    log.exception("_build_pitcher_row")
+        # Single query to resolve name + handedness
+        if pid:
+            cached = _PITCHER_CACHE.get(pid)
+            need_name = True  # always prefer raw DB name
+            need_throws = not p_throws
+            if cached and cached.get('throws'):
+                if not need_throws:
+                    pass
+                else:
+                    p_throws = cached['throws']
+                    need_throws = False
+            if need_name or need_throws:
+                try:
+                    cur.execute(
+                        "SELECT pitcher_name, p_throws FROM plate_appearances "
+                        "WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
+                    r = cur.fetchone()
+                    if r:
+                        if r[0]:
+                            pname = r[0]
+                        if not p_throws and r[1]:
+                            p_throws = r[1]
+                except Exception:
+                    log.exception("_build_pitcher_row")
+                if not pname or pname == 'TBD':
+                    if cached and cached.get('name'):
+                        pname = cached['name']
+        # Update cache with resolved values
+        _cache_pitcher(pid, pname, p_throws)
+
+        display_name = f"{pname} {p_throws}".strip() if p_throws else pname
+        empty = [display_name, "0.0", "0", "0", "", "0", "",
+                 "0", "0", "0", "0", "0", "", "",
+                 "", "", "", "", "", "", "", "", "", "", "", ""]
+
+        if not pid:
+            return empty
+
+        # Try calculated DB
+        conn_calc = self.calc_connect() if season is not None else None
+        if conn_calc:
+            try:
+                cur_calc = conn_calc.cursor()
+                cur_calc.execute("""
+                    SELECT plate_appearances, outs_recorded, innings_pitched,
+                           strikeouts, walks, hits_allowed,
+                           singles_allowed, doubles_allowed, triples_allowed,
+                           home_runs_allowed, earned_runs,
+                           k_pct, bb_pct, era, whiff_pct,
+                           slg_against, hard_pct, xoba_against, babip_against,
+                           whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
+                           avg_velo, top_velo
+                    FROM calculated_pitching_stats
+                    WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
+                """, (season, pid, matchup, window))
+                crow = cur_calc.fetchone()
+                if crow and _si(crow["plate_appearances"]) > 0:
+                    outs = _si(crow["outs_recorded"])
+                    k = _si(crow["strikeouts"])
+                    bb = _si(crow["walks"])
+                    hits = _si(crow["hits_allowed"])
+                    singles = _si(crow["singles_allowed"])
+                    doubles = _si(crow["doubles_allowed"])
+                    triples = _si(crow["triples_allowed"])
+                    hrs = _si(crow["home_runs_allowed"])
+                    k_pct = _sf(crow["k_pct"])
+                    bb_pct = _sf(crow["bb_pct"])
+                    era = _sf(crow["era"])
+                    whiff_pct = _sf(crow["whiff_pct"])
+                    slg_ag = _sf(crow["slg_against"])
+                    hard_p = _sf(crow["hard_pct"])
+                    xoba_ag = _sf(crow["xoba_against"])
+                    babip_ag = _sf(crow["babip_against"])
+                    whip_v = _sf(crow["whip"])
+                    barrel_p = _sf(crow["barrel_pct"])
+                    ld_p = _sf(crow["ld_pct"])
+                    soft_p = _sf(crow["soft_pct"])
+                    contact_p = _sf(crow["contact_pct"])
+                    zone_p = _sf(crow["zone_pct"])
+                    avg_velo_v = _sf(crow["avg_velo"])
+                    top_velo_v = _sf(crow["top_velo"])
+                    fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
+                    return [display_name, _fmt_ip(outs), str(outs), str(k),
+                            _fmt_pct(k_pct), str(bb), _fmt_pct(bb_pct),
+                            str(hits), str(singles), str(doubles), str(triples), str(hrs),
+                            _fmt2(era), _fmt3(whip_v),
+                            _fmt3(xoba_ag), _fmt3(babip_ag), _fmt3(slg_ag), _fmt_pct(zone_p),
+                            _fmt_pct(barrel_p), _fmt_pct(soft_p), _fmt_pct(ld_p), _fmt_pct(hard_p), _fmt_pct(contact_p),
+                            fmt_velo(avg_velo_v), fmt_velo(top_velo_v), _fmt_pct(whiff_pct)]
+            except Exception:
+                log.exception("_build_pitcher_row")
+
+        # Fallback: raw plate_appearances aggregation
+        try:
+            matchup_sql = ''
+            if matchup == 'vs_lefty':
+                matchup_sql = " AND stand = 'L'"
+            elif matchup == 'vs_righty':
+                matchup_sql = " AND stand = 'R'"
+
+            date_sql = ''
+            date_params = []
+            if window and window != 'season':
+                try:
+                    n = int(window.replace('last', ''))
+                except Exception:
+                    n = None
+                if n and season is not None:
+                    cur.execute(
+                        "SELECT DISTINCT game_date FROM plate_appearances WHERE season = ? AND pitcher_id = ? ORDER BY game_date DESC LIMIT ?",
+                        (season, pid, n))
+                    dates = [r[0] for r in cur.fetchall()]
+                    if dates:
+                        date_sql = ' AND game_date IN ({})'.format(','.join('?' for _ in dates))
+                        date_params = dates
+                    else:
+                        return empty
+
+            sql = f"""
+            SELECT
+              COUNT(*) as pa,
+              SUM(CASE WHEN (COALESCE(is_ab,0)=1 AND COALESCE(is_hit,0)=0)
+                         OR COALESCE(is_sac_fly,0)=1
+                         OR COALESCE(is_sac_bunt,0)=1 THEN 1 ELSE 0 END) as outs,
+              SUM(COALESCE(is_strikeout,0)) as k,
+              SUM(COALESCE(is_walk,0)) as bb,
+              SUM(COALESCE(is_hit,0)) as hits,
+              SUM(COALESCE(is_single,0)) as singles,
+              SUM(COALESCE(is_double,0)) as doubles,
+              SUM(COALESCE(is_triple,0)) as triples,
+              SUM(COALESCE(is_home_run,0)) as hrs,
+              SUM(COALESCE(runs,0)) as runs_allowed
+            FROM plate_appearances
+            WHERE season = ? AND pitcher_id = ? {matchup_sql} {date_sql}
+            """
+            params = [season, pid] + date_params
+            cur.execute(sql, params)
+            r = cur.fetchone()
+            if r and _si(r[0]) > 0:
+                pa = _si(r[0])
+                outs = _si(r[1])
+                k = _si(r[2])
+                bb = _si(r[3])
+                hits = _si(r[4])
+                singles = _si(r[5])
+                doubles = _si(r[6])
+                triples = _si(r[7])
+                hrs = _si(r[8])
+                runs = _si(r[9])
+                innings = outs / 3.0
+                k_pct = round(k / pa, 2) if pa > 0 else None
+                bb_pct = round(bb / pa, 2) if pa > 0 else None
+                era = round(runs / innings * 9.0, 2) if innings > 0 else None
+                # Compute SLG/BABIP from raw counts (Hard%/xOBA unavailable without Statcast)
+                _ab = pa - bb
+                _tb = singles + 2 * doubles + 3 * triples + 4 * hrs
+                _slg = round(_tb / _ab, 3) if _ab > 0 else None
+                _babip_d = _ab - k - hrs
+                _babip = round((hits - hrs) / _babip_d, 3) if _babip_d > 0 else None
+                _whip = round((bb + hits) / innings, 3) if innings > 0 else None
+                return [display_name, _fmt_ip(outs), str(outs), str(k),
+                        _fmt_pct(k_pct), str(bb), _fmt_pct(bb_pct),
+                        str(hits), str(singles), str(doubles), str(triples), str(hrs),
+                        _fmt2(era), _fmt3(_whip),
+                        "", _fmt3(_babip), _fmt3(_slg), "",
+                        "", "", "", "", "", "", "", ""]
+        except Exception:
+            log.exception("_build_pitcher_row")
+
+        return empty
+
+    def _build_pitcher_br_row(self, cur, pid, pname, p_throws, season, matchup, window):
+        """Build a pitcher baserunning row."""
+        if pid:
+            try:
+                cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
+                r = cur.fetchone()
+                if r and r[0]:
+                    pname = r[0]
+            except Exception:
+                pass
+        display_name = f"{pname} {p_throws}".strip() if p_throws else pname
+        empty = [display_name, "0", "0", "0", ""]
+        if not pid:
+            return empty
+        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc:
+            try:
+                cur_calc = conn_calc.cursor()
+                cur_calc.execute("""
+                    SELECT sb_attempts_against, pickoffs, sb_allowed, sb_allowed_avg
+                    FROM calculated_pitcher_baserunning_stats
+                    WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
+                """, (season, pid, matchup, window))
+                crow = cur_calc.fetchone()
+                if crow:
+                    att = _si(crow["sb_attempts_against"])
+                    pk = _si(crow["pickoffs"])
+                    sb = _si(crow["sb_allowed"])
+                    sb_avg = _sf(crow["sb_allowed_avg"])
+                    return [display_name, str(att), str(pk), str(sb), _fmt_pct(sb_avg)]
+            except Exception:
+                log.exception("_build_pitcher_br_row")
+        return empty
+
+    def _build_catcher_br_row(self, pid, pname, season, matchup, window):
+        """Build a catcher baserunning row."""
+        empty = [pname or '', "0", "0", "0", ""]
+        if not pid:
+            return empty
+        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc:
+            try:
+                cur_calc = conn_calc.cursor()
+                cur_calc.execute("""
+                    SELECT sb_attempts_against, caught_stealing, sb_allowed, sb_allowed_avg
+                    FROM calculated_catcher_baserunning_stats
+                    WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
+                """, (season, pid, matchup, window))
+                crow = cur_calc.fetchone()
+                if crow:
+                    att = _si(crow["sb_attempts_against"])
+                    cs = _si(crow["caught_stealing"])
+                    sb = _si(crow["sb_allowed"])
+                    sb_avg = _sf(crow["sb_allowed_avg"])
+                    return [pname or '', str(att), str(cs), str(sb), _fmt_pct(sb_avg)]
+            except Exception:
+                log.exception("_build_catcher_br_row")
+        return empty
+
+    def _build_runner_br_row(self, pid, pos, name, hand, season, matchup, window):
+        """Build a runner baserunning row."""
+        display_name = f"{name} {hand}".strip() if hand else name
+        empty = [pos, display_name, "", "0", "0", "0", "0", "", "0", "0", ""]
+        if not pid:
+            return empty
+        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc:
+            try:
+                cur_calc = conn_calc.cursor()
+                cur_calc.execute("""
+                    SELECT steal_attempts, stolen_bases, caught_stealing, pickoffs,
+                           stole_2b, stole_3b, obp,
+                           sprint_speed, bolts, competitive_runs, bolt_pct
+                    FROM calculated_baserunning_stats
+                    WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
+                """, (season, pid, matchup, window))
+                crow = cur_calc.fetchone()
+                if crow:
+                    att = _si(crow["steal_attempts"])
+                    sb = _si(crow["stolen_bases"])
+                    s2b = _si(crow["stole_2b"])
+                    s3b = _si(crow["stole_3b"])
+                    obp = _sf(crow["obp"])
+                    sprint = crow["sprint_speed"]
+                    bolts = _si(crow["bolts"])
+                    comp_runs = _si(crow["competitive_runs"])
+                    bolt_pct = _sf(crow["bolt_pct"])
+                    sprint_str = f"{sprint:.1f}" if sprint is not None else ""
+                    return [pos, display_name, _fmt3(obp), str(att), str(sb),
+                            str(s2b), str(s3b), sprint_str, str(bolts),
+                            str(comp_runs), _fmt_pct(bolt_pct)]
+            except Exception:
+                log.exception("_build_runner_br_row")
+
+        # Fallback: try to get OBP from batting stats calc DB
+        obp_str = ""
+        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc:
+            try:
+                cur_calc = conn_calc.cursor()
+                cur_calc.execute("""
+                    SELECT obp FROM calculated_batting_stats
+                    WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
+                """, (season, pid, matchup, window))
+                brow = cur_calc.fetchone()
+                if brow and brow["obp"] is not None:
+                    obp_str = _fmt3(float(brow["obp"]))
+            except Exception:
+                log.exception("_build_runner_br_row")
+        return [pos, display_name, obp_str, "0", "0", "0", "0", "", "0", "0", ""]
+
     def get_game_pitching(self, game_id, season=None, matchup=None, window=None,
                           away_starter=None, home_starter=None,
                           away_pitchers=None, home_pitchers=None):
@@ -1501,204 +1831,6 @@ class DataManager:
             eff_season = dt.date.today().year
         eff_matchup = matchup or 'all'
         eff_window = window or 'season'
-
-        def _fmt_ip(outs):
-            """Format outs recorded as conventional IP (e.g. 18 outs → 6.0)."""
-            if outs is None or outs == 0:
-                return "0.0"
-            full = outs // 3
-            remainder = outs % 3
-            return f"{full}.{remainder}"
-
-        fmt2 = _fmt2; fmt3 = _fmt3; fmt_pct = _fmt_pct; fmt_era = _fmt_era
-
-        def _build_pitcher_row(pid, pname, p_throws):
-            # Resolve pid from name if missing — check cache first
-            if not pid and pname and pname != 'TBD':
-                cached_pid = _PITCHER_NAME_CACHE.get(pname)
-                if cached_pid:
-                    pid = cached_pid
-                else:
-                    try:
-                        cur.execute("SELECT pitcher_id FROM plate_appearances WHERE pitcher_name=? LIMIT 1", (pname,))
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            pid = int(r[0])
-                    except Exception:
-                        log.exception("_build_pitcher_row")
-            # Resolve handedness from cache, then DB
-            if not p_throws and pid:
-                cached = _PITCHER_CACHE.get(pid)
-                if cached and cached.get('throws'):
-                    p_throws = cached['throws']
-                else:
-                    try:
-                        cur.execute("SELECT p_throws FROM plate_appearances WHERE pitcher_id=? AND p_throws IS NOT NULL LIMIT 1", (pid,))
-                        r = cur.fetchone()
-                        if r and r[0]:
-                            p_throws = r[0]
-                    except Exception:
-                        log.exception("_build_pitcher_row")
-            # Resolve full name — always prefer raw DB (has full names)
-            # over cache (may have initial-format from schedule data)
-            if pid:
-                db_name = None
-                try:
-                    cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
-                    r = cur.fetchone()
-                    if r and r[0]:
-                        db_name = r[0]
-                except Exception:
-                    pass
-                if db_name:
-                    pname = db_name
-                else:
-                    cached = _PITCHER_CACHE.get(pid)
-                    if cached and cached.get('name'):
-                        pname = cached['name']
-            # Update cache with resolved values
-            _cache_pitcher(pid, pname, p_throws)
-
-            display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-            empty = [display_name, "0.0", "0", "0", "", "0", "",
-                     "0", "0", "0", "0", "0", "", "",
-                     "", "", "", "", "", "", "", "", "", "", "", ""]
-
-            if not pid:
-                return empty
-
-            # Try calculated DB
-            conn_calc = self.calc_connect() if eff_season is not None else None
-            if conn_calc:
-                try:
-                    cur_calc = conn_calc.cursor()
-                    cur_calc.execute("""
-                        SELECT plate_appearances, outs_recorded, innings_pitched,
-                               strikeouts, walks, hits_allowed,
-                               singles_allowed, doubles_allowed, triples_allowed,
-                               home_runs_allowed, earned_runs,
-                               k_pct, bb_pct, era, whiff_pct,
-                               slg_against, hard_pct, xoba_against, babip_against,
-                               whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-                               avg_velo, top_velo
-                        FROM calculated_pitching_stats
-                        WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
-                    """, (eff_season, pid, eff_matchup, eff_window))
-                    crow = cur_calc.fetchone()
-                    if crow and int(crow["plate_appearances"] or 0) > 0:
-                        outs = int(crow["outs_recorded"] or 0)
-                        k = int(crow["strikeouts"] or 0)
-                        bb = int(crow["walks"] or 0)
-                        hits = int(crow["hits_allowed"] or 0)
-                        singles = int(crow["singles_allowed"] or 0)
-                        doubles = int(crow["doubles_allowed"] or 0)
-                        triples = int(crow["triples_allowed"] or 0)
-                        hrs = int(crow["home_runs_allowed"] or 0)
-                        k_pct = float(crow["k_pct"]) if crow["k_pct"] is not None else None
-                        bb_pct = float(crow["bb_pct"]) if crow["bb_pct"] is not None else None
-                        era = float(crow["era"]) if crow["era"] is not None else None
-                        whiff_pct = float(crow["whiff_pct"]) if crow["whiff_pct"] is not None else None
-                        slg_ag = float(crow["slg_against"]) if crow["slg_against"] is not None else None
-                        hard_p = float(crow["hard_pct"]) if crow["hard_pct"] is not None else None
-                        xoba_ag = float(crow["xoba_against"]) if crow["xoba_against"] is not None else None
-                        babip_ag = float(crow["babip_against"]) if crow["babip_against"] is not None else None
-                        whip_v = float(crow["whip"]) if crow["whip"] is not None else None
-                        barrel_p = float(crow["barrel_pct"]) if crow["barrel_pct"] is not None else None
-                        ld_p = float(crow["ld_pct"]) if crow["ld_pct"] is not None else None
-                        soft_p = float(crow["soft_pct"]) if crow["soft_pct"] is not None else None
-                        contact_p = float(crow["contact_pct"]) if crow["contact_pct"] is not None else None
-                        zone_p = float(crow["zone_pct"]) if crow["zone_pct"] is not None else None
-                        avg_velo_v = float(crow["avg_velo"]) if crow["avg_velo"] is not None else None
-                        top_velo_v = float(crow["top_velo"]) if crow["top_velo"] is not None else None
-                        fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
-                        return [display_name, _fmt_ip(outs), str(outs), str(k),
-                                fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
-                                str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                                fmt_era(era), fmt3(whip_v),
-                                fmt3(xoba_ag), fmt3(babip_ag), fmt3(slg_ag), fmt_pct(zone_p),
-                                fmt_pct(barrel_p), fmt_pct(soft_p), fmt_pct(ld_p), fmt_pct(hard_p), fmt_pct(contact_p),
-                                fmt_velo(avg_velo_v), fmt_velo(top_velo_v), fmt_pct(whiff_pct)]
-                except Exception:
-                    log.exception("_build_pitcher_row")
-
-            # Fallback: raw plate_appearances aggregation
-            try:
-                matchup_sql = ''
-                if eff_matchup == 'vs_lefty':
-                    matchup_sql = " AND stand = 'L'"
-                elif eff_matchup == 'vs_righty':
-                    matchup_sql = " AND stand = 'R'"
-
-                date_sql = ''
-                date_params = []
-                if eff_window and eff_window != 'season':
-                    try:
-                        n = int(eff_window.replace('last', ''))
-                    except Exception:
-                        n = None
-                    if n and eff_season is not None:
-                        cur.execute(
-                            "SELECT DISTINCT game_date FROM plate_appearances WHERE season = ? AND pitcher_id = ? ORDER BY game_date DESC LIMIT ?",
-                            (eff_season, pid, n))
-                        dates = [r[0] for r in cur.fetchall()]
-                        if dates:
-                            date_sql = ' AND game_date IN ({})'.format(','.join('?' for _ in dates))
-                            date_params = dates
-                        else:
-                            return empty
-
-                sql = f"""
-                SELECT
-                  COUNT(*) as pa,
-                  SUM(CASE WHEN (COALESCE(is_ab,0)=1 AND COALESCE(is_hit,0)=0)
-                             OR COALESCE(is_sac_fly,0)=1
-                             OR COALESCE(is_sac_bunt,0)=1 THEN 1 ELSE 0 END) as outs,
-                  SUM(COALESCE(is_strikeout,0)) as k,
-                  SUM(COALESCE(is_walk,0)) as bb,
-                  SUM(COALESCE(is_hit,0)) as hits,
-                  SUM(COALESCE(is_single,0)) as singles,
-                  SUM(COALESCE(is_double,0)) as doubles,
-                  SUM(COALESCE(is_triple,0)) as triples,
-                  SUM(COALESCE(is_home_run,0)) as hrs,
-                  SUM(COALESCE(runs,0)) as runs_allowed
-                FROM plate_appearances
-                WHERE season = ? AND pitcher_id = ? {matchup_sql} {date_sql}
-                """
-                params = [eff_season, pid] + date_params
-                cur.execute(sql, params)
-                r = cur.fetchone()
-                if r and int(r[0] or 0) > 0:
-                    pa = int(r[0])
-                    outs = int(r[1] or 0)
-                    k = int(r[2] or 0)
-                    bb = int(r[3] or 0)
-                    hits = int(r[4] or 0)
-                    singles = int(r[5] or 0)
-                    doubles = int(r[6] or 0)
-                    triples = int(r[7] or 0)
-                    hrs = int(r[8] or 0)
-                    runs = int(r[9] or 0)
-                    innings = outs / 3.0
-                    k_pct = round(k / pa, 2) if pa > 0 else None
-                    bb_pct = round(bb / pa, 2) if pa > 0 else None
-                    era = round(runs / innings * 9.0, 2) if innings > 0 else None
-                    # Compute SLG/BABIP from raw counts (Hard%/xOBA unavailable without Statcast)
-                    _ab = pa - bb
-                    _tb = singles + 2 * doubles + 3 * triples + 4 * hrs
-                    _slg = round(_tb / _ab, 3) if _ab > 0 else None
-                    _babip_d = _ab - k - hrs
-                    _babip = round((hits - hrs) / _babip_d, 3) if _babip_d > 0 else None
-                    _whip = round((bb + hits) / innings, 3) if innings > 0 else None
-                    return [display_name, _fmt_ip(outs), str(outs), str(k),
-                            fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
-                            str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                            fmt_era(era), fmt3(_whip),
-                            "", fmt3(_babip), fmt3(_slg), "",
-                            "", "", "", "", "", "", "", ""]
-            except Exception:
-                log.exception("module_level")
-
-            return empty
 
         def _get_pitcher_teams(game_id):
             """Return (home_pids, away_pids, pitcher_info) by checking the
@@ -1741,9 +1873,11 @@ class DataManager:
 
         # ── Bullpen / multi-pitcher mode ──
         if away_pitchers is not None or home_pitchers is not None:
-            away_rows = [_build_pitcher_row(p.get('id'), p.get('name', 'TBD'), p.get('throws', ''))
+            away_rows = [self._build_pitcher_row(cur, p.get('id'), p.get('name', 'TBD'), p.get('throws', ''),
+                                                 eff_season, eff_matchup, eff_window)
                          for p in (away_pitchers or [])]
-            home_rows = [_build_pitcher_row(p.get('id'), p.get('name', 'TBD'), p.get('throws', ''))
+            home_rows = [self._build_pitcher_row(cur, p.get('id'), p.get('name', 'TBD'), p.get('throws', ''),
+                                                 eff_season, eff_matchup, eff_window)
                          for p in (home_pitchers or [])]
             if not away_rows and not home_rows:
                 return None
@@ -1758,7 +1892,7 @@ class DataManager:
                 return []
             pid = sorted_pids[0]
             pname, p_throws, _ = info.get(pid, ('', '', 0))
-            return [_build_pitcher_row(pid, pname, p_throws)]
+            return [self._build_pitcher_row(cur, pid, pname, p_throws, eff_season, eff_matchup, eff_window)]
 
         away_rows = _build_side(away_pids, pitcher_info)
         home_rows = _build_side(home_pids, pitcher_info)
@@ -1768,12 +1902,12 @@ class DataManager:
             pid = away_starter.get('id')
             pname = away_starter.get('name', 'TBD')
             pt = away_starter.get('throws', '')
-            away_rows = [_build_pitcher_row(pid, pname, pt)]
+            away_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window)]
         if not home_rows and home_starter:
             pid = home_starter.get('id')
             pname = home_starter.get('name', 'TBD')
             pt = home_starter.get('throws', '')
-            home_rows = [_build_pitcher_row(pid, pname, pt)]
+            home_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window)]
 
         if not away_rows and not home_rows:
             return None
@@ -1791,7 +1925,7 @@ class DataManager:
             return None
         try:
             url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
-            resp = _http.get(url, timeout=10)
+            resp = _http.get(url, timeout=TIMEOUT_DEFAULT)
             resp.raise_for_status()
             box = resp.json()
         except Exception:
@@ -1851,132 +1985,18 @@ class DataManager:
         eff_matchup = matchup or 'all'
         eff_window = window or 'season'
 
-        fmt3 = _fmt3
-        fmt_pct = _fmt_pct
-
-        calc_ok = eff_season is not None and os.path.exists(self.calc_db_path)
-
         # ── Pitcher baserunning ──────────────────────────────────────────
         PIT_BR_COLS = ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%"]
         PIT_BR_HI = set()
-
-        def _build_pitcher_br_row(pid, pname, p_throws):
-            # Resolve full name from DB (API may pass abbreviated "F. Last")
-            if pid:
-                try:
-                    cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
-                    r = cur.fetchone()
-                    if r and r[0]:
-                        pname = r[0]
-                except Exception:
-                    pass
-            display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-            empty = [display_name, "0", "0", "0", ""]
-            if not pid:
-                return empty
-            conn_calc = self.calc_connect() if calc_ok else None
-            if conn_calc:
-                try:
-                    cur_calc = conn_calc.cursor()
-                    cur_calc.execute("""
-                        SELECT sb_attempts_against, pickoffs, sb_allowed, sb_allowed_avg
-                        FROM calculated_pitcher_baserunning_stats
-                        WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
-                    """, (eff_season, pid, eff_matchup, eff_window))
-                    crow = cur_calc.fetchone()
-                    if crow:
-                        att = int(crow["sb_attempts_against"] or 0)
-                        pk = int(crow["pickoffs"] or 0)
-                        sb = int(crow["sb_allowed"] or 0)
-                        sb_avg = float(crow["sb_allowed_avg"]) if crow["sb_allowed_avg"] is not None else None
-                        return [display_name, str(att), str(pk), str(sb), fmt_pct(sb_avg)]
-                except Exception:
-                    log.exception("_build_pitcher_br_row")
-            return empty
 
         # ── Catcher baserunning ──────────────────────────────────────────
         CAT_BR_COLS = ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%"]
         CAT_BR_HI = set()
 
-        def _build_catcher_br_row(pid, pname):
-            empty = [pname or '', "0", "0", "0", ""]
-            if not pid:
-                return empty
-            conn_calc = self.calc_connect() if calc_ok else None
-            if conn_calc:
-                try:
-                    cur_calc = conn_calc.cursor()
-                    cur_calc.execute("""
-                        SELECT sb_attempts_against, caught_stealing, sb_allowed, sb_allowed_avg
-                        FROM calculated_catcher_baserunning_stats
-                        WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
-                    """, (eff_season, pid, eff_matchup, eff_window))
-                    crow = cur_calc.fetchone()
-                    if crow:
-                        att = int(crow["sb_attempts_against"] or 0)
-                        cs = int(crow["caught_stealing"] or 0)
-                        sb = int(crow["sb_allowed"] or 0)
-                        sb_avg = float(crow["sb_allowed_avg"]) if crow["sb_allowed_avg"] is not None else None
-                        return [pname or '', str(att), str(cs), str(sb), fmt_pct(sb_avg)]
-                except Exception:
-                    log.exception("_build_catcher_br_row")
-            return empty
-
         # ── Runner baserunning (lineup) ──────────────────────────────────
         BR_COLS = ["POS", "PLAYER", "OBP", "SB Att", "SB", "Stole 2nd",
                    "Stole 3rd", "Sprint", "Bolts", "Comp Runs", "Bolt%"]
         BR_HI = {2}  # OBP
-
-        def _build_runner_br_row(pid, pos, name, hand):
-            display_name = f"{name} {hand}".strip() if hand else name
-            empty = [pos, display_name, "", "0", "0", "0", "0", "", "0", "0", ""]
-            if not pid:
-                return empty
-            conn_calc = self.calc_connect() if calc_ok else None
-            if conn_calc:
-                try:
-                    cur_calc = conn_calc.cursor()
-                    cur_calc.execute("""
-                        SELECT steal_attempts, stolen_bases, caught_stealing, pickoffs,
-                               stole_2b, stole_3b, obp,
-                               sprint_speed, bolts, competitive_runs, bolt_pct
-                        FROM calculated_baserunning_stats
-                        WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
-                    """, (eff_season, pid, eff_matchup, eff_window))
-                    crow = cur_calc.fetchone()
-                    if crow:
-                        att = int(crow["steal_attempts"] or 0)
-                        sb = int(crow["stolen_bases"] or 0)
-                        s2b = int(crow["stole_2b"] or 0)
-                        s3b = int(crow["stole_3b"] or 0)
-                        obp = float(crow["obp"]) if crow["obp"] is not None else None
-                        sprint = crow["sprint_speed"]
-                        bolts = int(crow["bolts"] or 0)
-                        comp_runs = int(crow["competitive_runs"] or 0)
-                        bolt_pct = float(crow["bolt_pct"]) if crow["bolt_pct"] is not None else None
-                        sprint_str = f"{sprint:.1f}" if sprint is not None else ""
-                        return [pos, display_name, fmt3(obp), str(att), str(sb),
-                                str(s2b), str(s3b), sprint_str, str(bolts),
-                                str(comp_runs), fmt_pct(bolt_pct)]
-                except Exception:
-                    log.exception("_build_runner_br_row")
-
-            # Fallback: try to get OBP from batting stats calc DB
-            obp_str = ""
-            conn_calc = self.calc_connect() if calc_ok else None
-            if conn_calc:
-                try:
-                    cur_calc = conn_calc.cursor()
-                    cur_calc.execute("""
-                        SELECT obp FROM calculated_batting_stats
-                        WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
-                    """, (eff_season, pid, eff_matchup, eff_window))
-                    brow = cur_calc.fetchone()
-                    if brow and brow["obp"] is not None:
-                        obp_str = fmt3(float(brow["obp"]))
-                except Exception:
-                    log.exception("_build_runner_br_row")
-            return [pos, display_name, obp_str, "0", "0", "0", "0", "", "0", "0", ""]
 
         # ── Identify starters and lineup for each side ───────────────────
         # Load lineup from cache
@@ -2011,15 +2031,17 @@ class DataManager:
                         pit_throws = r[0]
                 except Exception:
                     log.exception("_build_side")
-            pit_row = [_build_pitcher_br_row(pit_pid, pit_name, pit_throws)]
+            pit_row = [self._build_pitcher_br_row(cur, pit_pid, pit_name, pit_throws,
+                                                    eff_season, eff_matchup, eff_window)]
 
             # Collect ALL catchers from the roster (shows multiple when
             # lineup isn't confirmed yet; narrows to one once it is).
             cat_rows = []
             for p in lineup_list:
                 if p.get('pos', '').upper() == 'C':
-                    cat_rows.append(_build_catcher_br_row(
-                        p.get('player_id'), p.get('name', '')))
+                    cat_rows.append(self._build_catcher_br_row(
+                        p.get('player_id'), p.get('name', ''),
+                        eff_season, eff_matchup, eff_window))
             # Fallback: look up from DB
             if not cat_rows:
                 try:
@@ -2031,14 +2053,16 @@ class DataManager:
                     """, (game_id, fielding_flag))
                     r = cur.fetchone()
                     if r:
-                        cat_rows.append(_build_catcher_br_row(r[0], r[1] or ''))
+                        cat_rows.append(self._build_catcher_br_row(
+                            r[0], r[1] or '', eff_season, eff_matchup, eff_window))
                 except Exception:
                     log.exception("_build_side")
 
             # Lineup rows
             if lineup_list:
-                br_rows = [_build_runner_br_row(
-                    p.get('player_id'), p.get('pos', ''), p.get('name', ''), p.get('hand', '')
+                br_rows = [self._build_runner_br_row(
+                    p.get('player_id'), p.get('pos', ''), p.get('name', ''), p.get('hand', ''),
+                    eff_season, eff_matchup, eff_window
                 ) for p in lineup_list]
             else:
                 # Fallback: build from PAs in the game
@@ -2051,7 +2075,8 @@ class DataManager:
                           AND UPPER(COALESCE(position, '')) != 'P'
                         GROUP BY batter_id ORDER BY MIN(at_bat_number) ASC
                     """, (game_id, flag))
-                    br_rows = [_build_runner_br_row(r[0], r[2] or '', r[1] or '', r[3] or '')
+                    br_rows = [self._build_runner_br_row(r[0], r[2] or '', r[1] or '', r[3] or '',
+                                                         eff_season, eff_matchup, eff_window)
                                for r in cur.fetchall()]
                 except Exception:
                     br_rows = []
@@ -2089,14 +2114,7 @@ class DataManager:
             return None
         cur = conn.cursor()
 
-        fmt3 = _fmt3; fmt1 = _fmt1; fmt_pct = _fmt_pct; fmt_deg = _fmt_deg; fmt_era = _fmt_era
-
-        def _fmt_ip(outs):
-            if outs is None or outs == 0:
-                return "0.0"
-            full = outs // 3
-            remainder = outs % 3
-            return f"{full}.{remainder}"
+        fmt3 = _fmt3; fmt1 = _fmt1; fmt_pct = _fmt_pct; fmt_deg = _fmt_deg
 
         # Load lineup to get player IDs
         cache_file = os.path.join(self.cache_dir, f"{game_id}.json")
@@ -2199,32 +2217,32 @@ class DataManager:
                 params = [pid] + list(batter_ids) + date_params
                 cur.execute(sql, params)
                 r = cur.fetchone()
-                if r and int(r[0] or 0) > 0:
-                    pa = int(r[0])
-                    outs = int(r[1] or 0)
-                    k = int(r[2] or 0)
-                    bb = int(r[3] or 0)
-                    hits = int(r[4] or 0)
-                    singles = int(r[5] or 0)
-                    doubles = int(r[6] or 0)
-                    triples = int(r[7] or 0)
-                    hrs = int(r[8] or 0)
-                    er = int(r[9] or 0)
-                    whiffs = int(r[10] or 0)
-                    swings = int(r[11] or 0)
-                    ab = int(r[12] or 0)
-                    tb = int(r[13] or 0)
-                    sf = int(r[14] or 0)
-                    xwoba = float(r[15]) if r[15] is not None else None
-                    bip = int(r[16] or 0)
-                    hard_ct = int(r[17] or 0)
-                    soft_ct = int(r[18] or 0)
-                    ld_ct = int(r[19] or 0)
-                    barrel_ct = int(r[20] or 0)
-                    in_zone = int(r[21] or 0)
-                    total_pitches_z = int(r[22] or 0)
-                    avg_velo = float(r[23]) if r[23] is not None else None
-                    top_velo = float(r[24]) if r[24] is not None else None
+                if r and _si(r[0]) > 0:
+                    pa = _si(r[0])
+                    outs = _si(r[1])
+                    k = _si(r[2])
+                    bb = _si(r[3])
+                    hits = _si(r[4])
+                    singles = _si(r[5])
+                    doubles = _si(r[6])
+                    triples = _si(r[7])
+                    hrs = _si(r[8])
+                    er = _si(r[9])
+                    whiffs = _si(r[10])
+                    swings = _si(r[11])
+                    ab = _si(r[12])
+                    tb = _si(r[13])
+                    sf = _si(r[14])
+                    xwoba = _sf(r[15])
+                    bip = _si(r[16])
+                    hard_ct = _si(r[17])
+                    soft_ct = _si(r[18])
+                    ld_ct = _si(r[19])
+                    barrel_ct = _si(r[20])
+                    in_zone = _si(r[21])
+                    total_pitches_z = _si(r[22])
+                    avg_velo = _sf(r[23])
+                    top_velo = _sf(r[24])
                     innings = outs / 3.0
                     k_pct = round(k / pa, 2) if pa > 0 else None
                     bb_pct = round(bb / pa, 2) if pa > 0 else None
@@ -2244,7 +2262,7 @@ class DataManager:
                     return [display_name, _fmt_ip(outs), str(outs), str(k),
                             fmt_pct(k_pct), str(bb), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                            fmt_era(era), fmt3(whip),
+                            _fmt2(era), fmt3(whip),
                             fmt3(xwoba), fmt3(babip), fmt3(slg), fmt_pct(zone_pct),
                             fmt_pct(barrel_pct), fmt_pct(soft_pct), fmt_pct(ld_pct), fmt_pct(hard_pct), fmt_pct(contact_pct),
                             fmt_velo(avg_velo), fmt_velo(top_velo), fmt_pct(whiff_pct)]
@@ -2293,23 +2311,23 @@ class DataManager:
                 params = [pid, pitcher_id] + date_params
                 cur.execute(sql, params)
                 r = cur.fetchone()
-                if r and int(r[0] or 0) > 0:
-                    pa = int(r[0])
-                    ab = int(r[1] or 0)
-                    hits = int(r[2] or 0)
-                    singles = int(r[3] or 0)
-                    doubles = int(r[4] or 0)
-                    triples = int(r[5] or 0)
-                    hrs = int(r[6] or 0)
-                    runs = int(r[7] or 0)
-                    rbi = int(r[8] or 0)
-                    total_bases = int(r[9] or 0)
-                    walks = int(r[10] or 0)
-                    so = int(r[11] or 0)
-                    barrels = int(r[12] or 0)
-                    barrel_denom = int(r[13] or 0)
-                    pulls = int(r[14] or 0)
-                    pull_denom = int(r[15] or 0)
+                if r and _si(r[0]) > 0:
+                    pa = _si(r[0])
+                    ab = _si(r[1])
+                    hits = _si(r[2])
+                    singles = _si(r[3])
+                    doubles = _si(r[4])
+                    triples = _si(r[5])
+                    hrs = _si(r[6])
+                    runs = _si(r[7])
+                    rbi = _si(r[8])
+                    total_bases = _si(r[9])
+                    walks = _si(r[10])
+                    so = _si(r[11])
+                    barrels = _si(r[12])
+                    barrel_denom = _si(r[13])
+                    pulls = _si(r[14])
+                    pull_denom = _si(r[15])
 
                     avg = round(float(hits) / float(ab), 3) if ab > 0 else None
                     slg = round(float(total_bases) / float(ab), 3) if ab > 0 else None
@@ -2373,9 +2391,9 @@ class DataManager:
                 cur.execute(sql, params)
                 r = cur.fetchone()
                 if r:
-                    att = int(r[3] or 0)
-                    pk = int(r[1] or 0)
-                    sb = int(r[2] or 0)
+                    att = _si(r[3])
+                    pk = _si(r[1])
+                    sb = _si(r[2])
                     sb_pct = round(sb / att, 2) if att > 0 else None
                     return [display_name, str(att), str(pk), str(sb), fmt_pct(sb_pct)]
             except Exception:
@@ -2404,9 +2422,9 @@ class DataManager:
                 cur.execute(sql, params)
                 r = cur.fetchone()
                 if r:
-                    att = int(r[0] or 0)
-                    cs = int(r[1] or 0)
-                    sb = int(r[2] or 0)
+                    att = _si(r[0])
+                    cs = _si(r[1])
+                    sb = _si(r[2])
                     sb_pct = round(sb / att, 2) if att > 0 else None
                     return [cname or '', str(att), str(cs), str(sb), fmt_pct(sb_pct)]
             except Exception:
@@ -2447,13 +2465,13 @@ class DataManager:
                 cur.execute(sql, params)
                 r = cur.fetchone()
                 if r:
-                    att = int(r[0] or 0)
-                    sb = int(r[1] or 0)
-                    cs = int(r[2] or 0)
-                    s2b = int(r[3] or 0)
-                    s3b = int(r[4] or 0)
+                    att = _si(r[0])
+                    sb = _si(r[1])
+                    cs = _si(r[2])
+                    s2b = _si(r[3])
+                    s3b = _si(r[4])
                     sprint = round(float(r[5]), 1) if r[5] is not None else None
-                    bolts = int(r[6] or 0)
+                    bolts = _si(r[6])
                     sprint_str = f"{sprint:.1f}" if sprint is not None else ""
                     return [pos, display_name, str(att), str(sb), str(cs),
                             str(s2b), str(s3b), sprint_str, str(bolts)]
@@ -2679,23 +2697,7 @@ def _game_baserunning(away, home):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Widget helpers
 # ═══════════════════════════════════════════════════════════════════════════════
-_label_style_cache = {}
-
-def mk_label(text, color=None, size=10, bold=False, mono=False, align=None):
-    lbl = QLabel(text)
-    lbl.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-    key = (color or C['t1'], size, bold)
-    ss = _label_style_cache.get(key)
-    if ss is None:
-        fam = "Segoe UI"
-        w = "700" if bold else "400"
-        ss = (f"color:{key[0]}; background:transparent;"
-              f"font-family:'{fam}'; font-size:{size}px; font-weight:{w};")
-        _label_style_cache[key] = ss
-    lbl.setStyleSheet(ss)
-    if align:
-        lbl.setAlignment(align)
-    return lbl
+from _ui_utils import mk_label  # shared label factory (style-cached)
  
  
 def mk_hline():
@@ -2793,9 +2795,11 @@ class SmoothScrollArea(QScrollArea):
 # StatsTable
 # ═══════════════════════════════════════════════════════════════════════════════
 class StatsTable(QTableWidget):
-    def __init__(self, cols, data, hi_cols=None, name_col_wide=180, parent=None):
+    def __init__(self, cols, data, hi_cols=None, name_col_wide=180, grade_map=None,
+                 parent=None):
         super().__init__(parent)
         self._hi = hi_cols or set()
+        self._grade_map = grade_map or {}   # col_idx → "high_bad" | "high_good"
         self._hovered = -1
         self._cols = cols
         self._data = [list(row) for row in data]  # keep original data for sorting
@@ -2876,6 +2880,25 @@ class StatsTable(QTableWidget):
         total_h = header_h + (len(data) * ROW_H) + 2  # +2 for border
         self.setFixedHeight(total_h)
 
+    @staticmethod
+    def _parse_numeric(val):
+        """Extract a float from a display string like '25.9%' or '172'."""
+        s = str(val).strip().rstrip('%')
+        try:
+            return float(s)
+        except (ValueError, TypeError):
+            return None
+
+    def _compute_grade_ranges(self, data):
+        """Return {col_idx: (min_val, max_val)} for graded columns."""
+        ranges = {}
+        for ci in self._grade_map:
+            vals = [self._parse_numeric(row[ci]) for row in data if ci < len(row)]
+            vals = [v for v in vals if v is not None]
+            if vals:
+                ranges[ci] = (min(vals), max(vals))
+        return ranges
+
     def _populate_rows(self, data, cols):
         _name_col = -1
         for _nc in ("PLAYER", "PITCHER", "CATCHER"):
@@ -2893,6 +2916,7 @@ class StatsTable(QTableWidget):
         _cell_font = QFont("Segoe UI", 11)
         _cell_font.setPixelSize(11)
         _cell_font.setWeight(QFont.Weight.Bold)
+        _grade_ranges = self._compute_grade_ranges(data) if self._grade_map else {}
         self.setRowCount(len(data))
         for r, row in enumerate(data):
             self.setRowHeight(r, ROW_H)
@@ -2927,14 +2951,38 @@ class StatsTable(QTableWidget):
                 if _is_empty:
                     item.setForeground(_qc_t3)
                 else:
-                    # Grade stat against MLB average → green / red / default
-                    grade = grade_stat(_col_name, _sval, pitching=_is_pitching) if _col_name else None
-                    if grade == "above":
-                        item.setForeground(_qc_grn)
-                    elif grade == "below":
-                        item.setForeground(_qc_red)
+                    # Percentile-based grading for grade_map columns
+                    if c in _grade_ranges:
+                        nv = self._parse_numeric(val)
+                        lo, hi_v = _grade_ranges[c]
+                        if nv is not None and hi_v > lo:
+                            t = (nv - lo) / (hi_v - lo)
+                            high_bad = self._grade_map.get(c) == "high_bad"
+                            if high_bad:
+                                if t >= 0.67:
+                                    item.setForeground(_qc_red)
+                                elif t <= 0.33:
+                                    item.setForeground(_qc_grn)
+                                else:
+                                    item.setForeground(_qc_t1)
+                            else:  # high_good
+                                if t >= 0.67:
+                                    item.setForeground(_qc_grn)
+                                elif t <= 0.33:
+                                    item.setForeground(_qc_red)
+                                else:
+                                    item.setForeground(_qc_t1)
+                        else:
+                            item.setForeground(_qc_t1)
                     else:
-                        item.setForeground(_qc_t1)
+                        # Grade stat against MLB average → green / red / default
+                        grade = grade_stat(_col_name, _sval, pitching=_is_pitching) if _col_name else None
+                        if grade == "above":
+                            item.setForeground(_qc_grn)
+                        elif grade == "below":
+                            item.setForeground(_qc_red)
+                        else:
+                            item.setForeground(_qc_t1)
                 item.setBackground(bg_color)
                 item.setFont(_cell_font)
                 self.setItem(r, c, item)
@@ -3011,7 +3059,8 @@ class StatsTable(QTableWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reusable section wrapper  (title bar + StatsTable)
 # ═══════════════════════════════════════════════════════════════════════════════
-def table_section(title, badge, cols, data, hi=None, name_col_wide=180):
+def table_section(title, badge, cols, data, hi=None, name_col_wide=180,
+                  grade_map=None):
     wrapper = QFrame()
     wrapper.setStyleSheet(f"""
         QFrame {{ background:{C['bg1']}; border:1px solid {C['bdr']}; border-radius:6px; }}
@@ -3051,7 +3100,7 @@ def table_section(title, badge, cols, data, hi=None, name_col_wide=180):
     hl.addStretch()
     hl.addWidget(mk_label(badge, color=C["t3"], size=11, mono=True))
     vl.addWidget(hdr)
-    tbl = StatsTable(cols, data, hi, name_col_wide)
+    tbl = StatsTable(cols, data, hi, name_col_wide, grade_map=grade_map)
     tbl.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     vl.addWidget(tbl)
     wrapper._table = tbl
@@ -3389,14 +3438,14 @@ class GameCard(QFrame):
                     else:
                         hlbl = "BOT"
                     time_hl.addWidget(mk_label(
-                        f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
+                        f"{hlbl} {inn}", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
-            time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True))
+            time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
         elif ppd:
-            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True))
+            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True, bold=True))
         else:
             time_hl.addWidget(mk_label(
-                g["time"], color=C["t3"], size=10, mono=True))
+                g["time"], color=C["t3"], size=10, mono=True, bold=True))
         time_hl.addStretch()
         self._root.addLayout(time_hl)
 
@@ -3448,10 +3497,10 @@ class GameCard(QFrame):
             # Top → away batting, home pitching; Bottom → reversed
             _half = (g.get('inning_half') or '').lower()
             _away_is_batting = _half.startswith('top')
-            away_pab = (f"AB: {_short(_batter_name)} ({_batter_hand})" if _away_is_batting
-                        else f"P: {_short(_pitcher_name)} ({_pitcher_hand})") if _show_pab else ''
-            home_pab = (f"P: {_short(_pitcher_name)} ({_pitcher_hand})" if _away_is_batting
-                        else f"AB: {_short(_batter_name)} ({_batter_hand})") if _show_pab else ''
+            _pab_ab = f"AB: <span style='color:{C['t1']}'>{_short(_batter_name)} ({_batter_hand})</span>"
+            _pab_p  = f"P: <span style='color:{C['t1']}'>{_short(_pitcher_name)} ({_pitcher_hand})</span>"
+            away_pab = (_pab_ab if _away_is_batting else _pab_p) if _show_pab else ''
+            home_pab = (_pab_p if _away_is_batting else _pab_ab) if _show_pab else ''
 
             # Grid layout: teams col 0, diamond col 1, scores col 2
             grid = QGridLayout()
@@ -3468,6 +3517,7 @@ class GameCard(QFrame):
             # Row 1: away P/AB label (or empty placeholder)
             if _show_pab:
                 lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
             else:
                 lbl = mk_label("", size=9, mono=True)
             lbl.setContentsMargins(24, 0, 0, 0)
@@ -3488,6 +3538,7 @@ class GameCard(QFrame):
             # Row 4: home P/AB label (or empty placeholder)
             if _show_pab:
                 lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
             else:
                 lbl = mk_label("", size=9, mono=True)
             lbl.setContentsMargins(24, 0, 0, 0)
@@ -3539,7 +3590,9 @@ class GameCard(QFrame):
                 gl.set_bg(C["bg1"])
         super().leaveEvent(e)
 
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# Live Tracker Game Card (in schedule sidebar, expands to show play-by-play and live count)
+# ═══════════════════════════════════════════════════════════════════════════════
 class ScheduleGameCard(QFrame):
     """Game card for the schedule page with DraftKings betting lines."""
     _collapsed_height = 0  # class-level: max collapsed height across all cards
@@ -3588,6 +3641,56 @@ class ScheduleGameCard(QFrame):
         # Defer initial resize so glow effects don't trigger painter errors
         QTimer.singleShot(0, self._resize_for_expansion)
 
+    _DUE_UP_H = 20  # fixed height for due-up row placeholder
+
+    def _build_due_up_row(self, g, is_live, in_transition):
+        """Return a fixed-height widget showing due-up batters (or empty placeholder)."""
+        w = QWidget()
+        w.setFixedHeight(self._DUE_UP_H)
+        w.setStyleSheet("background:transparent;")
+        hl = QHBoxLayout(w)
+        hl.setContentsMargins(0, 4, 0, 0)
+        hl.setSpacing(12)
+
+        if not is_live:
+            return w
+
+        def _short(n):
+            p = n.split()
+            return f"{p[0][0]}. {' '.join(p[1:])}" if len(p) >= 2 else n
+
+        _du_name = g.get('current_batter_name', '')
+        _od_name = g.get('ondeck_batter_name', '')
+        _ih_name = g.get('inhole_batter_name', '')
+        _du_hand = g.get('current_batter_hand', '')
+        _od_hand = g.get('ondeck_batter_hand', '')
+        _ih_hand = g.get('inhole_batter_hand', '')
+
+        if in_transition:
+            # MID / END — next half-inning batters
+            parts = []
+            if _du_name:
+                parts.append(('Due Up', _du_name, _du_hand))
+            if _od_name:
+                parts.append(('On Deck', _od_name, _od_hand))
+        else:
+            # TOP / BOT — current half-inning upcoming batters
+            parts = []
+            if _od_name:
+                parts.append(('On Deck', _od_name, _od_hand))
+            if _ih_name:
+                parts.append(('In Hole', _ih_name, _ih_hand))
+
+        for lbl_text, name, hand in parts:
+            h_str = f" ({hand})" if hand else ""
+            tag = mk_label(f"{lbl_text}:", color=C["t3"], size=9, mono=True, bold=True)
+            val = mk_label(f"{_short(name)}{h_str}",
+                           color=C["t1"], size=9, mono=True, bold=True)
+            hl.addWidget(tag)
+            hl.addWidget(val)
+        hl.addStretch()
+        return w
+
     def _build_content(self, root):
         g = self.game
         odds = self._odds
@@ -3631,13 +3734,13 @@ class ScheduleGameCard(QFrame):
                         hlbl = "END"
                     else:
                         hlbl = "BOT"
-                    time_hl.addWidget(mk_label(f"{hlbl} {inn}", color=C["t3"], size=10, mono=True))
+                    time_hl.addWidget(mk_label(f"{hlbl} {inn}", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
-            time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True))
+            time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
         elif ppd:
-            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True))
+            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True, bold=True))
         else:
-            time_hl.addWidget(mk_label(g.get("time", "TBD"), color=C["t3"], size=10, mono=True))
+            time_hl.addWidget(mk_label(g.get("time", "TBD"), color=C["t3"], size=10, mono=True, bold=True))
         time_hl.addStretch()
         root.addLayout(time_hl)
 
@@ -3655,7 +3758,7 @@ class ScheduleGameCard(QFrame):
             hl.addWidget(mk_label(abbr, color=C["t1"], size=13, bold=True, mono=True))
             hl.addWidget(mk_label(pitcher or "TBD", color=C["t2"], size=11, mono=True), 1)
             if ml:
-                hl.addWidget(mk_label("ML:", color=C["t3"], size=9, mono=True))
+                hl.addWidget(mk_label("ML:", color=C["t3"], size=9, mono=True, bold=True))
                 hl.addWidget(mk_label(ml, color=C["ora"], size=10, bold=True, mono=True))
             return hl
 
@@ -3682,10 +3785,10 @@ class ScheduleGameCard(QFrame):
             return f"{p[0][0]}. {' '.join(p[1:])}" if len(p) >= 2 else n
         _half = (g.get('inning_half') or '').lower()
         _away_is_batting = _half.startswith('top')
-        away_pab = (f"AB: {_short(_batter_name)} ({_batter_hand})" if _away_is_batting
-                    else f"P: {_short(_pitcher_name)} ({_pitcher_hand})") if _show_pab else ''
-        home_pab = (f"P: {_short(_pitcher_name)} ({_pitcher_hand})" if _away_is_batting
-                    else f"AB: {_short(_batter_name)} ({_batter_hand})") if _show_pab else ''
+        _pab_ab = f"AB: <span style='color:{C['t1']}'>{_short(_batter_name)} ({_batter_hand})</span>"
+        _pab_p  = f"P: <span style='color:{C['t1']}'>{_short(_pitcher_name)} ({_pitcher_hand})</span>"
+        away_pab = (_pab_ab if _away_is_batting else _pab_p) if _show_pab else ''
+        home_pab = (_pab_p if _away_is_batting else _pab_ab) if _show_pab else ''
 
         if has_boxscore:
             # ── Live/final with box score ──
@@ -3705,6 +3808,7 @@ class ScheduleGameCard(QFrame):
             # Away P/AB label (or empty placeholder)
             if _show_pab:
                 lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
             else:
                 lbl = mk_label("", size=9, mono=True)
             lbl.setContentsMargins(26, 0, 0, 0)
@@ -3714,10 +3818,10 @@ class ScheduleGameCard(QFrame):
             div = QHBoxLayout()
             div.setSpacing(4)
             div.setContentsMargins(26, 0, 0, 0)
-            div.addWidget(mk_label("@", color=C["t3"], size=10, mono=True))
+            div.addWidget(mk_label("@", color=C["t3"], size=10, mono=True, bold=True))
             div.addWidget(_GradientLine(), 1)
             if ou_str:
-                div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True))
+                div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True, bold=True))
                 div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
             grid.addLayout(div, row, 0)
             row += 1
@@ -3730,6 +3834,7 @@ class ScheduleGameCard(QFrame):
             # Home P/AB label (or empty placeholder)
             if _show_pab:
                 lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+                lbl.setTextFormat(Qt.TextFormat.RichText)
             else:
                 lbl = mk_label("", size=9, mono=True)
             lbl.setContentsMargins(26, 0, 0, 0)
@@ -3752,6 +3857,9 @@ class ScheduleGameCard(QFrame):
             grid.setColumnStretch(0, 1)
             root.addLayout(grid)
 
+            # ── Due Up / On Deck / In the Hole (live games only) ──
+            root.addWidget(self._build_due_up_row(g, is_live, _in_transition))
+
             root.addSpacing(14)
 
             # ── Box score ──
@@ -3771,16 +3879,16 @@ class ScheduleGameCard(QFrame):
             inn_grid.setVerticalSpacing(1)
 
             # Team abbreviation column
-            away_name = mk_label(g["away"], color=C["t2"], size=9, mono=True)
+            away_name = mk_label(g["away"], color=C["t2"], size=9, mono=True, bold=True)
             away_name.setFixedWidth(32)
             inn_grid.addWidget(away_name, 1, 0)
-            home_name = mk_label(g["home"], color=C["t2"], size=9, mono=True)
+            home_name = mk_label(g["home"], color=C["t2"], size=9, mono=True, bold=True)
             home_name.setFixedWidth(32)
             inn_grid.addWidget(home_name, 2, 0)
 
             # Header row: inning numbers
             for i, inn in enumerate(padded):
-                lbl = mk_label(str(inn['num']), color=C["t3"], size=9, mono=True,
+                lbl = mk_label(str(inn['num']), color=C["t3"], size=9, mono=True, bold=True,
                                align=Qt.AlignmentFlag.AlignCenter)
                 lbl.setFixedWidth(20)
                 inn_grid.addWidget(lbl, 0, i + 1)
@@ -3789,7 +3897,7 @@ class ScheduleGameCard(QFrame):
             for i, inn in enumerate(padded):
                 val = inn.get('away')
                 txt = str(val) if val is not None else "-"
-                lbl = mk_label(txt, color=C["t1" if val is not None else "t3"], size=9, mono=True,
+                lbl = mk_label(txt, color=C["t1" if val is not None else "t3"], size=9, mono=True, bold=True,
                                align=Qt.AlignmentFlag.AlignCenter)
                 lbl.setFixedWidth(20)
                 inn_grid.addWidget(lbl, 1, i + 1)
@@ -3798,7 +3906,7 @@ class ScheduleGameCard(QFrame):
             for i, inn in enumerate(padded):
                 val = inn.get('home')
                 txt = str(val) if val is not None else "-"
-                lbl = mk_label(txt, color=C["t1" if val is not None else "t3"], size=9, mono=True,
+                lbl = mk_label(txt, color=C["t1" if val is not None else "t3"], size=9, mono=True, bold=True,
                                align=Qt.AlignmentFlag.AlignCenter)
                 lbl.setFixedWidth(20)
                 inn_grid.addWidget(lbl, 2, i + 1)
@@ -3816,12 +3924,12 @@ class ScheduleGameCard(QFrame):
                 lbl.setFixedWidth(24)
                 rhe_grid.addWidget(lbl, 0, j)
             for j, val in enumerate([g.get('away_score', 0), g.get('away_hits', 0), g.get('away_errors', 0)]):
-                lbl = mk_label(str(val), color=C["t1"], size=9, mono=True, bold=(j == 0),
+                lbl = mk_label(str(val), color=C["t1"], size=9, mono=True, bold=True,
                                align=Qt.AlignmentFlag.AlignCenter)
                 lbl.setFixedWidth(24)
                 rhe_grid.addWidget(lbl, 1, j)
             for j, val in enumerate([g.get('home_score', 0), g.get('home_hits', 0), g.get('home_errors', 0)]):
-                lbl = mk_label(str(val), color=C["t1"], size=9, mono=True, bold=(j == 0),
+                lbl = mk_label(str(val), color=C["t1"], size=9, mono=True, bold=True,
                                align=Qt.AlignmentFlag.AlignCenter)
                 lbl.setFixedWidth(24)
                 rhe_grid.addWidget(lbl, 2, j)
@@ -3865,6 +3973,7 @@ class ScheduleGameCard(QFrame):
                 # Away P/AB label (or empty placeholder)
                 if _show_pab:
                     lbl = mk_label(away_pab, color=C["t3"], size=9, mono=True, bold=True)
+                    lbl.setTextFormat(Qt.TextFormat.RichText)
                 else:
                     lbl = mk_label("", size=9, mono=True)
                 lbl.setContentsMargins(26, 0, 0, 0)
@@ -3876,7 +3985,7 @@ class ScheduleGameCard(QFrame):
                 div.addWidget(mk_label("@", color=C["t3"], size=10, mono=True))
                 div.addWidget(_GradientLine(), 1)
                 if ou_str:
-                    div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True))
+                    div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True, bold=True))
                     div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
                 grid.addLayout(div, row, 0)
                 row += 1
@@ -3888,6 +3997,7 @@ class ScheduleGameCard(QFrame):
                 # Home P/AB label (or empty placeholder)
                 if _show_pab:
                     lbl = mk_label(home_pab, color=C["t3"], size=9, mono=True, bold=True)
+                    lbl.setTextFormat(Qt.TextFormat.RichText)
                 else:
                     lbl = mk_label("", size=9, mono=True)
                 lbl.setContentsMargins(26, 0, 0, 0)
@@ -3909,6 +4019,10 @@ class ScheduleGameCard(QFrame):
                     grid.setColumnMinimumWidth(1, 16)
                 grid.setColumnStretch(0, 1)
                 root.addLayout(grid)
+
+                # ── Due Up / On Deck / In the Hole ──
+                root.addWidget(self._build_due_up_row(g, is_live, _in_transition))
+
                 root.addStretch()
             else:
                 # ── Scheduled games ──
@@ -3922,13 +4036,16 @@ class ScheduleGameCard(QFrame):
                 div.addWidget(mk_label("@", color=C["t3"], size=10, mono=True))
                 div.addWidget(_GradientLine(), 1)
                 if ou_str:
-                    div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True))
+                    div.addWidget(mk_label("O/U", color=C["t3"], size=9, mono=True, bold=True))
                     div.addWidget(mk_label(ou_str, color=C["t1"], size=9, bold=True, mono=True))
                 root.addLayout(div)
                 root.addLayout(team_row(g["home"], g.get("home_p", ""), home_ml))
                 ph2 = mk_label("", size=9, mono=True)
                 ph2.setContentsMargins(26, 0, 0, 0)
                 root.addWidget(ph2)
+
+                # ── Placeholder for due-up row (uniform height) ──
+                root.addWidget(self._build_due_up_row(g, False, False))
 
                 root.addSpacing(14)
 
@@ -3939,19 +4056,19 @@ class ScheduleGameCard(QFrame):
                 inn_grid.setContentsMargins(0, 0, 0, 0)
                 inn_grid.setHorizontalSpacing(0)
                 inn_grid.setVerticalSpacing(1)
-                away_name = mk_label(g["away"], color=C["t2"], size=9, mono=True)
+                away_name = mk_label(g["away"], color=C["t2"], size=9, mono=True, bold=True)
                 away_name.setFixedWidth(32)
                 inn_grid.addWidget(away_name, 1, 0)
-                home_name = mk_label(g["home"], color=C["t2"], size=9, mono=True)
+                home_name = mk_label(g["home"], color=C["t2"], size=9, mono=True, bold=True)
                 home_name.setFixedWidth(32)
                 inn_grid.addWidget(home_name, 2, 0)
                 for i in range(9):
-                    lbl = mk_label(str(i + 1), color=C["t3"], size=9, mono=True,
+                    lbl = mk_label(str(i + 1), color=C["t3"], size=9, mono=True, bold=True,
                                    align=Qt.AlignmentFlag.AlignCenter)
                     lbl.setFixedWidth(20)
                     inn_grid.addWidget(lbl, 0, i + 1)
                     for row in (1, 2):
-                        d = mk_label("-", color=C["t3"], size=9, mono=True,
+                        d = mk_label("-", color=C["t3"], size=9, mono=True, bold=True,
                                      align=Qt.AlignmentFlag.AlignCenter)
                         d.setFixedWidth(20)
                         inn_grid.addWidget(d, row, i + 1)
@@ -3967,7 +4084,7 @@ class ScheduleGameCard(QFrame):
                     lbl.setFixedWidth(24)
                     rhe_grid.addWidget(lbl, 0, j)
                     for row in (1, 2):
-                        d = mk_label("-", color=C["t3"], size=9, mono=True,
+                        d = mk_label("-", color=C["t3"], size=9, mono=True, bold=True,
                                      align=Qt.AlignmentFlag.AlignCenter)
                         d.setFixedWidth(24)
                         rhe_grid.addWidget(d, row, j)
@@ -4199,15 +4316,18 @@ class ScheduleGameCard(QFrame):
             scoring = p.get('is_scoring', False)
             is_action = p.get('is_action', False)
             is_challenge = p.get('is_challenge', False)
-            if is_challenge:
+            is_sub = p.get('is_substitution', False)
+            if is_sub:
+                event_color = C["amb"]
+            elif is_challenge:
                 event_color = C["amb"]
             elif is_action:
                 event_color = C["grn"] if scoring else C["amb"]
             else:
-                event_color = C["grn"] if scoring else C["ora"]
+                event_color = C["grn"] if scoring else C["t1"]
             if ev:
                 display_ev = f"Challenge: {ev}" if is_challenge else ev
-                el = mk_label(display_ev, color=event_color, size=11, bold=not is_action)
+                el = mk_label(display_ev, color=event_color, size=11, bold=not is_action or is_sub)
                 el.setContentsMargins(12, 0, 0, 0)
                 self._play_layout.addWidget(el)
             if desc:
@@ -5743,11 +5863,14 @@ class LeaderboardCard(QFrame):
         return QSize(260, 34 + self._ROW_H * self._visible_rows + 4)
 
 
-def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None):
+def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None,
+                         stat_tables=None):
     """Build a top-stats page with leaderboard cards.
 
     leaderboards : list of (title, rows, fmt[, unit]) tuples for LeaderboardCard widgets
     stat_table   : optional (section_title, badge, cols, data, hi_cols) for a table_section
+    stat_tables  : optional list of (label, section_title, badge, cols, data, hi_cols) for
+                   a filterable table group with a toggle bar
     """
     page = QWidget()
     page.setStyleSheet(f"background:{C['bg0']};")
@@ -5764,17 +5887,6 @@ def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None):
     sub = mk_label(subtitle, color=C["t2"], size=13)
     sub.setContentsMargins(0, 3, 0, 14)
     vl.addWidget(sub)
-
-    # ── optional stats table (e.g. HR Allowed) ──
-    if stat_table:
-        st_title, st_badge, st_cols, st_data, st_hi = stat_table
-        st_label = mk_label(st_title.upper(), color=C["t3"], size=10, mono=True)
-        st_label.setContentsMargins(0, 0, 0, 6)
-        vl.addWidget(st_label)
-
-        sec = table_section(st_title, st_badge, st_cols, st_data, st_hi, name_col_wide=140)
-        vl.addWidget(sec)
-        vl.addSpacing(20)
 
     # ── leaderboard cards (flow grid) ──
     if leaderboards:
@@ -5796,10 +5908,39 @@ def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None):
         for c in range(cols_per_row):
             grid.setColumnStretch(c, 1)
         vl.addLayout(grid)
+        vl.addSpacing(20)
     else:
         vl.addStretch()
         vl.addWidget(mk_label("No leaderboard data available", color=C["t3"], size=13, mono=True,
                               align=Qt.AlignmentFlag.AlignCenter))
+
+    # ── optional stats table (e.g. HR Allowed) ──
+    if stat_tables and len(stat_tables) > 1:
+        # Filterable table group with toggle bar
+        labels = [t[0] for t in stat_tables]
+        fb = FilterBar(labels)
+        vl.addWidget(fb)
+        vl.addSpacing(6)
+
+        stk = QStackedWidget()
+        for entry in stat_tables:
+            _lbl, st_title, st_badge, st_cols, st_data, st_hi = entry[:6]
+            st_gm = entry[6] if len(entry) > 6 else None
+            sec = table_section(st_title, st_badge, st_cols, st_data, st_hi,
+                                name_col_wide=140, grade_map=st_gm)
+            stk.addWidget(sec)
+        fb.changed.connect(stk.setCurrentIndex)
+        vl.addWidget(stk)
+        vl.addSpacing(20)
+    elif stat_table:
+        st_title, st_badge, st_cols, st_data, st_hi = stat_table
+        st_label = mk_label(st_title.upper(), color=C["t3"], size=10, mono=True)
+        st_label.setContentsMargins(0, 0, 0, 6)
+        vl.addWidget(st_label)
+
+        sec = table_section(st_title, st_badge, st_cols, st_data, st_hi, name_col_wide=140)
+        vl.addWidget(sec)
+        vl.addSpacing(20)
 
     vl.addStretch()
     sa.setWidget(content)
@@ -6140,6 +6281,20 @@ class SeamStatsApp(QMainWindow):
         self._search_widget = PlayerSearchWidget(parent=bar, compact=True)
         hl.addWidget(self._search_widget)
 
+        # ── Notepad button ──
+        notepad_btn = QPushButton("Notepad")
+        notepad_btn.setToolTip("Open scratchpad")
+        notepad_btn.setFixedHeight(28)
+        notepad_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        notepad_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
+                           border-radius:4px; font-size:11px; padding:0 10px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['ora']}; border-color:{C['ora']}; }}
+        """)
+        notepad_btn.clicked.connect(self._toggle_notepad)
+        hl.addWidget(notepad_btn)
+
         hl.addStretch()
 
         # ── Update progress bar (hidden until update runs) ──
@@ -6363,10 +6518,10 @@ class SeamStatsApp(QMainWindow):
 
             def run(self_w):
                 try:
-                    r = requests.get(
+                    r = _http.get(
                         SeamStatsApp._GITHUB_RELEASES_URL,
                         headers={"Accept": "application/vnd.github+json"},
-                        timeout=10,
+                        timeout=TIMEOUT_DEFAULT,
                     )
                     if r.status_code == 404:
                         self_w.result.emit("", "", "")
@@ -6608,7 +6763,7 @@ class SeamStatsApp(QMainWindow):
 
             def run(self_w):
                 try:
-                    r = requests.get(self_w._url, stream=True, timeout=60,
+                    r = _http.get(self_w._url, stream=True, timeout=TIMEOUT_DOWNLOAD,
                                      headers={"Accept": "application/octet-stream"})
                     r.raise_for_status()
                     total = int(r.headers.get("content-length", 0))
@@ -6753,6 +6908,203 @@ class SeamStatsApp(QMainWindow):
                     os.unlink(xml_path)
                 except Exception:
                     pass
+
+    # ── Notepad ──────────────────────────────────────────────────────────
+    _NOTEPAD_FILE = os.path.join(_app_paths.APP_DIR, "assets", "notepad.txt")
+
+    def _toggle_notepad(self):
+        """Show or hide the floating notepad panel."""
+        if hasattr(self, '_notepad_panel') and self._notepad_panel.isVisible():
+            self._notepad_panel.hide()
+            return
+        if not hasattr(self, '_notepad_panel'):
+            self._build_notepad_panel()
+        panel = self._notepad_panel
+        # Only set initial position/size on first show
+        if not hasattr(panel, '_positioned'):
+            panel.resize(380, 420)
+            gx = self.width() - 380 - 16
+            gy = 48
+            panel.move(gx, gy)
+            panel._positioned = True
+        panel.show()
+        panel.raise_()
+        self._notepad_edit.setFocus()
+
+    def _build_notepad_panel(self):
+        """Create the floating notepad overlay (built once, reused)."""
+        from PyQt6.QtWidgets import QTextEdit
+
+        _EDGE = 6  # pixels from edge to trigger resize
+
+        class _DragResizeFrame(QFrame):
+            """QFrame overlay that supports drag-to-move and edge-resize."""
+
+            def __init__(self, parent=None):
+                super().__init__(parent)
+                self._drag_pos = None
+                self._resize_edge = None
+                self.setMouseTracking(True)
+                self.setMinimumSize(260, 200)
+
+            # ── helpers ──
+            def _hit_edges(self, pos):
+                """Return set of edges ('l','r','t','b') the pos is near."""
+                r = self.rect()
+                edges = set()
+                if pos.x() <= _EDGE:            edges.add('l')
+                if pos.x() >= r.width() - _EDGE: edges.add('r')
+                if pos.y() <= _EDGE:            edges.add('t')
+                if pos.y() >= r.height() - _EDGE: edges.add('b')
+                return edges
+
+            @staticmethod
+            def _cursor_for_edges(edges):
+                if edges >= {'l','t'} or edges >= {'r','b'}:
+                    return Qt.CursorShape.SizeFDiagCursor
+                if edges >= {'r','t'} or edges >= {'l','b'}:
+                    return Qt.CursorShape.SizeBDiagCursor
+                if 'l' in edges or 'r' in edges:
+                    return Qt.CursorShape.SizeHorCursor
+                if 't' in edges or 'b' in edges:
+                    return Qt.CursorShape.SizeVerCursor
+                return Qt.CursorShape.ArrowCursor
+
+            # ── events ──
+            def mousePressEvent(self, e):
+                if e.button() == Qt.MouseButton.LeftButton:
+                    edges = self._hit_edges(e.position().toPoint())
+                    if edges:
+                        self._resize_edge = edges
+                        self._drag_pos = e.globalPosition().toPoint()
+                    else:
+                        # Only drag from the top 32px (header area)
+                        if e.position().toPoint().y() <= 32:
+                            self._drag_pos = e.globalPosition().toPoint()
+                            self._resize_edge = None
+                        else:
+                            self._drag_pos = None
+                            self._resize_edge = None
+                super().mousePressEvent(e)
+
+            def mouseMoveEvent(self, e):
+                if self._drag_pos is None:
+                    # Update cursor hint
+                    edges = self._hit_edges(e.position().toPoint())
+                    self.setCursor(self._cursor_for_edges(edges))
+                    super().mouseMoveEvent(e)
+                    return
+
+                gp = e.globalPosition().toPoint()
+                delta = gp - self._drag_pos
+
+                if self._resize_edge:
+                    geo = self.geometry()
+                    mn_w, mn_h = self.minimumWidth(), self.minimumHeight()
+                    if 'r' in self._resize_edge:
+                        geo.setRight(max(geo.left() + mn_w, geo.right() + delta.x()))
+                    if 'b' in self._resize_edge:
+                        geo.setBottom(max(geo.top() + mn_h, geo.bottom() + delta.y()))
+                    if 'l' in self._resize_edge:
+                        new_left = min(geo.right() - mn_w, geo.left() + delta.x())
+                        geo.setLeft(new_left)
+                    if 't' in self._resize_edge:
+                        new_top = min(geo.bottom() - mn_h, geo.top() + delta.y())
+                        geo.setTop(new_top)
+                    self.setGeometry(geo)
+                else:
+                    self.move(self.pos() + delta)
+
+                self._drag_pos = gp
+
+            def mouseReleaseEvent(self, e):
+                self._drag_pos = None
+                self._resize_edge = None
+                self.unsetCursor()
+                super().mouseReleaseEvent(e)
+
+        panel = _DragResizeFrame(self)
+        panel.setObjectName("notepadPanel")
+        panel.setStyleSheet(f"""
+            QFrame#notepadPanel {{
+                background:{C['bg1']}; border:1px solid {C['bdr']};
+                border-radius:6px;
+            }}
+        """)
+        vl = QVBoxLayout(panel)
+        vl.setContentsMargins(10, 8, 10, 10)
+        vl.setSpacing(6)
+
+        # Header row
+        hdr = QHBoxLayout()
+        hdr.addWidget(mk_label("NOTEPAD", color=C["t1"], size=11, bold=True, mono=True))
+        hdr.addStretch()
+
+        clear_btn = QPushButton("Clear")
+        clear_btn.setFixedHeight(22)
+        clear_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        clear_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:1px solid {C['bdr']};
+                           border-radius:3px; font-size:10px; padding:0 8px;
+                           font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['red']}; border-color:{C['red']}; }}
+        """)
+        clear_btn.clicked.connect(self._notepad_clear)
+        hdr.addWidget(clear_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{ background:transparent; color:{C['t3']}; border:none;
+                           font-size:13px; font-family:'Cascadia Mono','Consolas',monospace; }}
+            QPushButton:hover {{ color:{C['red']}; }}
+        """)
+        close_btn.clicked.connect(lambda: panel.hide())
+        hdr.addWidget(close_btn)
+        vl.addLayout(hdr)
+
+        # Text editor
+        edit = QTextEdit()
+        edit.setStyleSheet(f"""
+            QTextEdit {{ background:{C['bg2']}; color:{C['t1']}; border:1px solid {C['bdr']};
+                         border-radius:4px; font-size:12px; padding:6px;
+                         font-family:'Cascadia Mono','Consolas',monospace; }}
+        """)
+        edit.setPlaceholderText("Type notes here…")
+        vl.addWidget(edit)
+
+        # Load saved content
+        if os.path.exists(self._NOTEPAD_FILE):
+            try:
+                with open(self._NOTEPAD_FILE, 'r', encoding='utf-8') as f:
+                    edit.setPlainText(f.read())
+            except Exception:
+                pass
+
+        # Auto-save on change (debounced 500ms)
+        self._notepad_save_timer = QTimer()
+        self._notepad_save_timer.setSingleShot(True)
+        self._notepad_save_timer.setInterval(500)
+        self._notepad_save_timer.timeout.connect(self._notepad_save)
+        edit.textChanged.connect(self._notepad_save_timer.start)
+
+        self._notepad_panel = panel
+        self._notepad_edit = edit
+        panel.hide()
+
+    def _notepad_save(self):
+        """Save notepad contents to disk."""
+        try:
+            with open(self._NOTEPAD_FILE, 'w', encoding='utf-8') as f:
+                f.write(self._notepad_edit.toPlainText())
+        except Exception:
+            log.exception("notepad save")
+
+    def _notepad_clear(self):
+        """Clear the notepad and save."""
+        self._notepad_edit.clear()
+        self._notepad_save()
 
     def _show_settings(self):
         """Show the Settings dialog."""
@@ -7032,7 +7384,7 @@ class SeamStatsApp(QMainWindow):
                         self._lineup_prefetch_future.result(timeout=10)
                     except Exception:
                         pass
-                pt = _DM.get_todays_player_info(self._games)
+                pt, pitcher_pt = _DM.get_todays_player_info(self._games)
                 if pt:
                     _fmt_avg = lambda v: f"{v:.3f}" if isinstance(v, float) else str(v)
                     _fmt_pct = lambda v: f"{v * 100:.1f}%" if isinstance(v, float) else str(v)
@@ -7066,15 +7418,18 @@ class SeamStatsApp(QMainWindow):
 
                     _pit = "calculated_pitching_stats"
                     _min_ip = ("innings_pitched", 5.0)
-                    # Batch: all 3 pitching cols (ERA ascending)
+                    # Batch: all 6 pitching cols (ERA, h_per_9 ascending; contact_pct ascending = less contact is better)
                     pit_batch = _DM.get_leaderboards_batch(
-                        _pit, ["strikeouts", "era", "whiff_pct"], pt,
-                        ascending_cols={"era"},
+                        _pit, ["strikeouts", "era", "whiff_pct", "contact_pct", "k_per_9", "h_per_9"], pitcher_pt,
+                        ascending_cols={"era", "contact_pct", "h_per_9"},
                         min_col=_min_ip[0], min_val=_min_ip[1])
                     pit_lbs = [
-                        ("STRIKEOUTS (K)", pit_batch["strikeouts"], _fmt_int),
-                        ("ERA",            pit_batch["era"],        _fmt_era),
-                        ("WHIFF %",        pit_batch["whiff_pct"],  _fmt_pct),
+                        ("STRIKEOUTS (K)", pit_batch["strikeouts"],  _fmt_int),
+                        ("ERA",            pit_batch["era"],         _fmt_era),
+                        ("WHIFF %",        pit_batch["whiff_pct"],   _fmt_pct),
+                        ("CONTACT %",      pit_batch["contact_pct"], _fmt_pct),
+                        ("K/9",            pit_batch["k_per_9"],     _fmt_era),
+                        ("H/9",            pit_batch["h_per_9"],     _fmt_era),
                     ]
 
                     _br = "calculated_baserunning_stats"
@@ -7317,7 +7672,8 @@ class SeamStatsApp(QMainWindow):
                    'inning_half', 'inning_state', 'live',
                    'on_first', 'on_second', 'on_third', 'outs',
                    'balls', 'strikes',
-                   'current_batter_name', 'current_pitcher_name')
+                   'current_batter_name', 'current_pitcher_name',
+                   'ondeck_batter_name', 'inhole_batter_name')
     _CMP_BOX = ('innings_detail', 'away_hits', 'home_hits',
                 'away_errors', 'home_errors')
 
@@ -7669,26 +8025,34 @@ class SeamStatsApp(QMainWindow):
                 self._lb_fetched = False
                 return
 
-            # Build HR Allowed stat_table tuple for pitching page
-            pit_stat_table = None
+            # Build HR Allowed / Hits Allowed stat_tables for pitching page
+            pit_stat_tables = None
             if hr_tbl:
-                hr_cols, hr_data, hr_hi = hr_tbl
-                pit_stat_table = ("HR Allowed", "[ ©SA ]",
-                                  hr_cols, hr_data, hr_hi)
+                hr_cols, hr_data, hr_hi, hr_gm = hr_tbl["hr"]
+                h_cols, h_data, h_hi, h_gm = hr_tbl["hits"]
+                pit_stat_tables = [
+                    ("HR Allowed", "HR Allowed", "[ ©SA ]",
+                     hr_cols, hr_data, hr_hi, hr_gm),
+                    ("Hits Allowed", "Hits Allowed", "[ ©SA ]",
+                     h_cols, h_data, h_hi, h_gm),
+                ]
 
             replacements = [
                 (self.IDX_HIT,   "Top Stats - Hitting",
                  "2026 season · all qualified hitters", hit_lbs, None),
                 (self.IDX_PITCH, "Top Stats - Pitching",
-                 "2026 season · starters & relievers", pit_lbs, pit_stat_table),
+                 "2026 season · starters & relievers", pit_lbs, None),
                 (self.IDX_BR,    "Top Stats - Base Running",
                  "2026 season · speed & baserunning", br_lbs, None),
             ]
             cur = self._stack.currentIndex()
             for idx, title, subtitle, lbs, st in replacements:
+                kw = {}
+                if idx == self.IDX_PITCH and pit_stat_tables:
+                    kw["stat_tables"] = pit_stat_tables
                 new_page = build_top_stats_page(title, subtitle,
                                                 leaderboards=lbs or None,
-                                                stat_table=st)
+                                                stat_table=st, **kw)
                 old = self._stack.widget(idx)
                 self._stack.removeWidget(old)
                 old.deleteLater()
