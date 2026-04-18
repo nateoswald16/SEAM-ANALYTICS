@@ -4,9 +4,13 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
-## v1.2.0 — 2026-04-17
+## v1.2.0 — 2026-04-18
 
 ### Park & Weather
+
+**Hourly Precipitation & Humidity Updates**
+- Conditions container now updates precipitation and humidity values when toggling between hourly weather slots
+- Added `humidity` field to all three weather provider hourly slot dicts (NWS, Open-Meteo, WeatherAPI)
 
 **Stadium Size Descriptor**
 - Added `VENUE_SIZE_DESC` mapping all 30 venue IDs to size categories (Extra Small / Small / Medium / Large / Extra Large) based on foul-line distances and field area
@@ -56,6 +60,15 @@ All notable changes to Seam Analytics are documented here.
 **Wind Insight Fixed Height**
 - Wind insight description label now uses `setFixedHeight(lineSpacing * 2 + 4)` for a fixed 2-row height
 - Prevents the weather card from resizing when toggling between hourly slots
+
+### Game Status
+
+**Delay Display**
+- Sidebar and game tracker cards now show "DELAY TOP 4" / "DELAY BOT 7" etc. in amber when a game is in a delay, replacing the normal TOP/BOT/MID/END inning label
+
+**Postponed Display**
+- Postponed games now display "Postponed" instead of "PPD"
+- Postponed games are treated as finished (scores shown, no start time displayed)
 
 ### Lineups
 

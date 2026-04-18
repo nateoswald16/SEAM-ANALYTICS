@@ -459,9 +459,11 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
                     h_wd_compass = p.get("windDirection", "")
                     h_wd_deg = _NWS_COMPASS.get(h_wd_compass)
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
+                    h_rh = p.get("relativeHumidity", {}).get("value")
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
+                        "humidity": h_rh,
                         "night": not p.get("isDaytime", True),
                         "temp": p.get("temperature"),
                         "wind_speed": h_ws,
@@ -679,9 +681,12 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     h_ws = wspeeds[gi] if gi < len(wspeeds) else None
                     h_wd_deg = wdirs[gi] if gi < len(wdirs) else None
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
+                    _rh_arr = hourly.get("relative_humidity_2m", [])
+                    h_rh = _rh_arr[gi] if gi < len(_rh_arr) else None
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
+                        "humidity": h_rh,
                         "night": is_night,
                         "temp": round(h_temp) if h_temp is not None else None,
                         "wind_speed": round(h_ws) if h_ws is not None else None,
@@ -868,6 +873,7 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
+                        "humidity": wh.get("humidity"),
                         "night": not wh.get("is_day", 1),
                         "temp": wh.get("temp_f"),
                         "wind_speed": wh.get("wind_mph"),

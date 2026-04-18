@@ -1843,6 +1843,10 @@ class WeatherDetailWidget(QFrame):
         self.d["temp"] = slot.get("temp", self.d.get("temp"))
         self.d["condition"] = slot.get("condition", self.d.get("condition"))
         self.d["night"] = slot.get("night", False)
+        if slot.get("precip") is not None:
+            self.d["precip_pct"] = slot["precip"]
+        if slot.get("humidity") is not None:
+            self.d["humidity_pct"] = slot["humidity"]
 
         # Update stadium wind arrows
         self._stadium.set_wind(self.d["wind_dir"], self.d["wind_speed"])
@@ -1858,9 +1862,15 @@ class WeatherDetailWidget(QFrame):
             temp = self.d.get("temp", "--")
             ws = self.d.get("wind_speed", 0)
             wd = self.d.get("wind_dir", "Calm")
+            precip = self.d.get("precip_pct")
+            humid = self.d.get("humidity_pct")
             self._cond_vals["temp"].setText(f"{temp}°F")
             self._cond_vals["wind"].setText(
                 f"{ws} mph {wd}" if ws else "Calm")
+            self._cond_vals["precip"].setText(
+                f"{precip:.0f}%" if precip is not None else "--%")
+            self._cond_vals["humid"].setText(
+                f"{humid:.0f}%" if humid is not None else "--%")
             return
 
         # Recompute ratings (pass pre-computed roof status to avoid triple calls)
@@ -1886,9 +1896,15 @@ class WeatherDetailWidget(QFrame):
         temp = self.d.get("temp", "--")
         ws = self.d.get("wind_speed", 0)
         wd = self.d.get("wind_dir", "Calm")
+        precip = self.d.get("precip_pct")
+        humid = self.d.get("humidity_pct")
         self._cond_vals["temp"].setText(f"{temp}°F")
         self._cond_vals["wind"].setText(
             f"{ws} mph {wd}" if ws else "Calm")
+        self._cond_vals["precip"].setText(
+            f"{precip:.0f}%" if precip is not None else "--%")
+        self._cond_vals["humid"].setText(
+            f"{humid:.0f}%" if humid is not None else "--%")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

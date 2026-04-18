@@ -3488,7 +3488,7 @@ class GameCard(QFrame):
         st = (g.get("status") or "").lower()
         is_final = (g.get("time", "").upper() == "FINAL"
                     or st.startswith("final") or st.startswith("game over")
-                    or st.startswith("completed"))
+                    or st.startswith("completed") or ppd)
         is_live = self._is_live()
 
         time_hl = QHBoxLayout()
@@ -3507,6 +3507,19 @@ class GameCard(QFrame):
             if _gstatus.startswith('warmup'):
                 time_hl.addWidget(mk_label(
                     "WARMUPS", color=C["t3"], size=10, mono=True))
+            elif 'delay' in _gstatus:
+                inn = g.get("inning", "")
+                state = (g.get("inning_state") or g.get("inning_half") or "").lower()
+                if inn:
+                    if state.startswith("top"): hlbl = "TOP"
+                    elif state.startswith("mid"): hlbl = "MID"
+                    elif state.startswith("end"): hlbl = "END"
+                    else: hlbl = "BOT"
+                    dtxt = f"DELAY {hlbl} {inn}"
+                else:
+                    dtxt = "DELAY"
+                time_hl.addWidget(mk_label(
+                    dtxt, color=C["amb"], size=10, mono=True, bold=True))
             else:
                 inn = g.get("inning")
                 state = (g.get("inning_state") or g.get("inning_half") or "").lower()
@@ -3521,10 +3534,10 @@ class GameCard(QFrame):
                         hlbl = "BOT"
                     time_hl.addWidget(mk_label(
                         f"{hlbl} {inn}", color=C["t3"], size=10, mono=True, bold=True))
+        elif ppd:
+            time_hl.addWidget(mk_label("Postponed", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
-        elif ppd:
-            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True, bold=True))
         else:
             time_hl.addWidget(mk_label(
                 g["time"], color=C["t3"], size=10, mono=True, bold=True))
@@ -3781,7 +3794,7 @@ class ScheduleGameCard(QFrame):
         st = (g.get("status") or "").lower()
         is_final = (g.get("time", "").upper() == "FINAL"
                     or st.startswith("final") or st.startswith("game over")
-                    or st.startswith("completed"))
+                    or st.startswith("completed") or ppd)
         is_live = _is_game_live(g)
         show_score = is_live or is_final
         innings_detail = g.get('innings_detail', [])
@@ -3804,6 +3817,19 @@ class ScheduleGameCard(QFrame):
             if _gstatus.startswith('warmup'):
                 time_hl.addWidget(mk_label(
                     "WARMUPS", color=C["t3"], size=10, mono=True))
+            elif 'delay' in _gstatus:
+                inn = g.get("inning", "")
+                state = (g.get("inning_state") or g.get("inning_half") or "").lower()
+                if inn:
+                    if state.startswith("top"): hlbl = "TOP"
+                    elif state.startswith("mid"): hlbl = "MID"
+                    elif state.startswith("end"): hlbl = "END"
+                    else: hlbl = "BOT"
+                    dtxt = f"DELAY {hlbl} {inn}"
+                else:
+                    dtxt = "DELAY"
+                time_hl.addWidget(mk_label(
+                    dtxt, color=C["amb"], size=10, mono=True, bold=True))
             else:
                 inn = g.get("inning")
                 state = (g.get("inning_state") or g.get("inning_half") or "").lower()
@@ -3817,10 +3843,10 @@ class ScheduleGameCard(QFrame):
                     else:
                         hlbl = "BOT"
                     time_hl.addWidget(mk_label(f"{hlbl} {inn}", color=C["t3"], size=10, mono=True, bold=True))
+        elif ppd:
+            time_hl.addWidget(mk_label("Postponed", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
-        elif ppd:
-            time_hl.addWidget(mk_label("PPD", color=C["red"], size=10, mono=True, bold=True))
         else:
             time_hl.addWidget(mk_label(g.get("time", "TBD"), color=C["t3"], size=10, mono=True, bold=True))
         time_hl.addStretch()
@@ -7149,7 +7175,7 @@ class SeamStatsApp(QMainWindow):
                     pass
 
     # ── Notepad ──────────────────────────────────────────────────────────
-    _NOTEPAD_FILE = os.path.join(_app_paths.APP_DIR, "assets", "notepad.txt")
+    _NOTEPAD_FILE = os.path.join(_app_paths.DATA_DIR, "notepad.txt")
 
     def _toggle_notepad(self):
         """Show or hide the floating notepad panel."""
@@ -7313,7 +7339,14 @@ class SeamStatsApp(QMainWindow):
         edit.setPlaceholderText("Type notes here…")
         vl.addWidget(edit)
 
-        # Load saved content
+        # Load saved content (migrate from old assets/ location if needed)
+        _old_notepad = os.path.join(_app_paths.APP_DIR, "assets", "notepad.txt")
+        if not os.path.exists(self._NOTEPAD_FILE) and os.path.exists(_old_notepad):
+            try:
+                import shutil
+                shutil.copy2(_old_notepad, self._NOTEPAD_FILE)
+            except Exception:
+                pass
         if os.path.exists(self._NOTEPAD_FILE):
             try:
                 with open(self._NOTEPAD_FILE, 'r', encoding='utf-8') as f:

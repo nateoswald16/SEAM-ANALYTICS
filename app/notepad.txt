@@ -1,0 +1,41 @@
+STL @ HOU - Pitcher dependent
+
+	STL
+		Walker*
+		Herrera*
+		Urias
+	HOU
+		Yordan*	
+
+ATL @ PHI - RHB for weather
+
+	ATL
+		Riley
+	PHI
+		Turner
+
+LAD @ COL - LHB for weather
+
+	LAD
+		Rushing*
+		Ohtani*
+		Freeman
+	COL
+		Goodman
+
+TOR @ ARI - Pitcher dependent / LHB for weather (later in the game)
+
+	TOR
+		Sanchez
+	ARI
+		Marte*
+		
+SD @ LAA - Pitcher dependent
+
+	SD
+		Xander
+	LAA
+		Trout*
+		Peraza*
+		Yoan
+		Adell
