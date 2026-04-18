@@ -4,6 +4,74 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.2.0 — 2026-04-17
+
+### Park & Weather
+
+**Stadium Size Descriptor**
+- Added `VENUE_SIZE_DESC` mapping all 30 venue IDs to size categories (Extra Small / Small / Medium / Large / Extra Large) based on foul-line distances and field area
+- New "Stadium Size: {desc}" label displayed below venue name on each weather card
+
+**Roof Status Label Cleanup**
+- Venue name line now uses `_predict_roof_status()` for proper formatting: ALL CAPS status (OPEN/CLOSED) with `*` suffix when predicted
+- Removed redundant roof badge from the card header row
+
+**Color Grading Thresholds**
+- Changed HR rating, hits rating, `_split_color()`, and `_hits_color()` thresholds from ±3% / ±2% to ±8%
+- Removed amber from neutral values — all neutral ratings now display white
+
+**Weather Overlay Fix**
+- Widened `WeatherOverlay` from 200px to 320px and switched from fixed-position text to dynamic centering using `QFontMetricsF` text measurement
+- Icon, temperature, and condition text are now measured and centered as a group — no more clipping on long descriptions like "Showers And Thunderstorms Likely"
+- Reduced gaps between icon→temp (4px) and temp→condition (6px)
+
+**Game Delay Hourly Re-Anchoring**
+- Delayed starts: fetches `firstPitch` from the live feed; if ≥15 min after scheduled `gameDate`, re-anchors hourly weather window and displayed time to the actual start
+- Suspended/resumed games: uses `resumeDateTime` from the live feed to re-anchor
+- Mid-game rain delays: detects `status="Delayed"` + `currentInning > 0` and re-anchors hourly window to the current hour so weather slots show resume-time conditions
+- Reuses already-fetched live feed JSON in the venue-coords fallback to avoid duplicate HTTP calls
+
+**Per-Park Deviation Ranking Diagnostic**
+- Created `_diag_park_rank.py` diagnostic tool that ranks venues by total prediction deviation (|HR Δ| + |XBH Δ| + |1B Δ|) against BallparkPal reference data
+- Includes a simulation engine that tests proposed parameter changes without modifying source code
+- Handles closed-roof venue suppression in simulations
+- Uses correct MLB API elevation values (feet): Coors=5190, Wrigley=595, Target=828, PNC=780, Progressive=653, etc.
+
+**7 Park-Specific Calibration Fixes (Total Deviation 90→63)**
+- Target Field (3312): WX temperature multiplier 0.80→0.60
+- Nationals Park (3309): Park factor 92→88, WX wind multiplier 1.60→1.40
+- Wrigley Field (17): WX wind multiplier 3.00→3.50
+- Fenway Park (3): Park factor 95→92, Hit factor 1B 1.07→1.04
+- Yankee Stadium (3313): Park factor 99→97
+- Sutter Health Park (2529): Park factor 101→99
+- loanDepot park (4169): Hit factor 2B 1.04→1.00
+- Final accuracy: Perfect(≤2): 3, Close(3-5): 10, Off(>5): 2
+
+**Hourly Toggle Fix for Finished Games**
+- Fixed hourly weather toggle showing only the current hour for finished games (e.g. "6 PM" instead of "2 PM, 3 PM, 4 PM, 5 PM")
+- Root cause: NWS API only returns future forecast periods, so past game hours are lost
+- Added Open-Meteo historical hourly fallback: after primary weather source, if `hourly_conditions` has fewer than 4 entries and a game UTC timestamp exists, fetches historical hourly data from Open-Meteo
+- All games now populate 4 correct hourly slots regardless of game status
+
+**Wind Insight Fixed Height**
+- Wind insight description label now uses `setFixedHeight(lineSpacing * 2 + 4)` for a fixed 2-row height
+- Prevents the weather card from resizing when toggling between hourly slots
+
+### Lineups
+
+**Filter Behavior on Subpage Switch**
+- Switching between subpages (Batting, Pitching, Base Running, BvP, Bullpen) now resets all filters (Season, Matchup, Time Window) to their defaults
+- Team toggle (Away/Home) no longer resets other applied filters — switching teams preserves the current Season, Matchup, and Time Window selections
+
+**Live Game Current Pitcher in Base Running**
+- Base Running subpage now shows the current active pitcher (including relievers) instead of only the starting pitcher for live games
+- New `get_current_pitchers()` method on `DataManager` fetches the boxscore API to identify the most recent pitcher per team
+- `get_game_baserunning()` accepts new `away_current_pitcher`/`home_current_pitcher` parameters
+- Both the initial data load and filter-triggered refreshes detect live games and pass current pitcher info
+- Non-live games (scheduled/final) continue to show the starter as before
+
+---
+
 ## v1.1.2 — 2026-04-15
 
 ### Top Pitching

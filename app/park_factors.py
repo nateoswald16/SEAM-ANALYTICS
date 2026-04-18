@@ -39,7 +39,11 @@ import _app_paths
 # ═══════════════════════════════════════════════════════════════════════════════
 from _app_theme import C
 from _ui_utils import mk_label as _mk
+from park_widget import WeatherDetailWidget
 
+
+# Abbreviation normalization (MLB API inconsistencies)
+_ABBR_NORM = {"AZ": "ARI"}
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Savant park factors  (venue_id → wOBA-based overall index, 100 = neutral)
@@ -883,13 +887,35 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Retractable roof prediction (pregame, before MLB provides official status)
 # ═══════════════════════════════════════════════════════════════════════════════
-# Per-venue rules based on MLB operational guidelines and historical patterns.
-# General: teams prefer open at 60°F+; high winds 25+ mph close roof.
-# Rain policies vary by venue — TEX/HOU are "zero tolerance" (close at ≥10%),
-# MIL monitors hourly (close if any rain in window), SEA is a "carport"
-# (stays open longer, closes when rain imminent).  Home team decides pregame;
-# roof can only move once mid-game.
-# Venue IDs:  MIL=32, HOU=2392, SEA=680, ARI=15, TEX=5325, TOR=14, MIA=4169
+# Per-venue thresholds for "open roof" conditions (from MLB operational data):
+#   MIL (32):  Temp ≥ 60–63 °F
+#   ARI (15):  Temp < 100 °F
+#   TEX (5325): Temp 65–80 °F, Humidity < 50 %
+#   MIA (4169): Heat Index < 83, Humidity < 70 %, Rain < 15 %
+#   HOU (2392): Temp 65–77 °F, Humidity < 50 %, Dew Point < 55 °F
+#   TOR (14):  Fan comfort & field safety (no field drainage)
+#   SEA (680): "Open as much as possible" (~78 % of games)
+# General: high winds ≥ 25 mph close the roof at all venues.
+# Home team decides pregame; roof can only move once mid-game.
+
+def _heat_index(temp_f: float, rh: float) -> float:
+    """Rothfusz regression heat index (°F)."""
+    if temp_f < 80:
+        return temp_f
+    return (-42.379 + 2.04901523 * temp_f + 10.14333127 * rh
+            - 0.22475541 * temp_f * rh - 6.83783e-3 * temp_f ** 2
+            - 5.481717e-2 * rh ** 2 + 1.22874e-3 * temp_f ** 2 * rh
+            + 8.5282e-4 * temp_f * rh ** 2 - 1.99e-6 * temp_f ** 2 * rh ** 2)
+
+def _dew_point(temp_f: float, rh: float) -> float:
+    """Approximate dew point (°F) via Magnus formula."""
+    if rh <= 0:
+        return temp_f - 40
+    tc = (temp_f - 32) * 5.0 / 9.0
+    a, b = 17.27, 237.7
+    gamma = (math.log(rh / 100.0) + a * tc / (b + tc))
+    dp_c = b * gamma / (a - gamma)
+    return dp_c * 9.0 / 5.0 + 32
 
 def _predict_retractable_roof(game: dict) -> str:
     """Return predicted roof_type string for a retractable venue.
@@ -911,32 +937,41 @@ def _predict_retractable_roof(game: dict) -> str:
 
     closed = False
     if vid == 32:       # MIL — American Family Field
-        # Staff monitors hourly forecasts; any rain → closed.  Comfort-focused.
+        # Open when: Temp ≥ 60 °F
         closed = temp < 60 or precip >= 15 or high_wind
-    elif vid == 2392:   # HOU — Daikin Park (Minute Maid)
-        # Zero-tolerance rain policy (close at even 10%).
-        # MLB-specific: close below 55°F or above 95°F.
-        closed = (temp < 55 or temp > 95 or precip >= 10 or high_wind
-                  or (temp > 88 and humid > 65))
+    elif vid == 2392:   # HOU — Minute Maid / Daikin Park
+        # Open when: Temp 65–77 °F, Humidity < 50 %, Dew Point < 55 °F
+        closed = (temp < 65 or temp > 77 or humid >= 50
+                  or _dew_point(temp, humid) >= 55
+                  or precip >= 10 or high_wind)
     elif vid == 680:    # SEA — T-Mobile Park
-        # "Carport" exception: roof acts as umbrella, stays open as long as
-        # possible.  Closes only when rain is imminent (higher threshold).
-        closed = temp < 60 or precip >= 50 or high_wind
+        # "Open as much as possible" — ~78 % of games open
+        closed = precip >= 50 or wind >= 30
     elif vid == 15:     # ARI — Chase Field
-        # Desert heat; close for heat (>85°F), cold (<60°F), rain, wind
-        # Typically closed May through September
-        closed = temp > 85 or temp < 60 or precip >= 20 or high_wind
+        # Open when: Temp < 100 °F
+        closed = temp >= 100 or precip >= 20 or high_wind
     elif vid == 5325:   # TEX — Globe Life Field
-        # Zero-tolerance rain policy (close at even 10%).
-        # Sensitive equipment (massive video boards).  Close for heat (>80°F).
-        closed = temp > 80 or temp < 60 or precip >= 10 or high_wind
+        # Open when: Temp 65–80 °F, Humidity < 50 %
+        closed = (temp < 65 or temp > 80 or humid >= 50
+                  or precip >= 10 or high_wind)
     elif vid == 14:     # TOR — Rogers Centre
-        # Conservative; close for cold (<60°F), moderate rain risk, wind
-        closed = temp < 60 or precip >= 20 or high_wind
+        # Fan comfort + field safety; no field drainage → low rain threshold
+        closed = temp < 60 or precip >= 15 or high_wind
     elif vid == 4169:   # MIA — loanDepot park
-        # Almost always closed due to heat + humidity;
-        # open only for mild, dry, low-humidity evenings
-        closed = temp > 78 or temp < 65 or humid > 60 or precip >= 15 or high_wind
+        # Night games and overcast conditions are more comfortable —
+        # Marlins tolerate higher humidity/heat index without the roof.
+        _cond = (game.get("condition") or "").lower()
+        _hourly = game.get("hourly_conditions") or []
+        _night = any(h.get("night") for h in _hourly[:2]) if _hourly else False
+        _overcast = any(w in _cond for w in ("cloud", "overcast", "partly"))
+        if _night or _overcast:
+            # Relaxed: Heat Index < 90, Humidity < 82 %
+            closed = (_heat_index(temp, humid) >= 90 or humid >= 82
+                      or precip >= 15 or high_wind)
+        else:
+            # Daytime sun: Heat Index < 83, Humidity < 70 %
+            closed = (_heat_index(temp, humid) >= 83 or humid >= 70
+                      or precip >= 15 or high_wind)
 
     tag = "CLOSED" if closed else "OPEN"
     return f"Retractable ({tag})*"
@@ -975,6 +1010,8 @@ def fetch_park_weather(date_str: str) -> list[dict]:
         t = g.get("teams", {})
         away_abbr = t.get("away", {}).get("team", {}).get("abbreviation", "?")
         home_abbr = t.get("home", {}).get("team", {}).get("abbreviation", "?")
+        away_abbr = _ABBR_NORM.get(away_abbr, away_abbr)
+        home_abbr = _ABBR_NORM.get(home_abbr, home_abbr)
 
         status = g.get("status", {}).get("detailedState", "")
         time_str = "TBD"
@@ -983,6 +1020,59 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             try:
                 dt_utc = datetime.fromisoformat(gd.replace("Z", "+00:00"))
                 time_str = dt_utc.astimezone().strftime("%I:%M %p").lstrip("0")
+            except Exception:
+                pass
+
+        # ── Delay / suspension: re-anchor to actual first pitch ──
+        # When a game is delayed the scheduled gameDate still reflects the
+        # original start.  The live feed's firstPitch (or resumeDateTime for
+        # suspended games) gives the real start so hourly weather windows
+        # align with the actual playing time.
+        #
+        # Mid-game delays (rain delay after play has started): firstPitch ≈
+        # gameDate so the threshold won't trigger.  Instead, detect that the
+        # game is mid-delay (status "Delayed" + currentInning > 0) and
+        # re-anchor to the current hour so the hourly slots show conditions
+        # for when play resumes.
+        _delay_statuses = ("Delayed", "Delayed Start", "Suspended",
+                           "In Progress", "Warmup", "Game Over", "Final")
+        _feed_json = None
+        if status in _delay_statuses and gd:
+            try:
+                _feed_json = _http.get(
+                    f"https://statsapi.mlb.com/api/v1.1/game/{gid}/feed/live",
+                    timeout=10,
+                ).json()
+                _feed_gd = _feed_json.get("gameData", {})
+                _feed_dt = _feed_gd.get("datetime", {})
+                _fp = (_feed_dt.get("firstPitch")
+                       or _feed_dt.get("resumeDateTime")
+                       or "")
+                if _fp:
+                    _fp_utc = datetime.fromisoformat(
+                        _fp.replace("Z", "+00:00"))
+                    _orig_utc = datetime.fromisoformat(
+                        gd.replace("Z", "+00:00"))
+                    # Only re-anchor if actual start is ≥15 min later
+                    if (_fp_utc - _orig_utc).total_seconds() >= 900:
+                        gd = _fp
+                        time_str = (_fp_utc.astimezone()
+                                    .strftime("%I:%M %p").lstrip("0"))
+
+                # Mid-game delay: game started on time but is currently
+                # stopped.  Re-anchor to the current hour so weather slots
+                # cover the expected resume window.
+                if status in ("Delayed",):
+                    _ls = _feed_json.get("liveData", {}).get("linescore", {})
+                    _inning = _ls.get("currentInning", 0) or 0
+                    if _inning > 0:
+                        _now_utc = datetime.now(timezone.utc)
+                        # Snap to the top of the current hour
+                        _now_hour = _now_utc.replace(
+                            minute=0, second=0, microsecond=0)
+                        gd = _now_hour.isoformat()
+                        time_str = (_now_hour.astimezone()
+                                    .strftime("%I:%M %p").lstrip("0"))
             except Exception:
                 pass
 
@@ -1012,10 +1102,11 @@ def fetch_park_weather(date_str: str) -> list[dict]:
         # Venue coords may be missing from schedule; grab from game feed
         if not result["lat"]:
             try:
-                feed = _http.get(
-                    f"https://statsapi.mlb.com/api/v1.1/game/{gid}/feed/live",
-                    timeout=10,
-                ).json()
+                feed = (_feed_json if _feed_json is not None
+                        else _http.get(
+                            f"https://statsapi.mlb.com/api/v1.1/game/{gid}/feed/live",
+                            timeout=10,
+                        ).json())
                 gv = feed.get("gameData", {}).get("venue", {})
                 gl = gv.get("location", {})
                 gc = gl.get("defaultCoordinates", {})
@@ -1038,16 +1129,32 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             except Exception:
                 pass
 
-        # Retractable roofs: determine open/closed from MLB condition field
+        # Retractable roofs: determine open/closed from MLB condition field.
+        # Only trust the API condition as an official roof indicator within
+        # 1 hour of game time (or once the game is live).  Earlier than that,
+        # the API frequently echoes stale or placeholder values that don't
+        # reflect the actual roof decision.
         _is_retractable = result["roof_type"] == "Retractable"
         _roof_confirmed = False
+        _game_live = status in ("In Progress", "Warmup", "Final",
+                                "Game Over", "Delayed")
+        # Check if we're within 1 hour of first pitch
+        _within_1hr = False
+        if gd and not _game_live:
+            try:
+                _gt = datetime.fromisoformat(gd.replace("Z", "+00:00"))
+                _now = datetime.now(_gt.tzinfo)
+                _within_1hr = (_gt - _now).total_seconds() <= 3600
+            except Exception:
+                pass
+        _trust_api = _game_live or _within_1hr
         if _is_retractable:
             cond_lower = result["condition"].lower()
-            if cond_lower in ("roof closed", "dome"):
+            if cond_lower in ("roof closed", "dome") and _trust_api:
                 result["roof_type"] = "Retractable (CLOSED)"
                 _roof_confirmed = True
-            elif cond_lower:
-                # Non-empty weather condition = game started with roof open
+            elif cond_lower and _game_live:
+                # Real weather reported while game is live → roof is open
                 result["roof_type"] = "Retractable (OPEN)"
                 _roof_confirmed = True
             # Clear dome/roof-closed condition so real weather can fill in
@@ -1055,6 +1162,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["condition"] = ""
 
         # NWS primary → WeatherAPI fallback → Open-Meteo fallback
+        _om_was_primary = False
         if result["lat"] and result["lon"]:
             _az = result["azimuth"]
             om = _fetch_nws(result["lat"], result["lon"],
@@ -1065,6 +1173,7 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             if not om:
                 om = _fetch_open_meteo(result["lat"], result["lon"],
                                        game_utc_iso=gd or None, azimuth=_az)
+                _om_was_primary = True
 
             result["precip_pct"] = om.get("precip_pct")
             result["pressure_hpa"] = om.get("pressure_hpa")
@@ -1088,8 +1197,22 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                 result["pressure_hpa"] = round(om["forecast_pressure"], 1)
             if om.get("forecast_humidity") is not None:
                 result["humidity_pct"] = om["forecast_humidity"]
-            if om.get("hourly_conditions"):
-                result["hourly_conditions"] = om["hourly_conditions"]
+
+            # Hourly conditions: NWS only provides future periods so past
+            # games may have < 4 slots.  Fall back to Open-Meteo (which has
+            # full historical hourly) when the primary source is incomplete.
+            # Skip the fallback call if Open-Meteo was already the primary
+            # source (its hourly data is already in ``om``).
+            _hourly = om.get("hourly_conditions") or []
+            if len(_hourly) < 4 and gd and not _om_was_primary:
+                _om_hourly = _fetch_open_meteo(
+                    result["lat"], result["lon"],
+                    game_utc_iso=gd, azimuth=_az)
+                _fallback_h = _om_hourly.get("hourly_conditions") or []
+                if len(_fallback_h) >= 4:
+                    _hourly = _fallback_h
+            if _hourly:
+                result["hourly_conditions"] = _hourly
 
         # Predictive roof status for retractable venues (pregame only)
         if _is_retractable and not _roof_confirmed:
@@ -1534,12 +1657,24 @@ class ParkWeatherCard(QFrame):
     def __init__(self, data: dict, parent=None):
         super().__init__(parent)
         self.d = data
+        self._game_id = data.get("game_id")
         self.setStyleSheet(
             f"QFrame {{ background:{C['bg1']}; "
             f"border:1px solid {C['bdr']}; border-radius:6px; }}")
         self.setSizePolicy(QSizePolicy.Policy.Expanding,
                            QSizePolicy.Policy.Fixed)
         self._build()
+
+    def update_data(self, data: dict):
+        """Update card with new weather data — update labels in-place."""
+        self.d = data
+        self._game_id = data.get("game_id")
+        # Update detail label
+        self._hourly = data.get("hourly_conditions", [])
+        self._detail_lbl.setText(self._detail_text(0))
+        # Update mini park widget
+        if hasattr(self._park, 'update_data'):
+            self._park.update_data(data)
 
     def _build(self):
         vl = QVBoxLayout(self)
@@ -1737,6 +1872,19 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
     is_today = (date_str == _dt.date.today().isoformat())
 
     if is_today or force_refresh:
+        # Preserve original hourly_conditions from existing cache before
+        # clearing — weather APIs drop past hours on re-fetch, which would
+        # cause the hourly toggle to shift mid-game.
+        _prev_hourly: dict[int, list[dict]] = {}
+        prev = get_cached_weather(date_str)
+        if prev:
+            for g in prev:
+                hc = g.get("hourly_conditions")
+                if hc and len(hc) >= 4:
+                    gid = g.get("game_id")
+                    if gid:
+                        _prev_hourly[gid] = hc
+
         # Delete stale disk cache so we get fresh weather
         try:
             stale = _weather_cache_path(date_str)
@@ -1747,6 +1895,7 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
         with _weather_lock:
             _weather_cache.pop(date_str, None)
     else:
+        _prev_hourly = {}
         # For non-today dates, use existing cache if available
         existing = get_cached_weather(date_str)
         if existing is not None:
@@ -1754,6 +1903,15 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
 
     # Fetch fresh data and update cache + disk
     data = fetch_park_weather(date_str)
+
+    # Restore original hourly_conditions so the 4-hour window stays
+    # anchored to game start rather than shifting to "now".
+    if _prev_hourly:
+        for g in data:
+            gid = g.get("game_id")
+            if gid and gid in _prev_hourly:
+                g["hourly_conditions"] = _prev_hourly[gid]
+
     with _weather_lock:
         _weather_cache[date_str] = data
     _save_weather_to_disk(date_str, data)
@@ -1798,10 +1956,30 @@ class _WeatherWorker(QThread):
                 self.finished.emit(cached)
                 return
 
+        # Preserve original hourly_conditions before re-fetch
+        _prev_hourly: dict[int, list[dict]] = {}
+        prev = get_cached_weather(self._date)
+        if prev:
+            for g in prev:
+                hc = g.get("hourly_conditions")
+                if hc and len(hc) >= 4:
+                    gid = g.get("game_id")
+                    if gid:
+                        _prev_hourly[gid] = hc
+
         try:
             data = fetch_park_weather(self._date)
         except Exception:
             data = []
+
+        # Restore original hourly_conditions so the 4-hour window stays
+        # anchored to game start.
+        if _prev_hourly:
+            for g in data:
+                gid = g.get("game_id")
+                if gid and gid in _prev_hourly:
+                    g["hourly_conditions"] = _prev_hourly[gid]
+
         with _weather_lock:
             _weather_cache[self._date] = data
         _save_weather_to_disk(self._date, data)
@@ -1911,6 +2089,31 @@ class ParkFactorsPage(QWidget):
         self._worker.finished.connect(self._on_refresh)
         self._worker.start()
 
+        # ── 30-minute periodic refresh for long sessions ──
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(30 * 60 * 1000)  # 30 minutes
+        self._refresh_timer.timeout.connect(self.refresh_weather)
+        self._refresh_timer.start()
+
+        # Track last refresh time so nav-back can skip if recent
+        import time as _t
+        self._last_refresh_mono = _t.monotonic()
+
+    # ── public refresh entry point ──
+    def refresh_weather(self):
+        """Kick off a background weather re-fetch (debounced to 60s)."""
+        import time as _t
+        now = _t.monotonic()
+        # Don't re-fetch if last refresh was < 60s ago
+        if now - self._last_refresh_mono < 60:
+            return
+        self._last_refresh_mono = now
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._worker = _WeatherWorker(self._date)
+        self._worker.finished.connect(self._on_refresh)
+        self._worker.start()
+
     # ── title + filter section ──
     def _build_header(self):
         wrap = QWidget()
@@ -1996,7 +2199,7 @@ class ParkFactorsPage(QWidget):
         self._grid = QGridLayout(cw)
         self._grid.setContentsMargins(24, 14, 24, 24)
         self._grid.setSpacing(14)
-        self._ncols = 4
+        self._ncols = 2
         for col in range(self._ncols):
             self._grid.setColumnStretch(col, 1)
 
@@ -2012,6 +2215,23 @@ class ParkFactorsPage(QWidget):
             return
         if data == self._all_data:
             return  # identical — nothing to update
+        # Diff per-game and update only changed cards in-place
+        old_map = {g.get("game_id"): g for g in (self._all_data or [])}
+        new_map = {g.get("game_id"): g for g in data}
+        if set(old_map.keys()) == set(new_map.keys()):
+            # Same games — update cards in-place instead of full rebuild
+            card_map = {getattr(c, '_game_id', None): c for c in self._cards
+                        if hasattr(c, '_game_id')}
+            changed = False
+            for gid, new_g in new_map.items():
+                if old_map.get(gid) != new_g and gid in card_map:
+                    card_map[gid].update_data(new_g)
+                    changed = True
+            if changed:
+                self._all_data = data
+                self._count_lbl.setText(f"{len(data)} games")
+            return
+        # Game set changed — full rebuild required
         self._on_data(data)
 
     # ── populate grid with cards ──
@@ -2030,7 +2250,7 @@ class ParkFactorsPage(QWidget):
         BATCH = 4
         end = min(self._populate_idx + BATCH, len(self._pending_games))
         for i in range(self._populate_idx, end):
-            card = ParkWeatherCard(self._pending_games[i])
+            card = WeatherDetailWidget(self._pending_games[i])
             self._cards.append(card)
             row, col = divmod(i, self._ncols)
             self._grid.addWidget(card, row, col)
@@ -2050,12 +2270,10 @@ class ParkFactorsPage(QWidget):
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         w = self.width()
-        if w < 900:
-            new_cols = 2
-        elif w < 1200:
-            new_cols = 3
+        if w < 1200:
+            new_cols = 1
         else:
-            new_cols = 4
+            new_cols = 2
         if new_cols != self._ncols and self._cards:
             self._ncols = new_cols
             self._reflow_grid()

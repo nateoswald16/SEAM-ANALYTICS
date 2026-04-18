@@ -33,6 +33,7 @@ app/statcast_cache/
 # ── Installer build artifacts ─────────────────────────────────
 build/
 dist/
+installer/build/
 installer/output/
 
 # ── OS junk ───────────────────────────────────────────────────
@@ -56,6 +57,7 @@ app/verify_2025.py
 app/rebuild_2026.py
 app/backfill_outs_er.py
 app/download_historical_statcast.py
+app/_diag_*.py
 
 # ── API keys ──────────────────────────────────────────────────
 app/weatherapi_key.txt

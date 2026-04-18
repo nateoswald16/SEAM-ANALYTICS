@@ -26,6 +26,7 @@ import sqlite3
 import json
 import csv
 import logging
+import weakref
 from html import escape as _h
 from pathlib import Path
 import datetime as dt
@@ -327,6 +328,13 @@ class _PlaysNotifier(QObject):
     plays_ready = pyqtSignal(dict)  # {game_id_str: [play_dicts]}
 
 
+class _FilterRefreshNotifier(QObject):
+    """Emitted from bg thread when filter-refresh data is ready."""
+    br_ready = pyqtSignal(object)       # baserunning data or None
+    bvp_ready = pyqtSignal(object)      # bvp data or None
+    bullpen_ready = pyqtSignal(object)  # bullpen tuple or None
+
+
 class _GameDataNotifier(QObject):
     """Emitted from bg thread when game data (batting/pitching/br/bvp) is ready."""
     data_ready = pyqtSignal(dict)
@@ -424,7 +432,7 @@ class DataManager:
                 conn = None
         return conn
 
-    _season_cache: dict = {}  # {game_id: season_int} — class-level cache
+    _season_cache: dict = {}  # {game_id: season_int} — class-level cache (capped at 200)
 
     def _detect_season(self, cur, game_id):
         """Return the season year for a game_id, checking cache then DB."""
@@ -439,6 +447,10 @@ class DataManager:
                 if r and r[0]:
                     val = int(r[0])
                     self._season_cache[game_id] = val
+                    # Cap cache size
+                    if len(self._season_cache) > 200:
+                        oldest = next(iter(self._season_cache))
+                        del self._season_cache[oldest]
                     return val
             except Exception:
                 pass
@@ -843,12 +855,12 @@ class DataManager:
         except Exception:
             return None
 
-    def fetch_live_games(self, date_str):
+    def fetch_live_games(self, date_str, poll_mode=False):
         """Fetch live schedule from MLB API for a given date (returns app-friendly game dicts)."""
         if not self.api:
             return []
         try:
-            sched = self.api.get_schedule(date_str)
+            sched = self.api.get_schedule(date_str, poll_mode=poll_mode)
             out = []
             for g in sched:
                 gid = g.get('id')
@@ -861,6 +873,10 @@ class DataManager:
                 home_p = pp.get('home', {}).get('name') if pp.get('home') else 'TBD'
                 away_p_id = pp.get('away', {}).get('id') if pp.get('away') else None
                 home_p_id = pp.get('home', {}).get('id') if pp.get('home') else None
+                away_p_full = pp.get('away', {}).get('fullName', '') if pp.get('away') else ''
+                home_p_full = pp.get('home', {}).get('fullName', '') if pp.get('home') else ''
+                away_p_throws = pp.get('away', {}).get('throws', '') if pp.get('away') else ''
+                home_p_throws = pp.get('home', {}).get('throws', '') if pp.get('home') else ''
                 away_score = g.get('away_score', 0)
                 home_score = g.get('home_score', 0)
                 # Determine live flag conservatively
@@ -882,7 +898,8 @@ class DataManager:
                     'game_id': str(gid), 'away': away, 'home': home,
                     'away_p': away_p, 'home_p': home_p,
                     'away_p_id': away_p_id, 'home_p_id': home_p_id,
-                    'away_p_throws': '', 'home_p_throws': '',
+                    'away_p_full': away_p_full, 'home_p_full': home_p_full,
+                    'away_p_throws': away_p_throws, 'home_p_throws': home_p_throws,
                     'time': time_str, 'live': live,
                     'away_score': int(away_score or 0),
                     'home_score': int(home_score or 0),
@@ -1503,7 +1520,7 @@ class DataManager:
 
     # ── Extracted row builders (shared by pitching / baserunning) ────
 
-    def _build_pitcher_row(self, cur, pid, pname, p_throws, season, matchup, window):
+    def _build_pitcher_row(self, cur, pid, pname, p_throws, season, matchup, window, conn_calc=None):
         """Build a single pitcher stats row from calc DB or raw PA fallback."""
         # Resolve pid from name if missing — check cache first
         if not pid and pname and pname != 'TBD':
@@ -1557,7 +1574,8 @@ class DataManager:
             return empty
 
         # Try calculated DB
-        conn_calc = self.calc_connect() if season is not None else None
+        if conn_calc is None:
+            conn_calc = self.calc_connect() if season is not None else None
         if conn_calc:
             try:
                 cur_calc = conn_calc.cursor()
@@ -1689,7 +1707,7 @@ class DataManager:
 
         return empty
 
-    def _build_pitcher_br_row(self, cur, pid, pname, p_throws, season, matchup, window):
+    def _build_pitcher_br_row(self, cur, pid, pname, p_throws, season, matchup, window, conn_calc=None):
         """Build a pitcher baserunning row."""
         if pid:
             try:
@@ -1703,7 +1721,8 @@ class DataManager:
         empty = [display_name, "0", "0", "0", ""]
         if not pid:
             return empty
-        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc is None:
+            conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
         if conn_calc:
             try:
                 cur_calc = conn_calc.cursor()
@@ -1723,12 +1742,13 @@ class DataManager:
                 log.exception("_build_pitcher_br_row")
         return empty
 
-    def _build_catcher_br_row(self, pid, pname, season, matchup, window):
+    def _build_catcher_br_row(self, pid, pname, season, matchup, window, conn_calc=None):
         """Build a catcher baserunning row."""
         empty = [pname or '', "0", "0", "0", ""]
         if not pid:
             return empty
-        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc is None:
+            conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
         if conn_calc:
             try:
                 cur_calc = conn_calc.cursor()
@@ -1748,13 +1768,14 @@ class DataManager:
                 log.exception("_build_catcher_br_row")
         return empty
 
-    def _build_runner_br_row(self, pid, pos, name, hand, season, matchup, window):
+    def _build_runner_br_row(self, pid, pos, name, hand, season, matchup, window, conn_calc=None):
         """Build a runner baserunning row."""
         display_name = f"{name} {hand}".strip() if hand else name
         empty = [pos, display_name, "", "0", "0", "0", "0", "", "0", "0", ""]
         if not pid:
             return empty
-        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+        if conn_calc is None:
+            conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
         if conn_calc:
             try:
                 cur_calc = conn_calc.cursor()
@@ -1785,7 +1806,6 @@ class DataManager:
 
         # Fallback: try to get OBP from batting stats calc DB
         obp_str = ""
-        conn_calc = self.calc_connect() if os.path.exists(self.calc_db_path) else None
         if conn_calc:
             try:
                 cur_calc = conn_calc.cursor()
@@ -1872,12 +1892,13 @@ class DataManager:
             return home_pids, away_pids, pitcher_info
 
         # ── Bullpen / multi-pitcher mode ──
+        _calc_conn = self.calc_connect() if eff_season is not None else None
         if away_pitchers is not None or home_pitchers is not None:
             away_rows = [self._build_pitcher_row(cur, p.get('id'), p.get('name', 'TBD'), p.get('throws', ''),
-                                                 eff_season, eff_matchup, eff_window)
+                                                 eff_season, eff_matchup, eff_window, _calc_conn)
                          for p in (away_pitchers or [])]
             home_rows = [self._build_pitcher_row(cur, p.get('id'), p.get('name', 'TBD'), p.get('throws', ''),
-                                                 eff_season, eff_matchup, eff_window)
+                                                 eff_season, eff_matchup, eff_window, _calc_conn)
                          for p in (home_pitchers or [])]
             if not away_rows and not home_rows:
                 return None
@@ -1892,7 +1913,7 @@ class DataManager:
                 return []
             pid = sorted_pids[0]
             pname, p_throws, _ = info.get(pid, ('', '', 0))
-            return [self._build_pitcher_row(cur, pid, pname, p_throws, eff_season, eff_matchup, eff_window)]
+            return [self._build_pitcher_row(cur, pid, pname, p_throws, eff_season, eff_matchup, eff_window, _calc_conn)]
 
         away_rows = _build_side(away_pids, pitcher_info)
         home_rows = _build_side(home_pids, pitcher_info)
@@ -1902,17 +1923,72 @@ class DataManager:
             pid = away_starter.get('id')
             pname = away_starter.get('name', 'TBD')
             pt = away_starter.get('throws', '')
-            away_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window)]
+            away_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window, _calc_conn)]
         if not home_rows and home_starter:
             pid = home_starter.get('id')
             pname = home_starter.get('name', 'TBD')
             pt = home_starter.get('throws', '')
-            home_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window)]
+            home_rows = [self._build_pitcher_row(cur, pid, pname, pt, eff_season, eff_matchup, eff_window, _calc_conn)]
 
         if not away_rows and not home_rows:
             return None
 
         return PIT_COLS, PIT_HI, away_rows, home_rows
+
+    # ── Boxscore cache (avoids duplicate HTTP calls per game) ──────────
+    _boxscore_cache: dict = {}   # {game_id: (timestamp, json_dict)}
+    _BOXSCORE_TTL = 30           # seconds
+
+    def _fetch_boxscore(self, game_id):
+        """Fetch boxscore JSON with a short TTL cache to avoid duplicate calls."""
+        import time as _time
+        cached = self._boxscore_cache.get(game_id)
+        if cached:
+            ts, data = cached
+            if _time.monotonic() - ts < self._BOXSCORE_TTL:
+                return data
+        try:
+            url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
+            resp = _http.get(url, timeout=TIMEOUT_DEFAULT)
+            resp.raise_for_status()
+            box = resp.json()
+        except Exception:
+            log.exception("_fetch_boxscore: API fetch")
+            return None
+        self._boxscore_cache[game_id] = (_time.monotonic(), box)
+        # Cap cache size
+        if len(self._boxscore_cache) > 30:
+            oldest = min(self._boxscore_cache, key=lambda k: self._boxscore_cache[k][0])
+            del self._boxscore_cache[oldest]
+        return box
+
+    def get_current_pitchers(self, game_id):
+        """Fetch the current (most recent) pitcher for each team from the boxscore API.
+
+        Returns (away_pitcher_dict, home_pitcher_dict) where each dict has
+        keys: id, name, throws.  Returns (None, None) on failure.
+        """
+        if not game_id:
+            return None, None
+        box = self._fetch_boxscore(game_id)
+        if not box:
+            return None, None
+
+        result = {}
+        for side in ('away', 'home'):
+            team_data = box.get('teams', {}).get(side, {})
+            pitcher_ids = team_data.get('pitchers', [])
+            players = team_data.get('players', {})
+            if pitcher_ids:
+                current_pid = pitcher_ids[-1]
+                player_key = f"ID{current_pid}"
+                player_info = players.get(player_key, {})
+                person = player_info.get('person', {})
+                name = person.get('fullName', 'TBD')
+                result[side] = {'id': current_pid, 'name': name, 'throws': ''}
+            else:
+                result[side] = None
+        return result.get('away'), result.get('home')
 
     def get_bullpen_pitching(self, game_id, season=None, matchup=None, window=None):
         """Return pitching stats for all bullpen pitchers in the game.
@@ -1923,13 +1999,8 @@ class DataManager:
         """
         if not game_id:
             return None
-        try:
-            url = f"https://statsapi.mlb.com/api/v1/game/{game_id}/boxscore"
-            resp = _http.get(url, timeout=TIMEOUT_DEFAULT)
-            resp.raise_for_status()
-            box = resp.json()
-        except Exception:
-            log.exception("get_bullpen_pitching: API fetch")
+        box = self._fetch_boxscore(game_id)
+        if not box:
             return None
 
         away_pitchers = []
@@ -1966,8 +2037,14 @@ class DataManager:
             away_pitchers=away_pitchers, home_pitchers=home_pitchers)
 
     def get_game_baserunning(self, game_id, season=None, matchup=None, window=None,
-                              away_starter=None, home_starter=None):
+                              away_starter=None, home_starter=None,
+                              away_current_pitcher=None, home_current_pitcher=None):
         """Return baserunning data for a game: pitcher table, catcher table, lineup table.
+
+        When ``away_current_pitcher``/``home_current_pitcher`` are provided
+        (dicts with id, name, throws), they replace the starter in the
+        pitcher baserunning section (used for live games when a reliever
+        has entered).
 
         Returns a dict with keys: pit_cols, pit_hi, pit_away, pit_home,
         cat_cols, cat_hi, cat_away, cat_home, br_cols, br_hi, br_away, br_home.
@@ -2015,14 +2092,22 @@ class DataManager:
                 players = lineup_data['players']
 
         # Build side data
-        def _build_side(side, starter_info):
-            """Return (pit_rows, cat_rows, lineup_rows) for one side."""
+        # Open calc DB connection once for all row builders in this side
+        _calc_conn = self.calc_connect() if os.path.exists(self.calc_db_path) else None
+
+        def _build_side(side, starter_info, current_pitcher=None):
+            """Return (pit_rows, cat_rows, lineup_rows) for one side.
+
+            When *current_pitcher* is provided (live game), use it for the
+            pitcher BR row instead of the starter.
+            """
             lineup_list = players.get(side, [])
 
-            # Pitcher row
-            pit_pid = starter_info.get('id') if starter_info else None
-            pit_name = starter_info.get('name', 'TBD') if starter_info else 'TBD'
-            pit_throws = starter_info.get('throws', '') if starter_info else ''
+            # Pitcher row — use current pitcher if provided, else starter
+            pitcher_info = current_pitcher if current_pitcher else starter_info
+            pit_pid = pitcher_info.get('id') if pitcher_info else None
+            pit_name = pitcher_info.get('name', 'TBD') if pitcher_info else 'TBD'
+            pit_throws = pitcher_info.get('throws', '') if pitcher_info else ''
             if not pit_throws and pit_pid:
                 try:
                     cur.execute("SELECT p_throws FROM plate_appearances WHERE pitcher_id=? AND p_throws IS NOT NULL LIMIT 1", (pit_pid,))
@@ -2032,7 +2117,7 @@ class DataManager:
                 except Exception:
                     log.exception("_build_side")
             pit_row = [self._build_pitcher_br_row(cur, pit_pid, pit_name, pit_throws,
-                                                    eff_season, eff_matchup, eff_window)]
+                                                    eff_season, eff_matchup, eff_window, _calc_conn)]
 
             # Collect ALL catchers from the roster (shows multiple when
             # lineup isn't confirmed yet; narrows to one once it is).
@@ -2041,7 +2126,7 @@ class DataManager:
                 if p.get('pos', '').upper() == 'C':
                     cat_rows.append(self._build_catcher_br_row(
                         p.get('player_id'), p.get('name', ''),
-                        eff_season, eff_matchup, eff_window))
+                        eff_season, eff_matchup, eff_window, _calc_conn))
             # Fallback: look up from DB
             if not cat_rows:
                 try:
@@ -2054,7 +2139,7 @@ class DataManager:
                     r = cur.fetchone()
                     if r:
                         cat_rows.append(self._build_catcher_br_row(
-                            r[0], r[1] or '', eff_season, eff_matchup, eff_window))
+                            r[0], r[1] or '', eff_season, eff_matchup, eff_window, _calc_conn))
                 except Exception:
                     log.exception("_build_side")
 
@@ -2062,7 +2147,7 @@ class DataManager:
             if lineup_list:
                 br_rows = [self._build_runner_br_row(
                     p.get('player_id'), p.get('pos', ''), p.get('name', ''), p.get('hand', ''),
-                    eff_season, eff_matchup, eff_window
+                    eff_season, eff_matchup, eff_window, _calc_conn
                 ) for p in lineup_list]
             else:
                 # Fallback: build from PAs in the game
@@ -2076,7 +2161,7 @@ class DataManager:
                         GROUP BY batter_id ORDER BY MIN(at_bat_number) ASC
                     """, (game_id, flag))
                     br_rows = [self._build_runner_br_row(r[0], r[2] or '', r[1] or '', r[3] or '',
-                                                         eff_season, eff_matchup, eff_window)
+                                                         eff_season, eff_matchup, eff_window, _calc_conn)
                                for r in cur.fetchall()]
                 except Exception:
                     br_rows = []
@@ -2084,8 +2169,8 @@ class DataManager:
             return pit_row, cat_rows, br_rows
 
         # Away team faces home pitcher; home team faces away pitcher
-        away_pit, away_cat, away_br = _build_side('away', away_starter)
-        home_pit, home_cat, home_br = _build_side('home', home_starter)
+        away_pit, away_cat, away_br = _build_side('away', away_starter, away_current_pitcher)
+        home_pit, home_cat, home_br = _build_side('home', home_starter, home_current_pitcher)
 
         return {
             'pit_cols': PIT_BR_COLS, 'pit_hi': PIT_BR_HI,
@@ -3287,14 +3372,13 @@ class MiniDiamondWidget(QWidget):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Shared blink timer — one 900ms timer drives all live GameCard dot animations
 # ═══════════════════════════════════════════════════════════════════════════════
-_BLINK_CARDS: set = set()  # weakref-like set of GameCard instances currently blinking
+_BLINK_CARDS: weakref.WeakSet = weakref.WeakSet()
 _BLINK_STATE: list = [True]  # mutable container so inner lambda can toggle
 
 def _blink_tick():
     _BLINK_STATE[0] = not _BLINK_STATE[0]
     on = _BLINK_STATE[0]
-    dead = []
-    for card in _BLINK_CARDS:
+    for card in list(_BLINK_CARDS):
         try:
             card._blink = on
             if hasattr(card, "_dot"):
@@ -3302,9 +3386,7 @@ def _blink_tick():
                     f"color:{'#e85d3a' if on else '#6b1a0c'};"
                     "background:transparent; font-family:'Segoe UI'; font-size:10px;")
         except RuntimeError:
-            dead.append(card)
-    if dead:
-        _BLINK_CARDS.difference_update(dead)
+            pass  # prevent lingering deleted widget errors
     # Stop the global timer if no cards need blinking
     if not _BLINK_CARDS and _BLINK_TIMER is not None:
         _BLINK_TIMER.stop()
@@ -4335,6 +4417,11 @@ class ScheduleGameCard(QFrame):
                 dl.setWordWrap(True)
                 dl.setContentsMargins(24, 0, 0, 0)
                 self._play_layout.addWidget(dl)
+            hr_details = p.get('hr_details', '')
+            if hr_details:
+                hl = mk_label(hr_details, color=C["t2"], size=11)
+                hl.setContentsMargins(24, 0, 0, 0)
+                self._play_layout.addWidget(hl)
         self._play_layout.addStretch()
         # Auto-scroll to bottom
         QTimer.singleShot(50, lambda: (
@@ -4543,6 +4630,10 @@ class GameDetailPanel(QWidget):
         self._vl.setSpacing(0)
         self._game_data_notifier = _GameDataNotifier()
         self._game_data_notifier.data_ready.connect(self._on_game_data_ready)
+        self._filter_notifier = _FilterRefreshNotifier()
+        self._filter_notifier.br_ready.connect(self._on_br_refreshed)
+        self._filter_notifier.bvp_ready.connect(self._on_bvp_refreshed)
+        self._filter_notifier.bullpen_ready.connect(self._on_bullpen_refreshed)
         self._pending_data = None  # holds fetched data dict for lazy tab builds
         self._built_tabs = set()   # indices of tabs whose widgets have been built
         self._load_gen = 0          # incremented every load_game; stale signals ignored
@@ -4656,16 +4747,62 @@ class GameDetailPanel(QWidget):
                             return r[0]
                 except Exception:
                     log.exception("_lookup_throws")
+                # Fallback: People API (handles debut pitchers with no PA data)
+                if pid and hasattr(_DM, 'api') and _DM.api:
+                    try:
+                        hand = _DM.api._fetch_pitcher_hand(pid)
+                        if hand:
+                            _cache_pitcher(pid, pname, hand)
+                            return hand
+                    except Exception:
+                        log.exception("_lookup_throws people API")
                 return ''
+
+            # Resolve full names for debut pitchers who have no PA data yet
+            def _resolve_full_name(pid, abbr_name, full_name):
+                """Return the best available full name for a pitcher."""
+                if full_name:
+                    return full_name
+                if not pid:
+                    return abbr_name
+                # Try DB first
+                try:
+                    conn = _DM.connect()
+                    if conn:
+                        cur = conn.cursor()
+                        cur.execute("SELECT pitcher_name FROM plate_appearances WHERE pitcher_id=? AND pitcher_name IS NOT NULL LIMIT 1", (pid,))
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            return r[0]
+                except Exception:
+                    pass
+                # Fallback: People API
+                if hasattr(_DM, 'api') and _DM.api:
+                    try:
+                        name = _DM.api._fetch_person_name(pid)
+                        if name:
+                            return name
+                    except Exception:
+                        pass
+                return abbr_name
+
             if not data['away_p_throws']:
                 data['away_p_throws'] = _lookup_throws(game.get('away_p_id'), away_p)
             if not data['home_p_throws']:
                 data['home_p_throws'] = _lookup_throws(game.get('home_p_id'), home_p)
 
+            # Resolve full pitcher names (abbreviated "F. Last" → "First Last")
+            away_p_full = game.get('away_p_full', '')
+            home_p_full = game.get('home_p_full', '')
+            away_p_resolved = _resolve_full_name(game.get('away_p_id'), away_p, away_p_full)
+            home_p_resolved = _resolve_full_name(game.get('home_p_id'), home_p, home_p_full)
+            data['away_p'] = away_p_resolved
+            data['home_p'] = home_p_resolved
+
             gid = game.get('game_id')
-            away_starter = {'id': game.get('away_p_id'), 'name': away_p,
+            away_starter = {'id': game.get('away_p_id'), 'name': away_p_resolved,
                             'throws': data['away_p_throws']}
-            home_starter = {'id': game.get('home_p_id'), 'name': home_p,
+            home_starter = {'id': game.get('home_p_id'), 'name': home_p_resolved,
                             'throws': data['home_p_throws']}
 
             # Run all 4 data queries in parallel
@@ -4686,8 +4823,14 @@ class GameDetailPanel(QWidget):
 
             def _q_br():
                 try:
+                    away_cur = None
+                    home_cur = None
+                    if _is_game_live(game):
+                        away_cur, home_cur = _DM.get_current_pitchers(gid)
                     return _DM.get_game_baserunning(gid, away_starter=away_starter,
-                                                     home_starter=home_starter) if gid else None
+                                                     home_starter=home_starter,
+                                                     away_current_pitcher=away_cur,
+                                                     home_current_pitcher=home_cur) if gid else None
                 except Exception:
                     return None
 
@@ -4815,6 +4958,17 @@ class GameDetailPanel(QWidget):
             home_p = data['home_p']
             away_p_throws = data['away_p_throws']
             home_p_throws = data['home_p_throws']
+
+            # Propagate resolved full names + throws back into _current_game
+            # so filter-refresh paths use the resolved values.
+            cg = getattr(self, '_current_game', None)
+            if cg:
+                cg['away_p'] = away_p
+                cg['home_p'] = home_p
+                if away_p_throws:
+                    cg['away_p_throws'] = away_p_throws
+                if home_p_throws:
+                    cg['home_p_throws'] = home_p_throws
 
             def _sp_tag(name, hand):
                 h = f" {hand}" if hand else ""
@@ -5114,11 +5268,11 @@ class GameDetailPanel(QWidget):
             elif idx == 1:
                 self._refresh_pitching()
             elif idx == 2:
-                self._refresh_baserunning()
+                self._refresh_baserunning_bg()
             elif idx == 3:
-                self._refresh_bvp()
+                self._refresh_bvp_bg()
             elif idx == 4:
-                self._refresh_bullpen()
+                self._refresh_bullpen_bg()
         except RuntimeError:
             pass  # C++ object deleted
         except Exception:
@@ -5134,6 +5288,16 @@ class GameDetailPanel(QWidget):
             # Lazy-build the tab if it hasn't been built yet
             self._build_tab(idx)
             _fade_switch(self._inner_stack, idx)
+
+            # Reset all filters to defaults when switching subpages
+            if idx != prev:
+                self.season_cb.blockSignals(True)
+                self.season_cb.setCurrentIndex(0)
+                self.season_cb.blockSignals(False)
+                self.window_cb.blockSignals(True)
+                self.window_cb.setCurrentIndex(0)
+                self.window_cb.blockSignals(False)
+
             # Refresh this tab's data if it was built with stale filter values
             if idx in self._built_tabs and idx != prev and self._pending_data:
                 try:
@@ -5357,29 +5521,14 @@ class GameDetailPanel(QWidget):
 
     def _refresh_bullpen(self):
         """Refresh the bullpen tables using current filter selections."""
+        self._refresh_bullpen_bg()
+
+    def _apply_bullpen_data(self, res):
+        """Apply bullpen data to UI (must run on main thread)."""
         try:
             if _is_deleted(self):
                 return
-            game = getattr(self, '_current_game', None)
-            if not game:
-                return
-            gid = game.get('game_id')
             try:
-                sel_season = int(self.season_cb.currentText())
-            except Exception:
-                sel_season = None
-            mmap = {'Both': 'all', 'RHB': 'vs_righty', 'LHB': 'vs_lefty',
-                    'RHP': 'vs_righty', 'LHP': 'vs_lefty'}
-            wmap = {'All Games': 'season', 'Last 5 Games': 'last5', 'Last 10 Games': 'last10',
-                    'Last 15 Games': 'last15', 'Last 30 Games': 'last30'}
-            sel_matchup = mmap.get(self.matchup_cb.currentText(), 'all')
-            sel_window = wmap.get(self.window_cb.currentText(), 'season')
-
-            try:
-                res = _DM.get_bullpen_pitching(gid, season=sel_season, matchup=sel_matchup,
-                                                window=sel_window)
-                if not res:
-                    return
                 new_cols, new_hi, new_away, new_home = res
             except Exception:
                 return
@@ -5412,36 +5561,135 @@ class GameDetailPanel(QWidget):
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
         except Exception:
-            log.exception("_refresh_bullpen")
+            log.exception("_apply_bullpen_data")
+
+    # ── Background dispatchers for filter refresh (avoid blocking UI) ──
+
+    def _get_filter_selections(self):
+        """Read current filter combo values. Must be called on the main thread."""
+        game = getattr(self, '_current_game', None)
+        if not game:
+            return None
+        try:
+            sel_season = int(self.season_cb.currentText())
+        except Exception:
+            sel_season = None
+        mmap = {'Both': 'all', 'RHP': 'vs_righty', 'LHP': 'vs_lefty',
+                'RHB': 'vs_righty', 'LHB': 'vs_lefty'}
+        wmap = {'All Games': 'season', 'Last 5 Games': 'last5', 'Last 10 Games': 'last10',
+                'Last 15 Games': 'last15', 'Last 30 Games': 'last30'}
+        sel_matchup = mmap.get(self.matchup_cb.currentText(), 'all')
+        sel_window = wmap.get(self.window_cb.currentText(), 'season')
+        return {'game': game, 'season': sel_season, 'matchup': sel_matchup, 'window': sel_window}
+
+    def _refresh_baserunning_bg(self):
+        """Dispatch baserunning refresh to background thread."""
+        filt = self._get_filter_selections()
+        if not filt:
+            return
+        game = filt['game']
+        gid = game.get('game_id')
+        gen = self._load_gen
+        notifier = self._filter_notifier
+        away_starter = {'id': game.get('away_p_id'), 'name': game.get('away_p', 'TBD'),
+                        'throws': game.get('away_p_throws', '')}
+        home_starter = {'id': game.get('home_p_id'), 'name': game.get('home_p', 'TBD'),
+                        'throws': game.get('home_p_throws', '')}
+        is_live = _is_game_live(game)
+        def _work():
+            try:
+                away_current, home_current = (None, None)
+                if is_live:
+                    away_current, home_current = _DM.get_current_pitchers(gid)
+                data = _DM.get_game_baserunning(
+                    gid, season=filt['season'], matchup=filt['matchup'],
+                    window=filt['window'], away_starter=away_starter,
+                    home_starter=home_starter,
+                    away_current_pitcher=away_current,
+                    home_current_pitcher=home_current)
+                notifier.br_ready.emit(data)
+            except Exception:
+                notifier.br_ready.emit(None)
+        try:
+            _bg_pool.submit(_work)
+        except RuntimeError:
+            pass
+
+    def _refresh_bvp_bg(self):
+        """Dispatch BvP refresh to background thread."""
+        filt = self._get_filter_selections()
+        if not filt:
+            return
+        game = filt['game']
+        gid = game.get('game_id')
+        notifier = self._filter_notifier
+        wmap_bvp = {'season': 'all', 'last5': 'last5', 'last10': 'last10',
+                    'last15': 'last15', 'last30': 'last30'}
+        sel_window = wmap_bvp.get(filt['window'], 'all')
+        away_starter = {'id': game.get('away_p_id'), 'name': game.get('away_p', 'TBD'),
+                        'throws': game.get('away_p_throws', '')}
+        home_starter = {'id': game.get('home_p_id'), 'name': game.get('home_p', 'TBD'),
+                        'throws': game.get('home_p_throws', '')}
+        def _work():
+            try:
+                data = _DM.get_bvp_data(gid, window=sel_window,
+                    away_starter=away_starter, home_starter=home_starter)
+                notifier.bvp_ready.emit(data)
+            except Exception:
+                notifier.bvp_ready.emit(None)
+        try:
+            _bg_pool.submit(_work)
+        except RuntimeError:
+            pass
+
+    def _refresh_bullpen_bg(self):
+        """Dispatch bullpen refresh to background thread."""
+        filt = self._get_filter_selections()
+        if not filt:
+            return
+        game = filt['game']
+        gid = game.get('game_id')
+        notifier = self._filter_notifier
+        def _work():
+            try:
+                data = _DM.get_bullpen_pitching(gid, season=filt['season'],
+                    matchup=filt['matchup'], window=filt['window'])
+                notifier.bullpen_ready.emit(data)
+            except Exception:
+                notifier.bullpen_ready.emit(None)
+        try:
+            _bg_pool.submit(_work)
+        except RuntimeError:
+            pass
+
+    # ── Signal handlers (run on main thread) ──
+
+    def _on_br_refreshed(self, br_data):
+        """Apply baserunning data from background refresh."""
+        if _is_deleted(self) or not br_data:
+            return
+        self._apply_br_data(br_data)
+
+    def _on_bvp_refreshed(self, bvp_data):
+        """Apply BvP data from background refresh."""
+        if _is_deleted(self) or not bvp_data:
+            return
+        self._apply_bvp_data(bvp_data)
+
+    def _on_bullpen_refreshed(self, res):
+        """Apply bullpen data from background refresh."""
+        if _is_deleted(self) or not res:
+            return
+        self._apply_bullpen_data(res)
 
     def _refresh_baserunning(self):
         """Refresh the base running tables using current filter selections."""
+        self._refresh_baserunning_bg()
+
+    def _apply_br_data(self, br_data):
+        """Apply baserunning data to UI (must run on main thread)."""
         try:
             if _is_deleted(self):
-                return
-            game = getattr(self, '_current_game', None)
-            if not game:
-                return
-            gid = game.get('game_id')
-            try:
-                sel_season = int(self.season_cb.currentText())
-            except Exception:
-                sel_season = None
-            mmap = {'Both': 'all', 'RHP': 'vs_righty', 'LHP': 'vs_lefty',
-                    'RHB': 'vs_righty', 'LHB': 'vs_lefty'}
-            wmap = {'All Games': 'season', 'Last 5 Games': 'last5', 'Last 10 Games': 'last10',
-                    'Last 15 Games': 'last15', 'Last 30 Games': 'last30'}
-            sel_matchup = mmap.get(self.matchup_cb.currentText(), 'all')
-            sel_window = wmap.get(self.window_cb.currentText(), 'season')
-
-            away_starter = {'id': game.get('away_p_id'), 'name': game.get('away_p', 'TBD'),
-                            'throws': game.get('away_p_throws', '')}
-            home_starter = {'id': game.get('home_p_id'), 'name': game.get('home_p', 'TBD'),
-                            'throws': game.get('home_p_throws', '')}
-            br_data = _DM.get_game_baserunning(gid, season=sel_season, matchup=sel_matchup,
-                                                window=sel_window, away_starter=away_starter,
-                                                home_starter=home_starter)
-            if not br_data:
                 return
 
             stack = getattr(self, '_br_stack', None)
@@ -5515,33 +5763,24 @@ class GameDetailPanel(QWidget):
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
         except Exception:
-            log.exception("_refresh_baserunning")
+            log.exception("_apply_br_data")
 
     def _refresh_bvp(self):
         """Refresh the BvP tables using current time window selection."""
+        self._refresh_bvp_bg()
+
+    def _apply_bvp_data(self, bvp_data):
+        """Apply BvP data to UI (must run on main thread)."""
         if _is_deleted(self):
             return
         try:
             game = getattr(self, '_current_game', None)
             if not game:
                 return
-            gid = game.get('game_id')
-            wmap = {'All Games': 'all', 'Last 5 Games': 'last5', 'Last 10 Games': 'last10',
-                    'Last 15 Games': 'last15', 'Last 30 Games': 'last30'}
-            sel_window = wmap.get(self.window_cb.currentText(), 'all')
-
             away_p = game.get('away_p', 'TBD')
             home_p = game.get('home_p', 'TBD')
-            away_p_throws = game.get('away_p_throws', '')
-            home_p_throws = game.get('home_p_throws', '')
             away = getattr(self, '_bvp_away_name', 'AWAY')
             home = getattr(self, '_bvp_home_name', 'HOME')
-
-            bvp_data = _DM.get_bvp_data(gid, window=sel_window,
-                away_starter={'id': game.get('away_p_id'), 'name': away_p, 'throws': away_p_throws},
-                home_starter={'id': game.get('home_p_id'), 'name': home_p, 'throws': home_p_throws})
-            if not bvp_data:
-                return
 
             stack = getattr(self, '_bvp_stack', None)
             if not stack or _is_deleted(stack):
@@ -5638,7 +5877,7 @@ class GameDetailPanel(QWidget):
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
         except Exception:
-            log.exception("module_level")
+            log.exception("_apply_bvp_data")
 
     def on_lineup_cached(self, game_id: str):
         """Slot: called when a lineup cache for `game_id` is available."""
@@ -6236,7 +6475,7 @@ class SeamStatsApp(QMainWindow):
         self._score_notifier.scores_ready.connect(self._on_scores_fetched)
         self._score_fetching = False
         self._score_timer = QTimer(self)
-        self._score_timer.setInterval(5_000)
+        self._score_timer.setInterval(30_000)  # 30s initial delay; drops to 5s after first poll
         self._score_timer.timeout.connect(self._poll_scores)
         self._score_timer.start()
 
@@ -7480,6 +7719,9 @@ class SeamStatsApp(QMainWindow):
             if not self._lb_fetched and idx in (self.IDX_HIT, self.IDX_PITCH, self.IDX_BR):
                 self._lb_fetched = True
                 _bg_pool.submit(self._fetch_lb)
+            # Refresh weather when navigating back to Park Factors
+            if idx == self.IDX_PARK and hasattr(self, '_park_page') and self._park_page:
+                self._park_page.refresh_weather()
             # Lineups tab → load first game and show game detail
             if idx == self.IDX_LINEUP:
                 if (hasattr(self, '_games') and self._games) or GAMES:
@@ -7586,14 +7828,26 @@ class SeamStatsApp(QMainWindow):
         """Spawn a single background thread to fetch scores + plays together."""
         if self._score_fetching:
             return
-        # Only poll live scores when viewing today
-        if self._selected_date != dt.date.today():
-            return
+        today = dt.date.today()
+        # Midnight rollover: user was viewing "today" but the date advanced
+        if self._selected_date != today:
+            if self._selected_date == today - dt.timedelta(days=1):
+                self._selected_date = today
+                try:
+                    self._date_lbl.setText(today.strftime("%a, %b %d"))
+                    self._update_date_arrows()
+                except Exception:
+                    pass
+                self._load_date(today)
+                return
+            return  # viewing a non-today date intentionally
         self._score_fetching = True
         self.set_status("Updating scores\u2026", timeout=0)
 
-        # Collect play-fetch game IDs on the main thread before submitting
-        play_gids = self._collect_play_gids()
+        # Only fetch play-by-play when schedule tab is visible
+        sched_visible = (not _is_deleted(self._stack) and
+                         self._stack.currentIndex() == self.IDX_MATCHUP)
+        play_gids = self._collect_play_gids() if sched_visible else set()
 
         score_notifier = self._score_notifier
         plays_notifier = self._plays_notifier
@@ -7602,18 +7856,19 @@ class SeamStatsApp(QMainWindow):
                 # Fetch scores and emit immediately so sidebar updates without
                 # waiting for the slower per-game play-by-play fetches.
                 try:
-                    games = _DM.fetch_live_games(dt.date.today().isoformat())
+                    games = _DM.fetch_live_games(dt.date.today().isoformat(), poll_mode=True)
                 except Exception:
                     games = []
                 score_notifier.scores_ready.emit(games)
-                # Fetch plays in parallel (up to 4 concurrent requests)
+                # Fetch plays in parallel (up to 2 concurrent requests
+                # to reduce burst traffic on constrained networks)
                 plays_result = {}
                 if play_gids and hasattr(_DM, 'api') and _DM.api:
                     from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed
                     def _one(gid):
                         plays, preview, count = _DM.api.fetch_game_plays(gid)
                         return gid, plays, preview, count
-                    with _TPE(max_workers=min(4, len(play_gids))) as pool:
+                    with _TPE(max_workers=min(2, len(play_gids))) as pool:
                         futs = {pool.submit(_one, gid): gid for gid in play_gids}
                         for fut in as_completed(futs):
                             try:
@@ -7711,6 +7966,9 @@ class SeamStatsApp(QMainWindow):
     def _on_scores_fetched(self, games):
         """Update sidebar + schedule cards from a single source of truth (self._games)."""
         self._score_fetching = False
+        # After first successful poll, drop to 5s interval
+        if self._score_timer.interval() > 5_000:
+            self._score_timer.setInterval(5_000)
         if not games:
             self.set_status("Scores updated", right=f"{len(self._cards)} games")
             return
@@ -7768,7 +8026,9 @@ class SeamStatsApp(QMainWindow):
         any_live = any(_is_game_live(c.game) for c in self._cards)
         self.set_status("Scores updated", right=f"{active_count} active" if active_count else "All final")
         if not any_active:
-            self._score_timer.stop()
+            # Keep timer alive at slow cadence so midnight rollover is detected
+            if self._score_timer.interval() != 300_000:
+                self._score_timer.setInterval(300_000)
         elif any_live:
             # Games in progress — poll fast
             if self._score_timer.interval() != 5_000:
@@ -7870,7 +8130,7 @@ class SeamStatsApp(QMainWindow):
                 def _one(gid):
                     plays, preview, count = _DM.api.fetch_game_plays(gid)
                     return gid, plays, preview, count
-                with _TPE(max_workers=min(4, len(gids))) as pool:
+                with _TPE(max_workers=min(2, len(gids))) as pool:
                     futs = {pool.submit(_one, gid): gid for gid in gids}
                     for fut in as_completed(futs):
                         try:
@@ -7912,7 +8172,7 @@ class SeamStatsApp(QMainWindow):
                 def _one(gid):
                     plays, preview, count = _DM.api.fetch_game_plays(gid)
                     return gid, plays, preview, count
-                with _TPE(max_workers=min(4, len(gids))) as pool:
+                with _TPE(max_workers=min(2, len(gids))) as pool:
                     futs = {pool.submit(_one, gid): gid for gid in gids}
                     for fut in as_completed(futs):
                         try:
@@ -7928,8 +8188,11 @@ class SeamStatsApp(QMainWindow):
         """Update schedule cards AND sidebar diamonds with fresh play-by-play data."""
         if not plays_map:
             return
-        # Merge into cache (cap at 20 entries — evict oldest)
-        self._plays_cache.update(plays_map)
+        # Merge into cache (cap at 20 entries — evict least recently used)
+        for k, v in plays_map.items():
+            if k in self._plays_cache:
+                del self._plays_cache[k]  # remove to re-insert at end
+            self._plays_cache[k] = v
         if len(self._plays_cache) > 20:
             excess = len(self._plays_cache) - 20
             for key in list(self._plays_cache)[:excess]:

@@ -88,6 +88,8 @@ class MLBDataEngine:
         self._game_status_cache = {}  # {game_id: (status_str, timestamp)}
         self._sp_cache = {}  # {game_id_str: {"away": ..., "home": ..., "ts": timestamp}}
         self._handedness_cache = {}  # {player_id: handedness_code}
+        self._live_feed_cache = {}   # {game_id_str: (expires_mono, (plays, preview, count))}
+        self._schedule_cache = {}    # {date_str: (expires_mono, games_list)}
         self._id_cache_dirty = False  # Track whether id_cache needs saving
         self._cleanup_done = False  # Only run cleanup once per session
         self._local = threading.local()  # Thread-local DB connections
@@ -213,19 +215,32 @@ class MLBDataEngine:
             return self.team_abbreviations[team_name].get('logo_url', '')
         return ''
     
-    def get_schedule(self, date_str):
+    def get_schedule(self, date_str, poll_mode=False):
         """Fetch schedule for a specific date from MLB Stats API.
         
         Includes only R, W, D, L, C game types (Regular season and Postseason).
         
         Args:
             date_str: Date in format 'YYYY-MM-DD'
+            poll_mode: If True, use lighter hydration (skip probablePitcher)
+                       to reduce payload on repeated poll cycles.
         
         Returns:
             List of dicts with keys: id, away, home, time, status
         """
         try:
-            url = f"{self.api_base}/schedule?sportId=1&date={date_str}&hydrate=probablePitcher,linescore,person"
+            # Poll mode: probable pitchers are already cached from initial fetch,
+            # so skip that hydration to reduce bandwidth.
+            hydrate = "linescore,person" if poll_mode else "probablePitcher,linescore,person"
+
+            # In poll mode, return cached schedule if CDN data can't have changed
+            # (CDN max-age is 20s; we use 10s to stay responsive to score changes).
+            if poll_mode:
+                cached = self._schedule_cache.get(date_str)
+                if cached and _time.monotonic() < cached[0]:
+                    return cached[1]
+
+            url = f"{self.api_base}/schedule?sportId=1&date={date_str}&hydrate={hydrate}"
             _log.debug(f"Fetching schedule for {date_str}...")
             response = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             response.raise_for_status()
@@ -246,17 +261,22 @@ class MLBDataEngine:
                         game_time_str = game_info.get('gameDate', '')  # Changed from gameDateTime
                         
                         # Extract probable pitchers from schedule data
+                        # (skip in poll_mode — already cached from initial fetch)
                         game_id = game_info.get('gamePk', 0)
                         game_id_str = str(game_id)
-                        pp_data = {"away": None, "home": None}
-                        for team_key in ["away", "home"]:
-                            pp = game_info.get('teams', {}).get(team_key, {}).get('probablePitcher', {})
-                            if pp and pp.get('fullName'):
-                                pp_data[team_key] = {
-                                    "name": self._format_pitcher_name(pp['fullName']),
-                                    "id": pp.get('id')
-                                }
-                        self.probable_pitchers[game_id_str] = pp_data
+                        if not poll_mode:
+                            pp_data = {"away": None, "home": None}
+                            for team_key in ["away", "home"]:
+                                pp = game_info.get('teams', {}).get(team_key, {}).get('probablePitcher', {})
+                                if pp and pp.get('fullName'):
+                                    ph = pp.get('pitchHand', {})
+                                    pp_data[team_key] = {
+                                        "name": self._format_pitcher_name(pp['fullName']),
+                                        "fullName": pp['fullName'],
+                                        "id": pp.get('id'),
+                                        "throws": ph.get('code', '') if ph else '',
+                                    }
+                            self.probable_pitchers[game_id_str] = pp_data
                         
                         # Parse time
                         time_str = "TBD"
@@ -330,6 +350,8 @@ class MLBDataEngine:
                         continue
             
             _log.debug(f"  Found {len(games)} games (spring training excluded)")
+            # Cache for poll_mode to skip redundant requests within CDN freshness window
+            self._schedule_cache[date_str] = (_time.monotonic() + 10, games)
             return games
         except Exception as e:
             _log.warning(f"Error fetching schedule: {e}")
@@ -363,6 +385,11 @@ class MLBDataEngine:
         }
         try:
             url = f"{self.api_base.replace('/v1', '/v1.1')}/game/{game_id}/feed/live"
+            # ── Time-based cache: CDN max-age is 10s, skip request if still fresh ──
+            gid_str = str(game_id)
+            cached_entry = self._live_feed_cache.get(gid_str)
+            if cached_entry and _time.monotonic() < cached_entry[0]:
+                return cached_entry[1]          # still fresh — skip network round-trip
             resp = _session.get(url, timeout=_TIMEOUT_DEFAULT)
             resp.raise_for_status()
             data = resp.json()
@@ -409,7 +436,28 @@ class MLBDataEngine:
                 desc = res.get('description')
                 if not event and not desc:
                     continue
-                result.append({
+
+                # For home runs, extract hitData metrics from playEvents
+                hr_details = ''
+                if event and 'home run' in event.lower():
+                    for pe in reversed(p.get('playEvents', [])):
+                        hd = pe.get('hitData')
+                        if hd:
+                            dist = hd.get('totalDistance')
+                            ev_speed = hd.get('launchSpeed')
+                            la = hd.get('launchAngle')
+                            parts = []
+                            if dist is not None:
+                                parts.append(f"Distance: {int(dist)}ft")
+                            if ev_speed is not None:
+                                parts.append(f"Velocity: {ev_speed:.1f}mph")
+                            if la is not None:
+                                parts.append(f"Launch Angle: {la:.0f}°")
+                            if parts:
+                                hr_details = '  '.join(parts)
+                            break
+
+                play_entry = {
                     'inning': inning,
                     'half': half,
                     'event': event or '',
@@ -420,7 +468,10 @@ class MLBDataEngine:
                     'is_scoring': about.get('isScoringPlay', False),
                     'is_action': False,
                     'is_challenge': about.get('hasReview', False),
-                })
+                }
+                if hr_details:
+                    play_entry['hr_details'] = hr_details
+                result.append(play_entry)
 
             # Build a live preview string from the latest event in currentPlay
             live_preview = ""
@@ -477,6 +528,10 @@ class MLBDataEngine:
                 live_count['on_second'] = bool(offense.get('second'))
                 live_count['on_third'] = bool(offense.get('third'))
 
+            # ── Cache result for 8s (CDN max-age is 10s) to skip redundant requests ──
+            feed_result = (result, live_preview, live_count)
+            self._live_feed_cache[gid_str] = (_time.monotonic() + 8, feed_result)
+
             return result, live_preview, live_count
         except Exception:
             return [], "", {"balls": 0, "strikes": 0}
@@ -521,6 +576,52 @@ class MLBDataEngine:
         except Exception:
             pass
         return 'Unknown'
+
+    def _fetch_pitcher_hand(self, player_id):
+        """Fetch throwing hand for a pitcher from the People API.
+
+        Returns 'L', 'R', or '' on failure.  Uses the same cache as
+        ``_fetch_player_handedness`` to avoid duplicate HTTP calls.
+        """
+        with self._cache_lock:
+            cached = self._handedness_cache.get(player_id)
+        if cached and cached in ('L', 'R'):
+            return cached
+        try:
+            url = f"{self.api_base}/people/{player_id}"
+            response = _session.get(url, timeout=_TIMEOUT_SHORT)
+            if response.status_code != 200:
+                return ''
+            people = response.json().get('people', [])
+            if not people:
+                return ''
+            person = people[0]
+            ph = person.get('pitchHand', {})
+            code = ph.get('code', '') if ph else ''
+            result = code if code in ('L', 'R') else ''
+            if result:
+                with self._cache_lock:
+                    self._handedness_cache[player_id] = result
+            return result
+        except Exception:
+            return ''
+
+    def _fetch_person_name(self, player_id):
+        """Fetch full name for a player from the People API.
+
+        Returns the full name string, or '' on failure.
+        """
+        try:
+            url = f"{self.api_base}/people/{player_id}"
+            response = _session.get(url, timeout=_TIMEOUT_SHORT)
+            if response.status_code != 200:
+                return ''
+            people = response.json().get('people', [])
+            if not people:
+                return ''
+            return people[0].get('fullName', '')
+        except Exception:
+            return ''
 
     def _fetch_player_season_stats(self, player_id, season, group='batting'):
         """Fetch season aggregate stats for a player from MLB Stats API.
