@@ -1593,7 +1593,7 @@ class MiniParkWidget(QWidget):
         # ── 7) top-right: temp / pressure / altitude / precip ──
         p.setFont(QFont("Segoe UI", 10, QFont.Weight.Bold))
         temp = self.d.get("temp")
-        temp_txt = f"{temp}°F" if temp else "-- °F"
+        temp_txt = f"{round(float(temp))}°F" if temp else "-- °F"
         p.setPen(QColor(C["t1"]))
         p.drawText(QRectF(self.W - 90, 4, 82, 16),
                     Qt.AlignmentFlag.AlignRight, temp_txt)

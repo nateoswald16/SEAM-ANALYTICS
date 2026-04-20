@@ -163,98 +163,105 @@ VENUE_SIZE_DESC: dict[int, str] = {
 }
 
 # Park factors (venue_id → HR index, 100 = neutral)
-# Calibrated against BallparkPal stadium-only reference data
+# Calibrated against BallparkPal stadium-only reference data (Apr 19 2026)
 VENUE_PARK_FACTORS = {
-    1: 99, 2: 100, 3: 92, 4: 99, 5: 98, 7: 101, 12: 100, 14: 100,
-    15: 92, 17: 106, 19: 121, 22: 101, 31: 95, 32: 97, 680: 101,
-    2392: 106, 2394: 100, 2395: 97, 2529: 99, 2602: 103, 2680: 97,
-    2681: 106, 2889: 100, 3289: 98, 3309: 88, 3312: 93, 3313: 102,
-    4169: 90, 4705: 101, 5325: 97,
+    # BPP Combined Effect calibrated — all 30 parks (Apr 20 2026, R2)
+    1: 108, 2: 111, 3: 93, 4: 110, 5: 89, 7: 94, 12: 96, 14: 114,
+    15: 92, 17: 95, 19: 126, 22: 116, 31: 84, 32: 108, 680: 101,
+    2392: 106, 2394: 96, 2395: 84, 2529: 121, 2602: 123, 2680: 90,
+    2681: 114, 2889: 86, 3289: 95, 3309: 92, 3312: 93, 3313: 106,
+    4169: 87, 4705: 105, 5325: 85,
 }
 
 # Per-venue hit-type park factors (venue_id → {1B, 2B, 3B})
 # Expressed as 1.00 = league average.  HR factor already in VENUE_PARK_FACTORS.
-# Sources: Fangraphs park factors, ESPN park factors, historical data.
+# Sources: BPP Stadium Only — XBH% applied to both 2B and 3B (code recombines 92/8).
 VENUE_HIT_FACTORS: dict[int, dict[str, float]] = {
     #                              1B    2B    3B          Venue
-    1:    {"1B": 1.01, "2B": 0.90, "3B": 0.96},  # Angel Stadium
-    2:    {"1B": 1.00, "2B": 1.01, "3B": 0.85},  # Camden Yards
-    3:    {"1B": 1.04, "2B": 1.10, "3B": 0.70},  # Fenway Park
-    4:    {"1B": 0.99, "2B": 0.97, "3B": 1.00},  # Rate Field (Guaranteed Rate)
-    5:    {"1B": 0.98, "2B": 1.02, "3B": 0.92},  # Progressive Field
-    7:    {"1B": 1.01, "2B": 1.04, "3B": 1.15},  # Kauffman Stadium
-    12:   {"1B": 1.00, "2B": 0.98, "3B": 0.75},  # Tropicana Field
-    14:   {"1B": 1.00, "2B": 0.97, "3B": 0.80},  # Rogers Centre
-    15:   {"1B": 1.00, "2B": 1.14, "3B": 1.05},  # Chase Field
-    17:   {"1B": 0.93, "2B": 0.87, "3B": 0.90},  # Wrigley Field
-    19:   {"1B": 1.16, "2B": 1.35, "3B": 2.50},  # Coors Field
-    22:   {"1B": 1.01, "2B": 0.98, "3B": 0.80},  # Dodger Stadium
-    31:   {"1B": 1.00, "2B": 1.10, "3B": 1.10},  # PNC Park
-    32:   {"1B": 0.98, "2B": 0.96, "3B": 0.85},  # American Family Field
-    680:  {"1B": 0.93, "2B": 0.86, "3B": 0.77},  # T-Mobile Park
-    2392: {"1B": 0.96, "2B": 0.88, "3B": 0.90},  # Daikin Park (Minute Maid)
-    2394: {"1B": 1.00, "2B": 1.02, "3B": 1.45},  # Comerica Park
-    2395: {"1B": 0.98, "2B": 0.95, "3B": 0.88},  # Oracle Park
-    2529: {"1B": 1.05, "2B": 0.98, "3B": 1.00},  # Sutter Health Park
-    2602: {"1B": 1.02, "2B": 1.08, "3B": 0.95},  # Great American Ball Park
-    2680: {"1B": 0.98, "2B": 0.96, "3B": 0.85},  # Petco Park
-    2681: {"1B": 1.01, "2B": 1.05, "3B": 0.90},  # Citizens Bank Park
-    2889: {"1B": 1.00, "2B": 1.00, "3B": 1.05},  # Busch Stadium
-    3289: {"1B": 0.99, "2B": 0.97, "3B": 0.80},  # Citi Field
-    3309: {"1B": 1.03, "2B": 1.10, "3B": 0.95},  # Nationals Park
-    3312: {"1B": 1.01, "2B": 1.01, "3B": 1.10},  # Target Field
-    3313: {"1B": 0.94, "2B": 0.87, "3B": 0.85},  # Yankee Stadium
-    4169: {"1B": 1.04, "2B": 1.00, "3B": 0.80},  # loanDepot park
-    4705: {"1B": 1.01, "2B": 1.02, "3B": 1.00},  # Truist Park
-    5325: {"1B": 0.98, "2B": 0.95, "3B": 0.80},  # Globe Life Field
+    1:    {"1B": 1.04, "2B": 0.94, "3B": 0.94},  # Angel Stadium        XBH -6%, 1B +4%
+    2:    {"1B": 0.98, "2B": 0.96, "3B": 0.96},  # Camden Yards         XBH -4%, 1B -2%
+    3:    {"1B": 1.13, "2B": 1.29, "3B": 1.29},  # Fenway Park          XBH +29%, 1B +13%
+    4:    {"1B": 0.96, "2B": 0.89, "3B": 0.89},  # Rate Field           XBH -11%, 1B -4%
+    5:    {"1B": 1.00, "2B": 0.99, "3B": 0.99},  # Progressive Field    XBH -1%, 1B +0%
+    7:    {"1B": 0.98, "2B": 1.01, "3B": 1.01},  # Kauffman Stadium     XBH +1%, 1B -2%
+    12:   {"1B": 0.92, "2B": 0.93, "3B": 0.93},  # Tropicana Field      XBH -7%, 1B -8%
+    14:   {"1B": 0.98, "2B": 0.99, "3B": 0.99},  # Rogers Centre        XBH -1%, 1B -2%
+    15:   {"1B": 1.01, "2B": 1.10, "3B": 1.10},  # Chase Field          XBH +10%, 1B +1%
+    17:   {"1B": 1.04, "2B": 0.93, "3B": 0.93},  # Wrigley Field        XBH -7%, 1B +4%
+    19:   {"1B": 1.17, "2B": 1.16, "3B": 1.16},  # Coors Field          XBH +16%, 1B +17%
+    22:   {"1B": 0.96, "2B": 0.90, "3B": 0.90},  # Dodger Stadium       XBH -10%, 1B -4%
+    31:   {"1B": 1.04, "2B": 1.00, "3B": 1.00},  # PNC Park             XBH +0%, 1B +4%
+    32:   {"1B": 0.97, "2B": 0.93, "3B": 0.93},  # American Family Fld  XBH -7%, 1B -3%
+    680:  {"1B": 0.91, "2B": 0.82, "3B": 0.82},  # T-Mobile Park        XBH -18%, 1B -9%
+    2392: {"1B": 0.96, "2B": 0.88, "3B": 0.88},  # Daikin Park          XBH -12%, 1B -4%
+    2394: {"1B": 1.03, "2B": 1.12, "3B": 1.12},  # Comerica Park        XBH +12%, 1B +3%
+    2395: {"1B": 1.02, "2B": 1.07, "3B": 1.07},  # Oracle Park          XBH +7%, 1B +2%
+    2529: {"1B": 1.03, "2B": 1.08, "3B": 1.08},  # Sutter Health Park   XBH +8%, 1B +3%
+    2602: {"1B": 0.99, "2B": 0.98, "3B": 0.98},  # Great American BP    XBH -2%, 1B -1%
+    2680: {"1B": 0.97, "2B": 0.92, "3B": 0.92},  # Petco Park           XBH -8%, 1B -3%
+    2681: {"1B": 1.04, "2B": 1.02, "3B": 1.02},  # Citizens Bank Park   XBH +2%, 1B +4%
+    2889: {"1B": 0.99, "2B": 0.98, "3B": 0.98},  # Busch Stadium        XBH -2%, 1B -1%
+    3289: {"1B": 0.97, "2B": 0.96, "3B": 0.96},  # Citi Field           XBH -4%, 1B -3%
+    3309: {"1B": 1.01, "2B": 1.05, "3B": 1.05},  # Nationals Park       XBH +5%, 1B +1%
+    3312: {"1B": 1.02, "2B": 1.11, "3B": 1.11},  # Target Field         XBH +11%, 1B +2%
+    3313: {"1B": 1.03, "2B": 1.01, "3B": 1.01},  # Yankee Stadium       XBH +1%, 1B +3%
+    4169: {"1B": 1.07, "2B": 0.97, "3B": 0.97},  # loanDepot park       XBH -3%, 1B +7%
+    4705: {"1B": 0.98, "2B": 0.96, "3B": 0.96},  # Truist Park          XBH -4%, 1B -2%
+    5325: {"1B": 0.99, "2B": 1.02, "3B": 1.02},  # Globe Life Field     XBH +2%, 1B -1%
 }
 
-# Per-venue weather sensitivity profile (multipliers for each component).
-# Keys: w = wind, t = temperature, h = humidity, p = pressure/altitude.
-# 1.0 = league-average sensitivity.  Values >1 amplify, <1 dampen.
+# Per-venue weather sensitivity profile — asymmetric (pos, neg) multipliers.
+# Each key maps to a tuple: (pos_mult, neg_mult)
+#   pos_mult: applied when base effect > 0  (weather BOOSTS offense / carry)
+#   neg_mult: applied when base effect < 0  (weather SUPPRESSES offense / carry)
+# 1.0 = league-average sensitivity.  >1 amplifies, <1 dampens that direction.
+# Example: Coors w=(0.80, 0.02) → tailwind amplified 0.80× (thin air helps),
+#          headwind dampened to 0.02× (altitude carry compensates).
+# Base constants already include _WX_SCALE (0.45).
 # Sources: MLB Statcast wind study, BallparkPal, FanGraphs, CLEATZ, Oddstrader.
-VENUE_WX_PROFILE: dict[int, dict[str, float]] = {
-    # ── Tier 1: Extreme weather volatility ──
-    # Wind-dominated
-    17:   {"w": 3.50, "t": 1.20, "h": 0.80, "p": 1.00},  # Wrigley Field — most wind-volatile park in baseball
-    4:    {"w": 1.60, "t": 1.20, "h": 0.80, "p": 1.00},  # Guaranteed Rate — sheltered but still wind-sensitive
-    2681: {"w": 1.80, "t": 0.80, "h": 0.90, "p": 1.00},  # Citizens Bank — wind-dominated, temp dampened
-    7:    {"w": 1.80, "t": 1.00, "h": 0.80, "p": 1.00},  # Kauffman Stadium — plains, minimal obstruction
-    3:    {"w": 1.60, "t": 1.10, "h": 1.00, "p": 1.00},  # Fenway Park — wind-sensitive, moderate temp
-    3289: {"w": 1.50, "t": 1.00, "h": 0.90, "p": 1.00},  # Citi Field — most HR created by wind (28)
-    # Altitude-dominated
-    19:   {"w": 1.00, "t": 1.00, "h": 0.60, "p": 1.80},  # Coors Field — 5280 ft, thin air already reduces drag; wind/temp less impactful
-    15:   {"w": 0.80, "t": 1.50, "h": 0.90, "p": 1.40},  # Chase Field — highest avg temp, 1100 ft elevation
+# Primary/secondary factors per BPP + physics analysis (Apr 2026).
+VENUE_WX_PROFILE: dict[int, dict[str, tuple[float, float]]] = {
+    # ── Wind-dominated parks ──
+    17:   {"w": (1.00, 1.30), "t": (0.80, 1.05), "h": (0.40, 1.00), "p": (0.60, 0.60)},  # Wrigley — wind primary; cold Lake Michigan air secondary; overcast sky suppressive
+    2529: {"w": (1.00, 1.00), "t": (0.50, 0.70), "h": (0.30, 0.50), "p": (0.15, 0.15)},  # Sutter — wind-receptive (no upper decks); SW push to RF; temp secondary
+    7:    {"w": (1.78, 1.78), "t": (0.90, 0.98), "h": (0.70, 1.30), "p": (1.00, 1.00)},  # Kauffman — wind stops HRs more than almost any park; plains humidity/rain secondary
+    680:  {"w": (1.20, 0.20), "t": (0.20, 0.02), "h": (0.05, 0.05), "p": (0.80, 0.80)},  # T-Mobile — wind keeps balls in park; heavy coastal air density secondary; carport roof
 
-    # ── Tier 2: Moderate-high sensitivity (northern / temp-dominant) ──
-    2394: {"w": 1.20, "t": 1.10, "h": 0.90, "p": 1.00},  # Comerica Park — early-season cold exploitable
-    5:    {"w": 1.20, "t": 1.10, "h": 0.90, "p": 1.00},  # Progressive Field — Lake Erie cold, harsh April
-    3312: {"w": 1.20, "t": 0.60, "h": 0.90, "p": 1.00},  # Target Field — cold over-modeled at full sensitivity — cold early season over-modeled at full sensitivity
-    3313: {"w": 1.10, "t": 0.90, "h": 0.90, "p": 1.00},  # Yankee Stadium — short porch dampens wind + temp effect
-    2602: {"w": 1.40, "t": 1.20, "h": 0.90, "p": 1.00},  # Great American — bidirectional wind = temp
-    2889: {"w": 1.40, "t": 1.10, "h": 0.80, "p": 1.00},  # Busch Stadium — Midwest wind belt
+    # ── Altitude-driven parks ──
+    19:   {"w": (0.30, 0.02), "t": (0.15, 0.05), "h": (1.80, 0.10), "p": (2.50, 0.02)},  # Coors — altitude dominant (5190ft); heat further thins already light air; dry ball carry
+    15:   {"w": (0.60, 0.60), "t": (0.12, 0.20), "h": (0.20, 0.20), "p": (1.50, 1.50)},  # Chase — 2nd highest altitude; roof open/closed dictates temp exposure; pressure amplified
 
-    # ── Tier 3: Moderate (marine air / cool parks) ──
-    2395: {"w": 0.40, "t": 1.50, "h": 1.20, "p": 1.00},  # Oracle Park — wind blocked by architecture, marine layer
-    2680: {"w": 0.70, "t": 1.30, "h": 1.20, "p": 1.00},  # Petco Park — marine air, temp > humidity > wind
-    4169: {"w": 0.70, "t": 0.80, "h": 1.50, "p": 1.00},  # loanDepot Park — humidity-dominant when open
-    680:  {"w": 1.20, "t": 0.80, "h": 1.00, "p": 1.00},  # T-Mobile Park — carport roof partially shields temp swings; wind unblocked
+    # ── Temperature-volatile (northern / coastal cold) ──
+    3:    {"w": (1.58, 1.58), "t": (1.20, 1.30), "h": (0.80, 1.40), "p": (1.00, 1.00)},  # Fenway — cold starts suppress carry; wind secondary (structures vary impact); waterfront humidity
+    3313: {"w": (0.60, 0.60), "t": (1.50, 2.04), "h": (0.60, 1.10), "p": (1.00, 1.00)},  # Yankee — early cold hurts; wind critical to short porch in RF; East River moisture
+    2681: {"w": (1.10, 1.10), "t": (1.20, 2.10), "h": (0.60, 1.20), "p": (1.00, 1.00)},  # Citizens Bank — heat drives high-run environment; wind knocks down would-be HRs
+    3312: {"w": (0.56, 0.56), "t": (1.05, 1.22), "h": (0.50, 0.80), "p": (1.10, 1.10)},  # Target — coldest early season; 5th highest altitude (subtle p boost); wind secondary
+    5:    {"w": (1.05, 1.05), "t": (1.00, 0.80), "h": (0.60, 1.10), "p": (0.20, 0.20)},  # Progressive — Great Lakes cold; temp primary; wind secondary; altitude pressure dampened
+    2394: {"w": (0.90, 0.90), "t": (1.10, 1.30), "h": (0.60, 1.10), "p": (1.00, 1.00)},  # Comerica — large OF + early cold = difficult; temp primary; wind secondary
+    4:    {"w": (0.80, 0.80), "t": (1.30, 1.50), "h": (0.80, 1.30), "p": (1.00, 1.00)},  # Rate — cold starts favor pitchers; humid Midwest summers massive uptick; temp primary
+    3289: {"w": (1.00, 1.00), "t": (1.10, 1.20), "h": (0.60, 1.20), "p": (1.00, 1.00)},  # Citi — cold coastal air suppresses early-season HRs; temp primary; wind secondary
+    31:   {"w": (0.69, 0.69), "t": (0.75, 0.90), "h": (0.60, 1.10), "p": (1.00, 1.00)},  # PNC — offensive drop when temp drops + wind shifts Sept; river confluence moisture
+    3309: {"w": (0.80, 0.80), "t": (1.20, 0.95), "h": (0.70, 1.25), "p": (1.00, 1.00)},  # Nationals — moderate temp swing; Anacostia humidity secondary
 
-    # ── Tier 4: Low-moderate (Mid-Atlantic belt / balanced) ──
-    3309: {"w": 1.40, "t": 1.10, "h": 0.90, "p": 1.00},  # Nationals Park — wind-exposed along Anacostia
-    2:    {"w": 1.00, "t": 1.10, "h": 0.90, "p": 1.00},  # Camden Yards — Mid-Atlantic, balanced
-    31:   {"w": 0.70, "t": 0.90, "h": 0.90, "p": 1.00},  # PNC Park — low sensitivity, deep fences dominate
-    4705: {"w": 0.80, "t": 1.20, "h": 0.90, "p": 1.10},  # Truist Park — 3rd highest altitude, temp-dominant
-    2529: {"w": 0.80, "t": 1.00, "h": 0.30, "p": 0.60},  # Sutter Health Park — extra-small bandbox, short fences dominate
+    # ── Temperature + humidity driven (hot / humid) ──
+    2602: {"w": (0.80, 0.80), "t": (1.30, 1.50), "h": (1.00, 1.60), "p": (1.00, 1.00)},  # Great American — temp primary; one of most humid parks; heat+humidity = extreme carry
+    2889: {"w": (0.70, 0.70), "t": (1.20, 1.40), "h": (0.80, 1.30), "p": (1.00, 1.00)},  # Busch — consistently high summer heat; Mississippi valley humidity secondary
+    1:    {"w": (0.10, 0.10), "t": (0.70, 1.40), "h": (0.70, 1.00), "p": (1.00, 1.00)},  # Angel — marine layer + evening cool-down suppressive; humidity secondary; mild winds
+    22:   {"w": (0.30, 0.30), "t": (1.00, 1.20), "h": (0.40, 0.60), "p": (1.20, 1.20)},  # Dodger — high heat + coastal air density volatile; dry climate = low humidity variance
 
-    # ── Tier 5: Low sensitivity (mild climate / retractable roof) ──
-    5325: {"w": 0.70, "t": 1.00, "h": 0.80, "p": 1.00},  # Globe Life Field — sheltered when open
-    2392: {"w": 0.60, "t": 0.80, "h": 0.80, "p": 1.00},  # Daikin Park — rarely open, sheltered
-    32:   {"w": 0.70, "t": 1.00, "h": 0.80, "p": 1.00},  # American Family — roof when cold
-    14:   {"w": 0.70, "t": 1.00, "h": 0.80, "p": 1.00},  # Rogers Centre — roof open ~2/3 of games
-    22:   {"w": 0.50, "t": 0.70, "h": 0.60, "p": 1.00},  # Dodger Stadium — least weather-volatile, mild year-round
-    1:    {"w": 0.60, "t": 0.70, "h": 0.60, "p": 1.00},  # Angel Stadium — stable mild climate
-    # Tier 6 (Tropicana, venue 12) — fixed dome, handled by _FIXED_DOMES
+    # ── Humidity / air-density driven (marine / coastal) ──
+    2:    {"w": (0.60, 0.60), "t": (0.90, 1.08), "h": (1.00, 1.50), "p": (1.00, 1.00)},  # Camden — summer humidity primary boosts runs; Inner Harbor; temp secondary
+    4705: {"w": (0.50, 0.50), "t": (1.00, 1.19), "h": (0.80, 1.60), "p": (1.25, 1.25)},  # Truist — hot muggy humidity primary; 3rd highest altitude boosts p secondary
+    2680: {"w": (0.50, 0.50), "t": (1.00, 1.10), "h": (0.60, 1.40), "p": (1.40, 1.40)},  # Petco — heavy marine layer/air density primary; expansive layout; temp secondary
+    2395: {"w": (0.30, 0.50), "t": (1.20, 1.47), "h": (0.40, 1.50), "p": (1.00, 1.00)},  # Oracle — coldest avg temp in MLB; wind neutralized by barrier (swirl knocks down LDs)
+
+    # ── Roof-controlled / low sensitivity ──
+    5325: {"w": (0.40, 0.40), "t": (0.90, 1.10), "h": (0.05, 0.05), "p": (1.00, 1.00)},  # Globe Life — roof dictates performance; Texas heat secondary when open
+    2392: {"w": (0.02, 0.02), "t": (0.20, 0.05), "h": (0.05, 0.05), "p": (0.05, 0.05)},  # Daikin — controlled environment; heat impacts when roof open
+    4169: {"w": (0.50, 0.69), "t": (0.78, 0.90), "h": (0.30, 2.00), "p": (1.00, 1.00)},  # loanDepot — humid coastal; humidor + retractable roof manage conditions
+    14:   {"w": (0.30, 0.30), "t": (0.80, 0.98), "h": (0.05, 0.05), "p": (1.00, 1.00)},  # Rogers — indoor neutralizes; temp matters when roof opens in summer
+    32:   {"w": (0.69, 0.69), "t": (0.80, 0.98), "h": (0.05, 0.05), "p": (1.00, 1.00)},  # American Family — retractable; Midwest conditions when open
+    # Tropicana (venue 12) — fixed dome, handled by _FIXED_DOMES
 }
 
 # Hit-type weather sensitivity relative to HR adjustments
@@ -272,23 +279,40 @@ _W_3B = 0.02   # triples = 2% of all hits
 _W_HR = 0.06   # home runs = 6% of all hits
 
 # ── HR rating framework constants ──
-_REF_TEMP_F = 70.0           # league-average baseline temperature
-_REF_HUMIDITY = 50.0         # baseline humidity %
+_REF_TEMP_F = 72.5           # neutral baseline: midpoint of 70–75 °F carry range
+_REF_HUMID_CARRY = 50.0      # air density neutral: 50 % RH.  Below = denser air
+                             # (less carry), above = lighter air (more carry).
+_REF_HUMID_ABSORB = 57.0     # humidor standard: ALL 30 parks store balls at
+                             # 70 °F / 57 % RH.  Ball moisture neutral point.
 _REF_PRESSURE_HPA = 1013.25  # sea-level standard pressure
-_TEMP_PER_F = 0.65           # +0.65 pct-pts per °F above baseline
-_HUMID_PER_PCT = +0.025      # +0.025 pct-pts per 1% humidity above baseline
-                             # Humidor era (2022+): all 30 parks store balls at
-                             # 70°F / 50-57% RH for 14+ days, neutralising the
-                             # hygrothermal "dead ball" effect.  Ambient humidity
-                             # now only reduces air density (lighter H₂O displaces
-                             # heavier N₂/O₂), giving a small positive carry boost.
-_WIND_TAIL_PER_MPH = 0.80    # +0.80 pct-pts per mph tailwind (drag reduction only)
-_WIND_HEAD_PER_MPH = 1.20    # -1.20 pct-pts per mph headwind (direct opposition)
-                             # Asymmetry: headwind fights ball flight directly;
-                             # tailwind only reduces aerodynamic drag — weaker effect.
-_WIND_PER_HAND_CAP = 14.0    # max ±14% wind contribution per handedness
-_PRESS_PER_HPA = 0.20        # +0.20 pct-pts per hPa below expected
-_WX_CAP = 40.0               # max ±40% weather modifier
+
+# Raw physics-to-pct conversion constants.
+# These are multiplied by _WX_SCALE to produce MLB-average base values.
+# Venue profiles in VENUE_WX_PROFILE then enhance (>1) or dampen (<1).
+_WX_SCALE = 0.45             # global scaler: raw physics → MLB-average output
+                             # Absorbs park geometry, ball-bat physics, etc.
+_TEMP_PER_F = 1.47 * _WX_SCALE   # +0.66 pct-pts/°F at league-avg venue
+                             # Research: ~8 % aero + bat/ball/grip cold effects.
+# Humidity has TWO independent effects:
+_HUMID_CARRY_PER_PCT = 0.02 * _WX_SCALE  # +0.009 pct-pts per 1 % above 50 %
+                             # Air density only: humid air is lighter (H₂O
+                             # displaces heavier N₂/O₂) → more fly-ball carry.
+                             # ~1 ft per 50 % RH swing.  Universal physics —
+                             # same at every park, NOT venue-adjusted.
+_HUMID_ABSORB_PER_PCT = -0.08 * _WX_SCALE  # -0.036 pct-pts per 1 % above 57 %
+                             # Ball absorption: ambient humidity above humidor →
+                             # ball gains moisture → reduced COR / exit velo.
+                             # Below humidor → ball dries → MORE pop.
+                             # This is the dominant humidity effect and IS
+                             # venue-adjusted (domes ≈ 0, open-air amplified).
+_WIND_TAIL_PER_MPH = 1.80 * _WX_SCALE  # +0.81 pct-pts/mph tailwind
+                             # Research: ~3 ft carry per mph tailwind.
+_WIND_HEAD_PER_MPH = 2.50 * _WX_SCALE  # -1.125 pct-pts/mph headwind
+                             # Asymmetry: headwind directly opposes flight.
+_WIND_PER_HAND_CAP = 14.0    # max ±14 % wind contribution per handedness
+_PRESS_PER_HPA = 0.45 * _WX_SCALE  # +0.20 pct-pts/hPa below expected
+                             # Research: 2 ft per 0.3 inHg ≈ 10.16 hPa.
+_WX_CAP = 40.0               # max ±40 % weather modifier
 _RHB_PULL_DEG = 315.0        # RHB pull-side direction (toward LF)
 _LHB_PULL_DEG = 45.0         # LHB pull-side direction (toward RF)
 
@@ -297,28 +321,31 @@ _LHB_PULL_DEG = 45.0         # LHB pull-side direction (toward RF)
 # reduce K-rates, and turn some flyouts into hits.  Clear day sky aids pitchers
 # (visibility, higher K-rates).
 # Values are additive pct-pt modifiers applied to HR and Hits weather layers.
+# Rain: wet ball suppresses HR distance, but +9.6% walks / -10.1% K / wet turf
+#   errors produce +3.6% total run scoring.  HR is slightly negative (fly ball
+#   knock-down), but singles/XBH benefit from reduced control + wet fielding.
 _SKY_HR_MODIFIER = {
     "Overcast":       +1.8,   # thick cloud cover → +1.8% HR boost
     "Cloudy":         +1.2,   # moderate cloud → +1.2%
     "Partly Cloudy":  +0.4,   # partial cloud → small boost
-    "Drizzle":        -0.8,   # wet ball (heavier, less elastic) partly offsets humid air
-    "Rain":           -2.5,   # wet ball dominates — heavier, dead on contact
+    "Drizzle":        -0.5,   # wet ball (heavier, less elastic) partly offsets humid air
+    "Rain":           -2.0,   # wet ball dominates — heavier, dead on contact; knocks down fly balls
     "Clear":          -0.8,   # clear sky → slight pitcher advantage
 }
 _SKY_HITS_XBH_MOD = {
     "Overcast":       +1.5,
     "Cloudy":         +1.0,
     "Partly Cloudy":  +0.3,
-    "Drizzle":        -0.5,   # wet ball reduces exit velo on line drives
-    "Rain":           -2.0,   # heavy wet ball suppresses extra-base power
+    "Drizzle":        +0.5,   # wet turf → unpredictable bounces benefit gap hits
+    "Rain":           +1.5,   # slick grass + errors → balls get through for XBH
     "Clear":          -0.6,
 }
 _SKY_HITS_1B_MOD = {
     "Overcast":       +0.8,   # reduced K-rate → more balls in play → more singles
     "Cloudy":         +0.5,
     "Partly Cloudy":  +0.2,
-    "Drizzle":        +0.2,   # wet ball slight offset, but reduced K-rate helps
-    "Rain":           -1.0,   # wet ball + slick bat = fewer clean contacts
+    "Drizzle":        +1.0,   # reduced K-rate + wet grip → more walks/singles
+    "Rain":           +2.0,   # +9.6% walks, -10.1% K, slick turf = lots of singles
     "Clear":          -0.4,
 }
 
@@ -329,24 +356,144 @@ _SKY_HITS_1B_MOD = {
 # highest K-rates.
 # Format: venue_id → (day_modifier, night_modifier) in pct-pts for HR.
 # Positive = offence boost, negative = pitcher boost.
+# Based on BPP/Statcast day-vs-night splits for each park's unique physics:
+#   - "Extreme" night suppression: marine layer parks (Oracle, Petco)
+#   - "High" day/night flip: shadow parks (Truist, Fenway), wind parks (Wrigley)
+#   - "Moderate": most open-air parks (temp/density shift)
+#   - "Roof-Dependent"/"Neutral": domes & retractable (near-zero)
 _VENUE_DAY_NIGHT: dict[int, tuple[float, float]] = {
-    # park:           (day,   night)
-    4705:             (-1.5,  +1.5),   # Truist Park — strong day→pitcher / night→hitter flip
-    17:               (+0.5,  -0.5),   # Wrigley — day game tradition, heat + wind = hitter-friendly days
-    2889:             (-0.5,  +0.3),   # Busch Stadium — moderate day/night split
-    2602:             (+0.5,  -0.3),   # Great American — river heat in day games
-    3312:             (-0.8,  +0.3),   # Target Field — cold night air suppresses; day less extreme
-    3:                (-0.8,  +0.3),   # Fenway — dense cold night air, day heat helps
-    5:                (-0.5,  +0.3),   # Progressive — Lake Erie cold night effect
+    # park:           (day,   night)    # category from BPP analysis
+    # ── Extreme night suppression (marine layer) ──
+    2395:             (+2.0,  -2.5),    # Oracle — HR rates ~70% lower at night (marine layer)
+    2680:             (+1.5,  -2.0),    # Petco — heavy night air; one of toughest HR parks after dark
+    # ── High day/night volatility ──
+    17:               (+1.5,  -1.0),    # Wrigley — solar glare severe; night = consistent lighting
+    3:                (-1.5,  +1.0),    # Fenway — night neutralizes Green Monster shadows; cold AM
+    4705:             (-1.8,  +1.8),    # Truist — SSE shadows favor pitchers PM; offense jumps at night
+    19:               (+1.5,  -1.5),    # Coors — daytime dry heat = extreme carry; night rapid cooling
+    2529:             (+1.5,  -0.5),    # Sutter — day temps boost already strong baseline; moderate night
+    680:              (+1.0,  -1.2),    # T-Mobile — night air significantly denser than daytime coastal
+    # ── Moderate day/night split ──
+    1:                (+1.0,  -0.5),    # Angel — 79°F avg day temps reliable power boost
+    22:               (+1.0,  -0.5),    # Dodger — warm afternoon valley air boosts HRs
+    3313:             (-0.8,  +0.3),    # Yankee — late afternoon shadows tricky for RHB
+    2681:             (+0.5,  -0.3),    # Citizens Bank — warm night humidity keeps park "live"
+    3312:             (+0.3,  -1.0),    # Target — drastic night cooling in early/late season
+    2602:             (+0.3,  +0.8),    # Great American — muggy night humidity amplifies +23% HR base
+    2:                (-0.3,  +0.5),    # Camden — high night humidity thins air, aids carry
+    2889:             (+0.3,  +0.5),    # Busch — high night humidity aids carry (Midwest)
+    7:                (-0.3,  +0.5),    # Kauffman — night humidity helps HR carry (structurally suppressed)
+    5:                (+0.3,  -0.5),    # Progressive — night Lake Erie air denser/cooler
+    2394:             (+0.3,  -0.8),    # Comerica — early season night games coldest/densest in MLB
+    31:               (+0.5,  -0.5),    # PNC — night river air denser; daytime heat best for offense
+    3309:             (+0.5,  -0.3),    # Nationals — one of hottest avg temps; day games power-favorable
+    3289:             (+0.3,  -0.5),    # Citi — coastal night air denser, favors pitchers
+    4:                (+0.3,  -0.5),    # Rate — similar Midwest cooling pattern
+    # ── Roof-dependent (near-zero when closed) ──
+    15:               (+0.5,  -0.3),    # Chase — roof open day = extreme dry carry; closed = neutral
+    5325:             (+0.2,  -0.1),    # Globe Life — roof negates most; Texas heat secondary when open
+    32:               (+0.3,  -0.2),    # American Family — daytime heat when roof open
+    14:               (+0.1,  -0.1),    # Rogers — usually closed; night roof open = more carry-friendly
+    2392:             (+0.1,  -0.1),    # Daikin — usually closed; night humidity helps when open
+    4169:             ( 0.0,   0.0),    # loanDepot — humidor + AC = static environment
+    # ── Fully domed (zero) ──
+    12:               ( 0.0,   0.0),    # Tropicana — fixed dome; zero volatility
 }
-# Default: day games are slightly pitcher-friendly (glare + high K-rate in sun),
-# night games are neutral-to-slightly pitcher-friendly (dense air).
+# Default: day games slightly pitcher-friendly (glare + high K-rate; 6.40 K/gm
+# clear day vs 5.95 cloudy), night games neutral (dense air offset by humidity).
 _DEFAULT_DAY_MOD  = -0.3     # day default: slight pitcher edge
 _DEFAULT_NIGHT_MOD = +0.0    # night default: neutral
 
+# ── Per-venue sky (overcast) sensitivity multiplier ──
+# Applied to base sky modifiers in _venue_adjust_weather.
+# Overcast = fewer errors (0.73 vs 0.80 visitor), BA rises ~.259→.266.
+# Major = high benefit to hitters; Low = negligible; 0.0 = dome/N/A.
+_VENUE_SKY_MULT: dict[int, float] = {
+    # ── Major: overcast dramatically helps hitters ──
+    17:   1.80,   # Wrigley — eliminates severe high-glare shadows
+    4705: 1.60,   # Truist — removes difficult SSE shadow lines, aids recognition
+    # ── High: significant overcast benefit ──
+    2395: 1.50,   # Oracle — fog/heavy clouds simulate "night" penalty during day
+    2680: 1.40,   # Petco — overcast coastal conditions increase air density, favor pitchers
+    # ── Moderate: standard overcast benefit ──
+    3:    1.10,   # Fenway — cloudy helps track spin against low batter's eye
+    2529: 1.00,   # Sutter — consistent cloud cover helps fielders on high flies
+    680:  1.00,   # T-Mobile — frequent clouds; consistent hitting backdrop
+    2:    1.00,   # Camden — overcast = cleaner batter's eye than sunny
+    2602: 1.00,   # Great American — helps vision in bright Ohio Valley sun
+    3312: 1.00,   # Target — helps track balls in bright Northern sky
+    5:    1.00,   # Progressive — mitigates tricky wind-visual for hitters
+    3289: 1.00,   # Citi — reduces outfield errors that spike on clear days
+    # ── Low: minimal overcast impact ──
+    19:   0.40,   # Coors — altitude dominates regardless of light conditions
+    1:    0.40,   # Angel — typically clear; overcast rare but helps visibility
+    22:   0.50,   # Dodger — shadows consistent; clouds mainly affect OF glare
+    3313: 0.50,   # Yankee — clouds reduce sun-glare errors for visitors
+    2681: 0.50,   # Citizens Bank — generally neutral for carry
+    7:    0.50,   # Kauffman — visuals are primary overcast benefit
+    2889: 0.50,   # Busch — neutral distance impact
+    2394: 0.50,   # Comerica — neutral distance impact
+    3309: 0.50,   # Nationals — standard overcast benefit for vision
+    31:   0.50,   # PNC — tricky sun angles helped by clouds
+    4:    0.50,   # Rate — neutral distance impact
+    4169: 0.40,   # loanDepot — usually closed; minimal when open
+    15:   0.40,   # Chase — overcast often = roof opened for natural cooling
+    # ── Dome / retractable (near-zero) ──
+    5325: 0.0,    # Globe Life — weather non-factor indoors
+    2392: 0.0,    # Daikin — static environment when closed
+    14:   0.0,    # Rogers — static environment when closed
+    32:   0.0,    # American Family — static when closed
+    12:   0.0,    # Tropicana — fully climate-controlled
+}
+
+# ── Per-venue rain vulnerability multiplier ──
+# Applied to rain/drizzle sky modifiers in _venue_adjust_weather.
+# Rain: +3.6% total runs (wet grip → +9.6% BB, -10.1% K, slick turf → errors).
+# HR slightly suppressed (fly ball knock-down), but 1B/XBH boosted.
+# Vulnerability varies by drainage quality, grass type, local rain frequency.
+# Scale: Extreme=1.8, High=1.4, Moderate=1.0, Low=0.6, Minimal=0.3, None=0.0.
+_VENUE_RAIN_MULT: dict[int, float] = {
+    # ── Extreme: worst drainage / highest rain frequency ──
+    3:    1.80,   # Fenway — league leader in rain postponements (31+/decade); old drainage
+    5:    1.80,   # Progressive — one of most rain-hindered; frequently cited for needing a roof
+    2394: 1.80,   # Comerica — high rainfall frequency; limited fan cover makes delays difficult
+    3289: 1.80,   # Citi — very high rainout count (29+/decade); coastal humidity when wet helps HR
+    3313: 1.80,   # Yankee — among rainiest venues; disruptions force early bullpen usage
+    # ── High: frequent rain impact / poor drainage ──
+    2:    1.40,   # Camden — historically high rain delay frequency (26+/decade)
+    17:   1.40,   # Wrigley — open grass prone to ponding and slick infield
+    7:    1.40,   # Kauffman — high regional rainfall; fewer delays than STL
+    31:   1.40,   # PNC — fickle muggy riverfront weather → long delays
+    2889: 1.40,   # Busch — frequent Midwestern storms disrupt summer schedules
+    3309: 1.40,   # Nationals — frequent summer thunderstorms in DC
+    # ── Moderate: standard rain risk ──
+    4:    1.00,   # Rate — mid-range; standard Midwest patterns
+    2602: 1.00,   # Great American — surprisingly resilient for its region
+    3312: 1.00,   # Target — modern drainage allows quick recovery
+    2529: 1.00,   # Sutter — minor-league grade drainage; more susceptible than top MLB parks
+    2681: 1.00,   # Citizens Bank — modern drainage more efficient than NY/BAL
+    2395: 1.00,   # Oracle — fog/marine layer behaves like light mist; makes ball heavy
+    # ── Low: dry climate or good drainage ──
+    19:   0.60,   # Coors — rain often accompanies high humidity that aids HR carry
+    4705: 0.60,   # Truist — 2.5-acre underground drainage liner; rapid resume
+    # ── Minimal: very rare rain ──
+    1:    0.30,   # Angel — historically driest in MLB (1 rainout in a decade)
+    22:   0.30,   # Dodger — rare rain; ancient drainage can cause issues when it pours
+    2680: 0.30,   # Petco — Southern CA dry advantage; almost zero rainouts
+    # ── None: roof eliminates rain ──
+    15:   0.0,    # Chase — roof closed during rain
+    2392: 0.0,    # Daikin — fully climate-controlled
+    4169: 0.0,    # loanDepot — retractable roof eliminates Florida afternoon rain
+    32:   0.0,    # American Family — roof closed during inclement weather
+    680:  0.0,    # T-Mobile — retractable roof handles Pacific NW drizzle
+    5325: 0.0,    # Globe Life — roof eliminates Texas downpours
+    12:   0.0,    # Tropicana — permanent dome
+    14:   0.0,    # Rogers — climate-controlled indoor
+}
+
 # ── Closed-roof humidity passthrough ──
 # Most retractable / dome parks with AC control indoor humidity to ~50-55%
-# (near _REF_HUMIDITY), so humidity effect ≈ 0 when closed.  These venues
+# (near humidor 57 %), so humidity effect ≈ 0 when closed.  These venues
 # do NOT fully control indoor humidity:
 _CLOSED_ROOF_HUMID_MULT: dict[int, float] = {
     32:  1.2,   # American Family — heating only, no AC; traps humid air on hot days
@@ -504,6 +651,262 @@ def _wind_carry_pct(component_mph: float) -> float:
     return component_mph * _WIND_HEAD_PER_MPH
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wall-height-based LHB/RHB dimension splits
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Effective pull-zone wall heights (feet) per venue.
+# lf_wall: height a RHB-pulled ball faces (LF line → LC area).
+# rf_wall: height an LHB-pulled ball faces (RC → RF line area).
+# Sourced from BallparkPal stadium diagrams (Jun 2025).
+# Multi-section walls averaged to a single effective pull-zone height.
+VENUE_WALL_HEIGHTS: dict[int, tuple[float, float]] = {
+    #  venue_id: (lf_wall, rf_wall)
+    1:    ( 5.0,   5.0),   # Angel Stadium — uniform 5' LF/RF, 8' CF
+    2:    (13.0,  21.0),   # Camden Yards — LF 13', RF 21'
+    3:    (37.0,   5.0),   # Fenway Park — Green Monster 37' LF, 5' RF
+    4:    ( 8.0,   8.0),   # Rate Field — uniform 8'
+    5:    (19.0,  14.0),   # Progressive Field — LF 19', RF 14'
+    7:    ( 8.5,   8.5),   # Kauffman Stadium — uniform 8.5' (lowered from 10')
+    12:   ( 8.0,  11.0),   # Tropicana Field — LF line 5'/LC 11' → eff 8', RF 11'
+    14:   (14.0,  12.5),   # Rogers Centre — LF 14', RF 14'/11' → eff 12.5'
+    15:   ( 8.0,   8.0),   # Chase Field — LF/RF 8', CF 25'
+    17:   (16.0,  16.0),   # Wrigley Field — symmetric 16' ivy walls
+    19:   (13.0,  17.0),   # Coors Field — LF 13', RF 17'
+    22:   ( 4.0,   4.0),   # Dodger Stadium — uniform 4' LF/RF, 8' CF
+    31:   ( 6.0,  21.0),   # PNC Park — LF 6', RF 21' Clemente wall
+    32:   ( 8.0,   8.0),   # American Family Field — uniform 8'
+    680:  ( 8.0,   8.0),   # T-Mobile Park — uniform 8'
+    2392: (23.0,   7.0),   # Daikin Park — LF 21'/25' → eff 23', RF 7'
+    2394: ( 7.0,  12.0),   # Comerica Park — LF 7', RF 9'/15' → eff 12'
+    2395: ( 8.0,  22.0),   # Oracle Park — LF 8', RF arcade 20'/24' → eff 22'
+    2529: ( 8.0,   5.0),   # Sutter Health Park — LF 8', RF 5'
+    2602: (12.0,   8.0),   # Great American BP — LF 12', RF 8'
+    2680: ( 7.0,   8.5),   # Petco Park — LF 7', RF 7'/10' → eff 8.5'
+    2681: (11.0,  13.0),   # Citizens Bank Park — LF 11', RF 13'
+    2889: ( 8.0,   8.0),   # Busch Stadium — uniform 8'
+    3289: ( 8.0,   8.0),   # Citi Field — uniform 8'
+    3309: (10.0,  12.5),   # Nationals Park — LF 10'/9' → 10', RF 16'/9' → 12.5'
+    3312: ( 8.0,  23.0),   # Target Field — LF 8', RF 23'
+    3313: ( 8.0,   8.0),   # Yankee Stadium — uniform 8'
+    4169: (10.0,  10.0),   # LoanDepot Park — LF 12'/7' → 10', RF 12'/9'/7' → 10'
+    4705: ( 6.0,  16.0),   # Truist Park — LF 6', RF 16'
+    5325: ( 7.5,   9.0),   # Globe Life Field — LF 8'/7' → 7.5', RF 7'/10'/8' → 9'
+}
+
+_REF_WALL_FT = 8.0           # League-average baseline wall height
+_HR_WALL_SCALE  = 0.12       # pct-pts per foot deviation for HR
+_XBH_WALL_SCALE = 0.08       # pct-pts per foot deviation for XBH (doubles off wall)
+_S_WALL_SCALE   = 0.02       # pct-pts per foot deviation for singles (carom)
+
+
+def _dimension_splits(venue_id: int) -> dict:
+    """Zero-sum LHB/RHB offsets derived from outfield wall asymmetry.
+
+    Taller wall on pull side → fewer HR but more doubles for that hand.
+    Returns dict with hr_dim_lhb, hr_dim_rhb, xbh_dim_lhb, xbh_dim_rhb,
+    s_dim_lhb, s_dim_rhb — all zero-sum pairs.
+    """
+    lf_wall, rf_wall = VENUE_WALL_HEIGHTS.get(venue_id, (_REF_WALL_FT, _REF_WALL_FT))
+
+    # Raw offsets: short wall on pull side → more HR for that hand
+    # RHB pulls to LF, LHB pulls to RF
+    raw_hr_rhb = (_REF_WALL_FT - lf_wall) * _HR_WALL_SCALE
+    raw_hr_lhb = (_REF_WALL_FT - rf_wall) * _HR_WALL_SCALE
+    hr_mean = (raw_hr_rhb + raw_hr_lhb) / 2.0
+
+    # Tall wall → more doubles off it (inverse of HR)
+    raw_xbh_rhb = (lf_wall - _REF_WALL_FT) * _XBH_WALL_SCALE
+    raw_xbh_lhb = (rf_wall - _REF_WALL_FT) * _XBH_WALL_SCALE
+    xbh_mean = (raw_xbh_rhb + raw_xbh_lhb) / 2.0
+
+    # Caroms off tall wall → singles
+    raw_s_rhb = (lf_wall - _REF_WALL_FT) * _S_WALL_SCALE
+    raw_s_lhb = (rf_wall - _REF_WALL_FT) * _S_WALL_SCALE
+    s_mean = (raw_s_rhb + raw_s_lhb) / 2.0
+
+    return {
+        "hr_dim_rhb":  raw_hr_rhb  - hr_mean,
+        "hr_dim_lhb":  raw_hr_lhb  - hr_mean,
+        "xbh_dim_rhb": raw_xbh_rhb - xbh_mean,
+        "xbh_dim_lhb": raw_xbh_lhb - xbh_mean,
+        "s_dim_rhb":   raw_s_rhb   - s_mean,
+        "s_dim_lhb":   raw_s_lhb   - s_mean,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Three-stage weather pipeline
+#   Stage 0: Neutral park baseline (no weather)
+#   Stage 1: Base weather (universal constants, no venue multipliers)
+#   Stage 2: Venue-adjusted weather (venue-specific multipliers applied)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _neutral_park(venue_id: int) -> dict:
+    """Stage 0: Static park baseline with all weather factors neutral.
+
+    Returns what each stadium produces under perfectly neutral conditions
+    (70°F, 50% humidity, no wind, standard pressure, clear skies).
+    This is the stadium's inherent offensive environment.
+
+    Returns dict with keys: hr_pct, xbh_pct, singles_pct, overall_pct,
+    plus the raw factors for diagnostics.
+    """
+    # HR park factor
+    pf_index = VENUE_PARK_FACTORS.get(venue_id, 100)
+    hr_pct = float(pf_index - 100)
+
+    # Hit-type park factors
+    hf = VENUE_HIT_FACTORS.get(venue_id, {"1B": 1.00, "2B": 1.00, "3B": 1.00})
+    singles_pct = (hf["1B"] - 1.0) * 100.0
+    pf_2b_pct = (hf["2B"] - 1.0) * 100.0
+    pf_3b_pct = (hf["3B"] - 1.0) * 100.0
+    xbh_pct = pf_2b_pct * 0.92 + pf_3b_pct * 0.08
+
+    # Overall (frequency-weighted composite)
+    overall_pct = (singles_pct * _W_1B + pf_2b_pct * _W_2B
+                   + pf_3b_pct * _W_3B + hr_pct * _W_HR)
+
+    # Dimension-based LHB/RHB splits (wall asymmetry)
+    dim = _dimension_splits(venue_id)
+
+    return {
+        "hr_pct": hr_pct,
+        "xbh_pct": xbh_pct,
+        "singles_pct": singles_pct,
+        "overall_pct": overall_pct,
+        "pf_index": pf_index,
+        "pf_2b_pct": pf_2b_pct,
+        "pf_3b_pct": pf_3b_pct,
+        **dim,
+    }
+
+
+def _base_weather(data: dict) -> dict:
+    """Stage 1: Compute raw weather pct-pt effects using universal constants.
+
+    No venue multipliers are applied here — every park gets the same base
+    values for a given set of weather conditions.  This is the consistent
+    baseline that Stage 2 then adjusts per venue.
+
+    Returns dict with keys:
+        temp, humid_carry, humid_absorb, wind_rhb, wind_lhb, wind_avg,
+        pressure, sky_hr, sky_xbh, sky_1b, day_night
+    """
+    # Temperature
+    temp_f = float(data.get("temp", _REF_TEMP_F) or _REF_TEMP_F)
+    temp = (temp_f - _REF_TEMP_F) * _TEMP_PER_F
+
+    # Humidity — two independent effects
+    humid = float(data.get("humidity_pct", _REF_HUMID_CARRY) or _REF_HUMID_CARRY)
+    # 1) Air density / carry: ref=50%.  Higher humidity = lighter air = more carry.
+    #    Universal physics — NOT venue-adjusted.
+    humid_carry = (humid - _REF_HUMID_CARRY) * _HUMID_CARRY_PER_PCT
+    # 2) Ball absorption / pop: ref=57% (humidor).  Higher humidity = ball absorbs
+    #    moisture = less COR/exit velo.  Venue-adjusted (domes ≈ 0).
+    humid_absorb = (humid - _REF_HUMID_ABSORB) * _HUMID_ABSORB_PER_PCT
+
+    # Wind — trig decomposition per handedness
+    wind_speed = float(data.get("wind_speed", 0) or 0)
+    wind_dir = data.get("wind_dir", "")
+    wind_angle = WIND_ANGLES.get(wind_dir)
+
+    if wind_angle is not None and wind_speed > 0:
+        wrad = math.radians(wind_angle)
+        rhb_comp = wind_speed * math.cos(wrad - math.radians(_RHB_PULL_DEG))
+        lhb_comp = wind_speed * math.cos(wrad - math.radians(_LHB_PULL_DEG))
+        out_comp = wind_speed * math.cos(wrad)
+        wind_rhb = _wind_carry_pct(rhb_comp)
+        wind_lhb = _wind_carry_pct(lhb_comp)
+        wind_avg = _wind_carry_pct(out_comp)
+    else:
+        wind_rhb = wind_lhb = wind_avg = 0.0
+
+    # Pressure — deviation from expected at elevation
+    pressure_val = data.get("pressure_hpa")
+    elev = float(data.get("elevation", 0) or 0)
+    if pressure_val:
+        expected_p = _expected_pressure(elev)
+        pressure = (expected_p - float(pressure_val)) * _PRESS_PER_HPA
+    else:
+        pressure = 0.0
+
+    # Sky condition modifiers
+    condition = data.get("condition", "")
+    sky_hr = _sky_modifier(condition, _SKY_HR_MODIFIER)
+    sky_xbh = _sky_modifier(condition, _SKY_HITS_XBH_MOD)
+    sky_1b = _sky_modifier(condition, _SKY_HITS_1B_MOD)
+
+    # Day vs night modifier
+    day_night = _day_night_modifier(data)
+
+    return {
+        "temp": temp,
+        "humid_carry": humid_carry,
+        "humid_absorb": humid_absorb,
+        "wind_rhb": wind_rhb,
+        "wind_lhb": wind_lhb,
+        "wind_avg": wind_avg,
+        "pressure": pressure,
+        "sky_hr": sky_hr,
+        "sky_xbh": sky_xbh,
+        "sky_1b": sky_1b,
+        "day_night": day_night,
+        "condition": condition,
+    }
+
+
+def _venue_adjust_weather(base: dict, venue_id: int) -> dict:
+    """Stage 2: Apply asymmetric venue multipliers to base weather values.
+
+    Each profile entry is (pos_mult, neg_mult).  When a base value is
+    positive (weather boosts offense) pos_mult is used; when negative
+    (weather suppresses) neg_mult is used.
+
+    Humidity is split into two independent effects:
+      humid_carry:  Air density (ref 50%).  Universal physics — passes
+                    through WITHOUT venue adjustment.
+      humid_absorb: Ball moisture absorption (ref 57% humidor).  Venue-
+                    adjusted via "h" profile (domes ≈ 0, open-air varies).
+
+    Sky modifiers are scaled by per-venue _VENUE_SKY_MULT (default 1.0).
+    Day/night modifiers are venue-specific via _VENUE_DAY_NIGHT.
+    """
+    profile = VENUE_WX_PROFILE.get(venue_id, {})
+
+    def _asym(val: float, key: str) -> float:
+        tup = profile.get(key, (1.0, 1.0))
+        return val * tup[0] if val >= 0 else val * tup[1]
+
+    temp = _asym(base["temp"], "t")
+    humid_carry = base["humid_carry"]          # universal — no venue adjustment
+    humid_absorb = _asym(base["humid_absorb"], "h")  # venue-specific
+    pressure = _asym(base["pressure"], "p")
+
+    wind_rhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _asym(base["wind_rhb"], "w")))
+    wind_lhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _asym(base["wind_lhb"], "w")))
+    wind_avg = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _asym(base["wind_avg"], "w")))
+
+    # Scale sky modifiers by venue sensitivity — rain uses separate multiplier
+    cond = base.get("condition", "")
+    _is_rain = any(k in (cond or "").lower() for k in ("rain", "drizzle", "shower"))
+    sky_m = _VENUE_RAIN_MULT.get(venue_id, 1.0) if _is_rain else _VENUE_SKY_MULT.get(venue_id, 1.0)
+
+    return {
+        "temp": temp,
+        "humid_carry": humid_carry,
+        "humid_absorb": humid_absorb,
+        "wind_rhb": wind_rhb,
+        "wind_lhb": wind_lhb,
+        "wind_avg": wind_avg,
+        "pressure": pressure,
+        "sky_hr": base["sky_hr"] * sky_m,
+        "sky_xbh": base["sky_xbh"] * sky_m,
+        "sky_1b": base["sky_1b"] * sky_m,
+        "day_night": base["day_night"],
+    }
+
+
 def _sky_modifier(condition: str, table: dict) -> float:
     """Return additive pct-pt modifier for current sky/cloud condition."""
     if not condition:
@@ -553,30 +956,21 @@ def _day_night_modifier(data: dict) -> float:
 
 
 def _compute_hr_rating(data: dict, *, _roof_override=None) -> dict:
-    """Tiered HR carry rating: static park factor × weather modifier.
+    """Three-stage HR rating: neutral park → base weather → venue adjust.
 
-    Three stadium categories
-    ------------------------
-    1. **Fixed dome** — zero weather adjustments; return base park factor.
-    2. **Retractable roof** — predict roof status first; if closed, zero
-       weather adjustments; if open, apply standard formula.
-    3. **Open-air** — full weather adjustments.
-
-    Weather layers (when applicable)
-    --------------------------------
-    1. Temperature — +0.85 % per °F above 70 °F baseline.
-    2. Humidity — +0.08 % per 1 % above 50 % baseline.
-    3. Wind — directional & handedness-specific via cosine projection.
-    4. Pressure — deviation from expected at venue elevation.
-    5. Cap at ±40 %, combined **additively** with park factor.
+    Pipeline
+    --------
+    Stage 0: ``_neutral_park()`` — static park factor at neutral weather.
+    Stage 1: ``_base_weather()``  — universal weather effects.
+    Stage 2: ``_venue_adjust_weather()`` — venue-specific multipliers.
 
     Returns dict with total_pct, lhb_pct, rhb_pct, color, roof_status,
     and a ``components`` breakdown.
     """
-    # ── Base park factor ──
+    # ── Stage 0: Neutral park baseline ──
     venue_id = data.get("venue_id")
-    pf_index = VENUE_PARK_FACTORS.get(venue_id, 100)
-    park_pct = pf_index - 100                # e.g. 107 → +7%
+    park = _neutral_park(venue_id)
+    park_pct = park["hr_pct"]
 
     # ── Determine roof status (gatekeeper for weather adjustments) ──
     if _roof_override:
@@ -586,99 +980,51 @@ def _compute_hr_rating(data: dict, *, _roof_override=None) -> dict:
 
     # Fixed dome or roof closed → mostly no weather adjustments
     if roof_status in ("dome", "closed"):
-        # Some venues don't fully control indoor humidity (no AC / carport roof)
         _closed_hm = _CLOSED_ROOF_HUMID_MULT.get(venue_id, 0.0)
         if _closed_hm > 0:
-            _vp_c = VENUE_WX_PROFILE.get(venue_id, {})
-            humid_c = float(data.get("humidity_pct", _REF_HUMIDITY) or _REF_HUMIDITY)
-            humid_residual = (humid_c - _REF_HUMIDITY) * _HUMID_PER_PCT * _vp_c.get("h", 1.0) * _closed_hm
+            base = _base_weather(data)
+            profile = VENUE_WX_PROFILE.get(venue_id, {})
+            def _asym_h(val):
+                tup = profile.get("h", (1.0, 1.0))
+                return val * tup[0] if val >= 0 else val * tup[1]
+            # Carry passes through (universal); absorption gets venue + dome scaling
+            humid_residual = base["humid_carry"] + _asym_h(base["humid_absorb"]) * _closed_hm
         else:
             humid_residual = 0.0
         total = park_pct + humid_residual
         color = C["grn"] if total > 8 else C["red"] if total < -8 else C["t1"]
         return {
             "total_pct": float(total),
-            "lhb_pct": float(total),
-            "rhb_pct": float(total),
+            "lhb_pct": float(total + park["hr_dim_lhb"]),
+            "rhb_pct": float(total + park["hr_dim_rhb"]),
             "color": color,
             "roof_status": roof_status,
             "roof_confirmed": roof_confirmed,
             "components": {
-                "park_factor": pf_index,
+                "park_factor": park["pf_index"],
                 "temp": 0.0, "humidity": float(humid_residual), "wind": 0.0,
                 "wind_rhb": 0.0, "wind_lhb": 0.0,
                 "pressure": 0.0, "weather_total": float(humid_residual),
             },
         }
 
-    # ── Roof open or open-air: apply weather adjustments ──
+    # ── Stage 1 → Stage 2: base weather → venue-adjusted weather ──
+    base = _base_weather(data)
+    wx = _venue_adjust_weather(base, venue_id)
 
-    # Per-venue weather sensitivity profile
-    _vp = VENUE_WX_PROFILE.get(venue_id, {})
-    _wm = _vp.get("w", 1.0)   # wind multiplier
-    _tm = _vp.get("t", 1.0)   # temperature multiplier
-    _hm = _vp.get("h", 1.0)   # humidity multiplier
-    _pm = _vp.get("p", 1.0)   # pressure/altitude multiplier
+    # Combine weather modifiers per handedness
+    _h = wx["humid_carry"] + wx["humid_absorb"]
+    wx_rhb = wx["temp"] + _h + wx["wind_rhb"] + wx["pressure"] + wx["sky_hr"] + wx["day_night"]
+    wx_lhb = wx["temp"] + _h + wx["wind_lhb"] + wx["pressure"] + wx["sky_hr"] + wx["day_night"]
 
-    # Step 1: Temperature
-    temp_f = float(data.get("temp", _REF_TEMP_F) or _REF_TEMP_F)
-    temp_pct = (temp_f - _REF_TEMP_F) * _TEMP_PER_F * _tm
-
-    # Step 2: Humidity
-    humid = float(data.get("humidity_pct", _REF_HUMIDITY) or _REF_HUMIDITY)
-    humid_pct = (humid - _REF_HUMIDITY) * _HUMID_PER_PCT * _hm
-
-    # Step 3: Wind — trig decomposition per handedness
-    wind_speed = float(data.get("wind_speed", 0) or 0)
-    wind_dir = data.get("wind_dir", "")
-    wind_angle = WIND_ANGLES.get(wind_dir)
-
-    if wind_angle is not None and wind_speed > 0:
-        wrad = math.radians(wind_angle)
-        rhb_comp = wind_speed * math.cos(wrad - math.radians(_RHB_PULL_DEG))
-        lhb_comp = wind_speed * math.cos(wrad - math.radians(_LHB_PULL_DEG))
-
-        wind_pct_rhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _wind_carry_pct(rhb_comp) * _wm))
-        wind_pct_lhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _wind_carry_pct(lhb_comp) * _wm))
-    else:
-        wind_pct_rhb = wind_pct_lhb = 0.0
-
-    # Step 4: Pressure — deviation from expected at elevation
-    pressure = data.get("pressure_hpa")
-    elev = float(data.get("elevation", 0) or 0)
-    if pressure:
-        expected_p = _expected_pressure(elev)
-        press_pct = (expected_p - float(pressure)) * _PRESS_PER_HPA * _pm
-    else:
-        press_pct = 0.0
-
-    # Step 5: Sky condition (cloud cover) modifier
-    condition = data.get("condition", "")
-    sky_pct = _sky_modifier(condition, _SKY_HR_MODIFIER)
-
-    # Step 6: Day vs night modifier
-    dn_pct = _day_night_modifier(data)
-
-    # Step 7: Combine weather modifiers per handedness
-    wx_rhb = temp_pct + humid_pct + wind_pct_rhb + press_pct + sky_pct + dn_pct
-    wx_lhb = temp_pct + humid_pct + wind_pct_lhb + press_pct + sky_pct + dn_pct
-
-    # Step 8: Additive combination — park factor % + weather %
-    # Cap the *average* wx (not per-handedness) so asymmetric wind
-    # games (e.g. Wrigley blowing out to LF) aren't clipped prematurely.
-    rhb_pct = park_pct + wx_rhb
-    lhb_pct = park_pct + wx_lhb
+    # Cap the *average* wx so asymmetric wind games aren't clipped prematurely
+    rhb_pct = park_pct + park["hr_dim_rhb"] + wx_rhb
+    lhb_pct = park_pct + park["hr_dim_lhb"] + wx_lhb
     avg_wx = (wx_rhb + wx_lhb) / 2.0
     avg_wx = max(-_WX_CAP, min(_WX_CAP, avg_wx))
     total_pct = park_pct + avg_wx
 
-    # Color coding
-    if total_pct > 8:
-        color = C["grn"]
-    elif total_pct < -8:
-        color = C["red"]
-    else:
-        color = C["t1"]
+    color = C["grn"] if total_pct > 8 else C["red"] if total_pct < -8 else C["t1"]
 
     return {
         "total_pct": total_pct,
@@ -688,13 +1034,13 @@ def _compute_hr_rating(data: dict, *, _roof_override=None) -> dict:
         "roof_status": roof_status,
         "roof_confirmed": roof_confirmed,
         "components": {
-            "park_factor": pf_index,
-            "temp": round(temp_pct, 1),
-            "humidity": round(humid_pct, 1),
-            "wind": round((wind_pct_rhb + wind_pct_lhb) / 2.0, 1),
-            "wind_rhb": round(wind_pct_rhb, 1),
-            "wind_lhb": round(wind_pct_lhb, 1),
-            "pressure": round(press_pct, 1),
+            "park_factor": park["pf_index"],
+            "temp": round(wx["temp"], 1),
+            "humidity": round(_h, 1),
+            "wind": round((wx["wind_rhb"] + wx["wind_lhb"]) / 2.0, 1),
+            "wind_rhb": round(wx["wind_rhb"], 1),
+            "wind_lhb": round(wx["wind_lhb"], 1),
+            "pressure": round(wx["pressure"], 1),
             "weather_total": round((wx_rhb + wx_lhb) / 2.0, 1),
         },
     }
@@ -741,7 +1087,8 @@ def _compute_wind_insight(data: dict, *, _roof_override=None) -> dict:
 
     # Venue wind receptiveness tiers based on VENUE_WX_PROFILE "w" multiplier
     venue_id = data.get("venue_id")
-    _wm = VENUE_WX_PROFILE.get(venue_id, {}).get("w", 1.0)
+    _wm_raw = VENUE_WX_PROFILE.get(venue_id, {}).get("w", (1.0, 1.0))
+    _wm = _wm_raw[0] if isinstance(_wm_raw, tuple) else _wm_raw
 
     if _wm >= 2.0:
         _out_effect = "ball will carry significantly further"
@@ -784,31 +1131,25 @@ def _compute_wind_insight(data: dict, *, _roof_override=None) -> dict:
 
 
 def _compute_hits_rating(data: dict, *, _roof_override=None) -> dict:
-    """Predict hit-type adjustments: singles, doubles/triples, and overall.
+    """Three-stage hits rating: neutral park → base weather → venue adjust.
 
-    Uses per-venue hit-type park factors with weather adjustments scaled
-    by sensitivity:
-      - Singles:  30 % of HR weather sensitivity
-      - 2B/3B:   60–100 % of HR weather sensitivity (varies by component)
-      - HR:      100 % (computed separately)
-
-    For enclosed venues (dome / closed roof), weather adjustments are zero
-    and only base park factors apply.
+    Pipeline
+    --------
+    Stage 0: ``_neutral_park()`` — static hit-type park factors.
+    Stage 1: ``_base_weather()``  — universal weather effects.
+    Stage 2: ``_venue_adjust_weather()`` — venue-specific multipliers.
 
     Returns dict with xbh_pct, xbh_lhb, xbh_rhb, singles_pct, singles_lhb,
     singles_rhb, overall_pct, color, and roof_status.
     """
+    # ── Stage 0: Neutral park baseline ──
     venue_id = data.get("venue_id")
-    hf = VENUE_HIT_FACTORS.get(venue_id, {"1B": 1.00, "2B": 1.00, "3B": 1.00})
-    # Park-factor percentages (additive base)
-    pf_1b_pct = (hf["1B"] - 1.0) * 100.0
-    pf_2b_pct = (hf["2B"] - 1.0) * 100.0
-    pf_3b_pct = (hf["3B"] - 1.0) * 100.0
-    # Combined 2B/3B park-factor % (weighted: 2B≈92%, 3B≈8%)
-    pf_xbh_pct = pf_2b_pct * 0.92 + pf_3b_pct * 0.08
-
-    # HR park factor % for overall weighted calc
-    hr_park_pct = float(VENUE_PARK_FACTORS.get(venue_id, 100) - 100)
+    park = _neutral_park(venue_id)
+    pf_1b_pct = park["singles_pct"]
+    pf_2b_pct = park["pf_2b_pct"]
+    pf_3b_pct = park["pf_3b_pct"]
+    pf_xbh_pct = park["xbh_pct"]
+    hr_park_pct = park["hr_pct"]
 
     if _roof_override:
         roof_status, _ = _roof_override
@@ -816,13 +1157,15 @@ def _compute_hits_rating(data: dict, *, _roof_override=None) -> dict:
         roof_status, _ = _predict_roof_status(data)
 
     # ── Enclosed: mostly no weather adjustments ──
-    if roof_status in ("dome", "closed"):
-        # Residual humidity for non-AC / carport venues
+    if roof_status in ("dome", "closed", "Closed"):
         _closed_hm = _CLOSED_ROOF_HUMID_MULT.get(venue_id, 0.0)
         if _closed_hm > 0:
-            _vp_c = VENUE_WX_PROFILE.get(venue_id, {})
-            humid_c = float(data.get("humidity_pct", _REF_HUMIDITY) or _REF_HUMIDITY)
-            h_res = (humid_c - _REF_HUMIDITY) * _HUMID_PER_PCT * _vp_c.get("h", 1.0) * _closed_hm
+            base = _base_weather(data)
+            profile = VENUE_WX_PROFILE.get(venue_id, {})
+            def _asym_h2(val):
+                tup = profile.get("h", (1.0, 1.0))
+                return val * tup[0] if val >= 0 else val * tup[1]
+            h_res = base["humid_carry"] + _asym_h2(base["humid_absorb"]) * _closed_hm
         else:
             h_res = 0.0
         s_res = h_res * _SINGLES_WX_WEIGHT
@@ -831,99 +1174,55 @@ def _compute_hits_rating(data: dict, *, _roof_override=None) -> dict:
                    + (pf_3b_pct + x_res) * _W_3B + (hr_park_pct + h_res) * _W_HR)
         color = C["grn"] if overall > 8 else C["red"] if overall < -8 else C["t1"]
         return {
-            "xbh_pct": pf_xbh_pct + x_res, "xbh_lhb": pf_xbh_pct + x_res,
-            "xbh_rhb": pf_xbh_pct + x_res,
-            "singles_pct": pf_1b_pct + s_res, "singles_lhb": pf_1b_pct + s_res,
-            "singles_rhb": pf_1b_pct + s_res,
+            "xbh_pct": pf_xbh_pct + x_res,
+            "xbh_lhb": pf_xbh_pct + x_res + park["xbh_dim_lhb"],
+            "xbh_rhb": pf_xbh_pct + x_res + park["xbh_dim_rhb"],
+            "singles_pct": pf_1b_pct + s_res,
+            "singles_lhb": pf_1b_pct + s_res + park["s_dim_lhb"],
+            "singles_rhb": pf_1b_pct + s_res + park["s_dim_rhb"],
             "overall_pct": overall, "color": color,
             "roof_status": roof_status,
         }
 
-    # ── Open / outdoor: calculate weather adjustments ──
+    # ── Stage 1 → Stage 2: base weather → venue-adjusted weather ──
+    base = _base_weather(data)
+    wx = _venue_adjust_weather(base, venue_id)
 
-    # Per-venue weather sensitivity profile
-    _vp = VENUE_WX_PROFILE.get(venue_id, {})
-    _wm = _vp.get("w", 1.0)   # wind multiplier
-    _tm = _vp.get("t", 1.0)   # temperature multiplier
-    _hm = _vp.get("h", 1.0)   # humidity multiplier
-    _pm = _vp.get("p", 1.0)   # pressure/altitude multiplier
-
-    # Temperature
-    temp_f = float(data.get("temp", _REF_TEMP_F) or _REF_TEMP_F)
-    temp_pct = (temp_f - _REF_TEMP_F) * _TEMP_PER_F * _tm
-
-    # Humidity
-    humid = float(data.get("humidity_pct", _REF_HUMIDITY) or _REF_HUMIDITY)
-    humid_pct = (humid - _REF_HUMIDITY) * _HUMID_PER_PCT * _hm
-
-    # Wind — directional per handedness
-    wind_speed = float(data.get("wind_speed", 0) or 0)
-    wind_dir = data.get("wind_dir", "")
-    wind_angle = WIND_ANGLES.get(wind_dir)
-
-    if wind_angle is not None and wind_speed > 0:
-        wrad = math.radians(wind_angle)
-        out_comp = wind_speed * math.cos(wrad)
-        rhb_comp = wind_speed * math.cos(wrad - math.radians(_RHB_PULL_DEG))
-        lhb_comp = wind_speed * math.cos(wrad - math.radians(_LHB_PULL_DEG))
-        wind_pct = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _wind_carry_pct(out_comp) * _wm))
-        wind_pct_rhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _wind_carry_pct(rhb_comp) * _wm))
-        wind_pct_lhb = max(-_WIND_PER_HAND_CAP, min(_WIND_PER_HAND_CAP, _wind_carry_pct(lhb_comp) * _wm))
-    else:
-        wind_pct = wind_pct_rhb = wind_pct_lhb = 0.0
-
-    # Pressure
-    pressure = data.get("pressure_hpa")
-    elev = float(data.get("elevation", 0) or 0)
-    if pressure:
-        expected_p = _expected_pressure(elev)
-        press_pct = (expected_p - float(pressure)) * _PRESS_PER_HPA * _pm
-    else:
-        press_pct = 0.0
-
-    # Sky condition (cloud cover) modifier
-    condition = data.get("condition", "")
-    sky_xbh = _sky_modifier(condition, _SKY_HITS_XBH_MOD)
-    sky_1b  = _sky_modifier(condition, _SKY_HITS_1B_MOD)
-    sky_hr  = _sky_modifier(condition, _SKY_HR_MODIFIER)
-
-    # Day vs night modifier
-    dn_pct = _day_night_modifier(data)
-    # Scale day/night for hits: XBH gets 50%, singles gets 25%
-    dn_xbh = dn_pct * 0.50
-    dn_1b  = dn_pct * 0.25
+    dn_1b  = wx["day_night"] * 0.25
+    dn_xbh = wx["day_night"] * 0.50
 
     # ── Singles weather (15% of HR sensitivity + sky + day/night) ──
-    s_wx = (temp_pct + humid_pct + wind_pct + press_pct) * _SINGLES_WX_WEIGHT + sky_1b + dn_1b
+    _hh = wx["humid_carry"] + wx["humid_absorb"]
+    s_wx = (wx["temp"] + _hh + wx["wind_avg"] + wx["pressure"]) * _SINGLES_WX_WEIGHT + wx["sky_1b"] + dn_1b
     s_wx = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, s_wx))
-    s_wx_rhb = (temp_pct + humid_pct + wind_pct_rhb + press_pct) * _SINGLES_WX_WEIGHT + sky_1b + dn_1b
+    s_wx_rhb = (wx["temp"] + _hh + wx["wind_rhb"] + wx["pressure"]) * _SINGLES_WX_WEIGHT + wx["sky_1b"] + dn_1b
     s_wx_rhb = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, s_wx_rhb))
-    s_wx_lhb = (temp_pct + humid_pct + wind_pct_lhb + press_pct) * _SINGLES_WX_WEIGHT + sky_1b + dn_1b
+    s_wx_lhb = (wx["temp"] + _hh + wx["wind_lhb"] + wx["pressure"]) * _SINGLES_WX_WEIGHT + wx["sky_1b"] + dn_1b
     s_wx_lhb = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, s_wx_lhb))
 
     # ── 2B/3B weather (component-weighted fraction of HR + sky + day/night) ──
-    x_wx = (temp_pct * _XBH_TEMP_WEIGHT + humid_pct * _XBH_HUMID_WEIGHT
-            + wind_pct * _XBH_WIND_WEIGHT + press_pct * _XBH_PRESS_WEIGHT) + sky_xbh + dn_xbh
+    x_wx = (wx["temp"] * _XBH_TEMP_WEIGHT + _hh * _XBH_HUMID_WEIGHT
+            + wx["wind_avg"] * _XBH_WIND_WEIGHT + wx["pressure"] * _XBH_PRESS_WEIGHT) + wx["sky_xbh"] + dn_xbh
     x_wx = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, x_wx))
-    x_wx_rhb = (temp_pct * _XBH_TEMP_WEIGHT + humid_pct * _XBH_HUMID_WEIGHT
-                + wind_pct_rhb * _XBH_WIND_WEIGHT + press_pct * _XBH_PRESS_WEIGHT) + sky_xbh + dn_xbh
+    x_wx_rhb = (wx["temp"] * _XBH_TEMP_WEIGHT + _hh * _XBH_HUMID_WEIGHT
+                + wx["wind_rhb"] * _XBH_WIND_WEIGHT + wx["pressure"] * _XBH_PRESS_WEIGHT) + wx["sky_xbh"] + dn_xbh
     x_wx_rhb = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, x_wx_rhb))
-    x_wx_lhb = (temp_pct * _XBH_TEMP_WEIGHT + humid_pct * _XBH_HUMID_WEIGHT
-                + wind_pct_lhb * _XBH_WIND_WEIGHT + press_pct * _XBH_PRESS_WEIGHT) + sky_xbh + dn_xbh
+    x_wx_lhb = (wx["temp"] * _XBH_TEMP_WEIGHT + _hh * _XBH_HUMID_WEIGHT
+                + wx["wind_lhb"] * _XBH_WIND_WEIGHT + wx["pressure"] * _XBH_PRESS_WEIGHT) + wx["sky_xbh"] + dn_xbh
     x_wx_lhb = max(-_HITS_WX_CAP, min(_HITS_WX_CAP, x_wx_lhb))
 
-    # ── Additive: park factor % + weather % ──
+    # ── Additive: park factor % + dimension splits + weather % ──
     singles_pct = pf_1b_pct + s_wx
-    singles_rhb = pf_1b_pct + s_wx_rhb
-    singles_lhb = pf_1b_pct + s_wx_lhb
+    singles_rhb = pf_1b_pct + park["s_dim_rhb"] + s_wx_rhb
+    singles_lhb = pf_1b_pct + park["s_dim_lhb"] + s_wx_lhb
 
     xbh_pct = pf_xbh_pct + x_wx
-    xbh_rhb = pf_xbh_pct + x_wx_rhb
-    xbh_lhb = pf_xbh_pct + x_wx_lhb
+    xbh_rhb = pf_xbh_pct + park["xbh_dim_rhb"] + x_wx_rhb
+    xbh_lhb = pf_xbh_pct + park["xbh_dim_lhb"] + x_wx_lhb
 
     # HR weather (100% sensitivity + sky + day/night) for overall calc
-    hr_wx = (temp_pct + humid_pct
-             + (wind_pct_rhb + wind_pct_lhb) / 2.0 + press_pct + sky_hr + dn_pct)
+    hr_wx = (wx["temp"] + _hh
+             + (wx["wind_rhb"] + wx["wind_lhb"]) / 2.0 + wx["pressure"] + wx["sky_hr"] + wx["day_night"])
     hr_wx = max(-_WX_CAP, min(_WX_CAP, hr_wx))
 
     # ── Overall weighted hit adjustment ──
@@ -1369,7 +1668,7 @@ class WeatherOverlay(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
             temp = slot.get("temp", "")
-            temp_str = f"{temp}°F" if temp != "" else ""
+            temp_str = f"{round(float(temp))}°F" if temp != "" else ""
             cond_str = slot.get("condition", "")
 
             # Measure text widths for centering
@@ -1791,7 +2090,7 @@ class WeatherDetailWidget(QFrame):
         pressure = self.d.get("pressure_hpa")
 
         self._cond_vals["temp"] = _cond_row(grid, 0, "Temperature",
-                                            f"{temp}°F")
+                                            f"{round(float(temp))}°F" if temp != "--" else "--°F")
         self._cond_vals["wind"] = _cond_row(grid, 1, "Wind Speed",
                                             f"{ws} mph {wd}" if ws else "Calm")
         self._cond_vals["precip"] = _cond_row(grid, 2, "Precipitation",
@@ -1864,7 +2163,7 @@ class WeatherDetailWidget(QFrame):
             wd = self.d.get("wind_dir", "Calm")
             precip = self.d.get("precip_pct")
             humid = self.d.get("humidity_pct")
-            self._cond_vals["temp"].setText(f"{temp}°F")
+            self._cond_vals["temp"].setText(f"{round(float(temp))}°F" if temp != "--" else "--°F")
             self._cond_vals["wind"].setText(
                 f"{ws} mph {wd}" if ws else "Calm")
             self._cond_vals["precip"].setText(
@@ -1898,7 +2197,7 @@ class WeatherDetailWidget(QFrame):
         wd = self.d.get("wind_dir", "Calm")
         precip = self.d.get("precip_pct")
         humid = self.d.get("humidity_pct")
-        self._cond_vals["temp"].setText(f"{temp}°F")
+        self._cond_vals["temp"].setText(f"{round(float(temp))}°F" if temp != "--" else "--°F")
         self._cond_vals["wind"].setText(
             f"{ws} mph {wd}" if ws else "Calm")
         self._cond_vals["precip"].setText(

@@ -492,11 +492,15 @@ class MLBDataEngine:
                         desc = det.get('description', '')
                         live_preview = f"{ev}: {desc}" if ev and desc else (ev or desc)
                     elif last_ev.get('type') == 'pitch':
+                        pitch_num = sum(1 for e in cp_events if e.get('type') == 'pitch')
                         desc = det.get('description', '')
                         call = det.get('call', {}).get('description', '')
                         pitch_type = det.get('type', {}).get('description', '')
                         pitch_speed = last_ev.get('pitchData', {}).get('startSpeed')
                         base = call or desc
+                        # Ball in dirt that batter swung at is a strike, not a ball
+                        if 'dirt' in base.lower() and det.get('isStrike'):
+                            base = "Swinging (In Dirt)"
                         if pitch_type or pitch_speed:
                             extra = pitch_type or ''
                             if pitch_speed:
@@ -504,6 +508,7 @@ class MLBDataEngine:
                             live_preview = f"{base} ({extra})" if base else extra
                         else:
                             live_preview = base
+                        live_preview = f"{pitch_num}. {live_preview}"
                         if det.get('hasReview'):
                             live_preview = f"Challenge: {live_preview}"
 

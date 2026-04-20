@@ -4,6 +4,35 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.2.1 — 2026-04-20
+
+### Park & Weather
+
+**Wall-Height Dimension Splits**
+- Added `VENUE_WALL_HEIGHTS` dict with effective pull-zone wall heights (LF wall, RF wall) for all 30 MLB venues extracted from BallparkPal stadium diagrams
+- New `_dimension_splits()` function computes zero-sum LHB/RHB offsets from outfield wall asymmetry
+- Formula: short wall on pull side → more HR for that handedness; tall wall → more doubles off the wall (inverse of HR effect)
+- Scaling constants: HR ±0.12 pct-pts/ft, XBH ±0.08 pct-pts/ft, 1B ±0.02 pct-pts/ft from 8' reference baseline
+- All splits are zero-sum pairs — overall park ratings unchanged, only handedness differentials affected
+
+**Dimension Splits Wired Into Pipeline**
+- `_neutral_park()` now returns dimension split keys (`hr_dim_lhb`, `hr_dim_rhb`, `xbh_dim_*`, `s_dim_*`) via spread
+- `_compute_hr_rating()` applies HR dimension offsets to `lhb_pct` and `rhb_pct` in both dome and open-air paths
+- `_compute_hits_rating()` applies XBH and singles dimension offsets to per-handedness returns in both paths
+- Notable splits: Fenway LHB +1.92 HR (short RF porch), RHB −1.92 HR (Green Monster suppresses); PNC/Target LHB −0.90 HR (tall RF walls)
+
+**Fixed Dome Roof Check Bug**
+- `_compute_hits_rating()` now checks `roof_status in ("dome", "closed", "Closed")` instead of `== "Closed"`
+- Fixed Tropicana Field showing uneven LHB/RHB splits when it should be symmetric (fixed dome)
+
+**BPP Calibration Round 2 (Total Deviation 271→20)**
+- Park Factors (HR): Angel 103→108, Coors 121→126, Sutter 132→121
+- Weather Profiles: Nationals temp neg 2.40→0.95, Wrigley temp neg 1.80→1.05 + pressure 1.00→0.60, Progressive temp neg 1.45→0.80 + pressure 1.00→0.20, Sutter wind 2.20→1.00
+- Hit Factors (XBH/1B): Adjusted 12 parks — Fenway 2B 1.18→1.29 (Green Monster doubles), Coors 2B 1.31→1.16, Yankee 2B 0.88→1.01, PNC 2B 1.10→1.00, Target 2B 1.03→1.11, Citizens Bank 2B 0.97→1.02/1B 0.98→1.04, loanDepot 1B 0.99→1.07, Angel 2B 0.91→0.94, Progressive 2B 1.03→0.99/1B 0.94→1.00, T-Mobile 2B 0.85→0.82/1B 0.94→0.91, Wrigley 1B 1.01→1.04
+- Final accuracy against BPP: Perfect (≤2): 13, Close (3-5): 2, Off (>5): 0
+
+---
+
 ## v1.2.0 — 2026-04-18
 
 ### Park & Weather

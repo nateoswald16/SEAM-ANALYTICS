@@ -3538,6 +3538,8 @@ class GameCard(QFrame):
             time_hl.addWidget(mk_label("Postponed", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
+        elif st.startswith("delayed"):
+            time_hl.addWidget(mk_label("Delayed", color=C["amb"], size=10, mono=True, bold=True))
         else:
             time_hl.addWidget(mk_label(
                 g["time"], color=C["t3"], size=10, mono=True, bold=True))
@@ -3847,6 +3849,8 @@ class ScheduleGameCard(QFrame):
             time_hl.addWidget(mk_label("Postponed", color=C["t3"], size=10, mono=True, bold=True))
         elif is_final:
             time_hl.addWidget(mk_label("Final", color=C["t3"], size=10, mono=True, bold=True))
+        elif st.startswith("delayed"):
+            time_hl.addWidget(mk_label("Delayed", color=C["amb"], size=10, mono=True, bold=True))
         else:
             time_hl.addWidget(mk_label(g.get("time", "TBD"), color=C["t3"], size=10, mono=True, bold=True))
         time_hl.addStretch()
