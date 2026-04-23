@@ -101,8 +101,8 @@ class MLBDataEngine:
         """Insert into _player_data_cache with LRU-style eviction when over limit."""
         self._player_data_cache[key] = value
         if len(self._player_data_cache) > self._player_data_cache_max:
-            # Evict the oldest entry by timestamp
-            oldest_key = min(self._player_data_cache, key=lambda k: self._player_data_cache[k].get('ts', 0))
+            # Evict oldest insertion (Python 3.7+ dicts maintain insertion order)
+            oldest_key = next(iter(self._player_data_cache))
             self._player_data_cache.pop(oldest_key, None)
 
     def _load_cache(self):
@@ -178,9 +178,9 @@ class MLBDataEngine:
             _app_paths.TEAM_ABBREV_CSV,
         ]
         csv_file = None
-        for c in candidates:
-            if os.path.exists(c):
-                csv_file = c
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                csv_file = candidate
                 break
 
         if csv_file:
@@ -395,14 +395,14 @@ class MLBDataEngine:
             data = resp.json()
             all_plays = data.get('liveData', {}).get('plays', {}).get('allPlays', [])
             result = []
-            for p in all_plays:
-                res = p.get('result', {})
-                about = p.get('about', {})
+            for play in all_plays:
+                res = play.get('result', {})
+                about = play.get('about', {})
                 inning = about.get('inning', 0)
                 half = about.get('halfInning', '')
 
                 # Extract mid-at-bat action events from playEvents
-                for pe in p.get('playEvents', []):
+                for pe in play.get('playEvents', []):
                     if pe.get('type') != 'action':
                         continue
                     pe_details = pe.get('details', {})
@@ -440,7 +440,7 @@ class MLBDataEngine:
                 # For home runs, extract hitData metrics from playEvents
                 hr_details = ''
                 if event and 'home run' in event.lower():
-                    for pe in reversed(p.get('playEvents', [])):
+                    for pe in reversed(play.get('playEvents', [])):
                         hd = pe.get('hitData')
                         if hd:
                             dist = hd.get('totalDistance')
@@ -689,24 +689,24 @@ class MLBDataEngine:
             # Ensure all cached players have 4 elements (position, name, handedness, player_id)
             # Convert old 3-element format to 4-element with handedness
             away_fixed = []
-            for p in cached["away"]:
-                if len(p) == 3:
+            for player in cached["away"]:
+                if len(player) == 3:
                     # Old format: (position, name, player_id) -> add empty handedness
-                    away_fixed.append((p[0], p[1], '', p[2]))
-                elif len(p) == 4:
-                    away_fixed.append(tuple(p))
+                    away_fixed.append((player[0], player[1], '', player[2]))
+                elif len(player) == 4:
+                    away_fixed.append(tuple(player))
                 else:
-                    away_fixed.append(tuple(p))
+                    away_fixed.append(tuple(player))
             
             home_fixed = []
-            for p in cached["home"]:
-                if len(p) == 3:
+            for player in cached["home"]:
+                if len(player) == 3:
                     # Old format: (position, name, player_id) -> add empty handedness
-                    home_fixed.append((p[0], p[1], '', p[2]))
-                elif len(p) == 4:
-                    home_fixed.append(tuple(p))
+                    home_fixed.append((player[0], player[1], '', player[2]))
+                elif len(player) == 4:
+                    home_fixed.append(tuple(player))
                 else:
-                    home_fixed.append(tuple(p))
+                    home_fixed.append(tuple(player))
             
             return {
                 "away": away_fixed,
@@ -2185,9 +2185,9 @@ class MLBDataEngine:
 
             # rows: list of (game_date, event_type, is_successful, pitcher_id)
             all_dates = []
-            for r in rows:
-                if r[0] not in all_dates:
-                    all_dates.append(r[0])
+            for row in rows:
+                if row[0] not in all_dates:
+                    all_dates.append(row[0])
 
             # Determine filtered events based on time_window
             if time_window == 'overall':

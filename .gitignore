@@ -48,6 +48,9 @@ nul
 *.swp
 *.swo
 
+# ── Internal dev docs (not for repo) ─────────────────────────
+app/helper.md
+
 # ── Dev docs (local only) ────────────────────────────────────
 DevUpdate.md
 
@@ -58,6 +61,7 @@ app/rebuild_2026.py
 app/backfill_outs_er.py
 app/download_historical_statcast.py
 app/_diag_*.py
+app/audit_stats_2025.py
 
 # ── API keys ──────────────────────────────────────────────────
 app/weatherapi_key.txt

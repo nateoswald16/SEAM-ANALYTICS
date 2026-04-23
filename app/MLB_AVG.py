@@ -8,7 +8,7 @@ by seam_app.py to colour table cells.
 Cell values are expected in the display format produced by
 ``_build_row_for_player_info`` in seam_app.py:
     AVG/ISO  → "0.243"        (fmt3, raw fraction)
-    K%/BB%   → "0.23"         (fmt2, raw fraction)
+    K%/BB%   → "23.0%"        (fmt_pct, ×100 with % suffix)
     Brl%/Pull% → "6.5%"       (fmt_pct, ×100 with % suffix)
     EV/MaxEV → "88.5"         (fmt1, mph)
     AVG LA/LA → "12.5°"       (fmt_deg, degrees with ° suffix)
@@ -28,13 +28,18 @@ MLB_BENCHMARKS = {
     # ── Batting ──
     "AVG":    {"avg": 0.243, "threshold": 0.015, "higher_is_better": True},
     "ISO":    {"avg": 0.145, "threshold": 0.020, "higher_is_better": True},
-    "K%":     {"avg": 0.23,  "threshold": 0.03,  "higher_is_better": False},
-    "BB%":    {"avg": 0.085, "threshold": 0.015, "higher_is_better": True},
+    "K%":     {"avg": 23.0,  "threshold": 3.0,   "higher_is_better": False},
+    "BB%":    {"avg": 8.5,   "threshold": 1.5,   "higher_is_better": True},
     "Brl%":   {"avg": 6.5,   "threshold": 2.0,   "higher_is_better": True},
     "EV":     {"avg": 88.5,  "threshold": 2.0,   "higher_is_better": True},
     "MaxEV":  {"avg": 108.0, "threshold": 3.0,   "higher_is_better": True},
     "AVG LA": {"avg": 12.0,  "threshold": 4.0,   "higher_is_better": None},
     "LA":     {"avg": 12.0,  "threshold": 4.0,   "higher_is_better": None},
+    "Hard%":  {"avg": 38.5,  "threshold": 4.0,   "higher_is_better": True},   # batter default; pitcher overridden below
+    "BatSpd": {"avg": 70.6,  "threshold": 2.0,   "higher_is_better": True},
+    "SqUp%":  {"avg": 26.0,  "threshold": 2.0,   "higher_is_better": True},   # avg band 24–28%; above avg ≥28%; below avg ≤24%
+    "Blast%": {"avg": 10.0,  "threshold": 3.0,   "higher_is_better": True},   # avg band 7–13%; above avg ≥13%; below avg ≤7%
+    "Chase%": {"avg": 30.0,  "threshold": 4.0,   "higher_is_better": False},
     # ── Pitching ──
     "ERA":      {"avg": 4.15,  "threshold": 0.60,  "higher_is_better": False},
     "Whiff%":   {"avg": 25.0,  "threshold": 4.0,   "higher_is_better": True},
@@ -46,8 +51,10 @@ MLB_BENCHMARKS = {
     "Barrel%":  {"avg": 8.5,   "threshold": 2.0,   "higher_is_better": False},
     "Soft%":    {"avg": 39.0,  "threshold": 4.0,   "higher_is_better": True},
     "LD%":      {"avg": 22.0,  "threshold": 3.0,   "higher_is_better": False},
-    "Hard%":    {"avg": 40.0,  "threshold": 4.0,   "higher_is_better": False},
     "Contact%": {"avg": 77.0,  "threshold": 3.0,   "higher_is_better": False},
+    "SwStr%":   {"avg": 10.5,  "threshold": 1.5,   "higher_is_better": True},
+    "GB%":      {"avg": 44.0,  "threshold": 5.0,   "higher_is_better": True},
+    "F-Strike%":{"avg": 60.0,  "threshold": 5.0,   "higher_is_better": True},
     # ── HR-Allowed table (pitching) ──
     "HR:BF%":     {"avg": 2.75,  "threshold": 0.75,  "higher_is_better": False},
     "Pull Air%":  {"avg": 17.0,  "threshold": 3.0,   "higher_is_better": False},
@@ -63,9 +70,10 @@ MLB_BENCHMARKS = {
 
 # Pitching-specific overrides (polarity flipped vs batting)
 _PITCHING_BENCHMARKS = {
-    "K%":  {"avg": 0.23,  "threshold": 0.03,  "higher_is_better": True},
-    "BB%": {"avg": 0.085, "threshold": 0.015, "higher_is_better": False},
-    "SB%": {"avg": 75.0,  "threshold": 8.0,   "higher_is_better": False},
+    "K%":     {"avg": 23.0,  "threshold": 3.0,   "higher_is_better": True},
+    "BB%":    {"avg": 8.5,   "threshold": 1.5,   "higher_is_better": False},
+    "Hard%":  {"avg": 40.0,  "threshold": 4.0,   "higher_is_better": False},  # pitcher Hard% allowed
+    "SB%":    {"avg": 75.0,  "threshold": 8.0,   "higher_is_better": False},
 }
 
 # Columns that are never graded (info / counting stats)

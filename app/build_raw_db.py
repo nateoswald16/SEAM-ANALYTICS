@@ -513,7 +513,7 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'hc_y': hit_data.get('hc_y'),
             'barrel': feed_barrel,
             'pull': feed_pull,
-            'batter_is_home': 0 if about.get('isTopInning', True) else 1,
+            'batter_is_home': (lambda a: 0 if (a.get('isTopInning') if a.get('isTopInning') is not None else a.get('halfInning', 'top').lower() == 'top') else 1)(about),
             'home_team': home,
             'away_team': away,
             'outs_recorded': outs_on_play,

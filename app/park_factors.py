@@ -25,11 +25,11 @@ _http_om = create_http_session(total_retries=0, backoff_factor=0)
 
 from PyQt6.QtWidgets import (
     QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel,
-    QScrollArea, QGridLayout, QPushButton, QSizePolicy,
+    QScrollArea, QGridLayout, QPushButton, QSizePolicy, QToolTip,
 )
-from PyQt6.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QRectF, QPointF, QThread, pyqtSignal, QTimer, QByteArray, QSize
 from PyQt6.QtGui import (
-    QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QPixmap, QImage,
+    QColor, QFont, QPainter, QPainterPath, QPen, QBrush, QPixmap, QImage, QIcon,
 )
 
 import _app_paths
@@ -39,156 +39,11 @@ import _app_paths
 # ═══════════════════════════════════════════════════════════════════════════════
 from _app_theme import C
 from _ui_utils import mk_label as _mk
-from park_widget import WeatherDetailWidget
+from park_widget import WeatherDetailWidget, VENUE_PARK_FACTORS
 
 
 # Abbreviation normalization (MLB API inconsistencies)
 _ABBR_NORM = {"AZ": "ARI"}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Savant park factors  (venue_id → wOBA-based overall index, 100 = neutral)
-# Source: baseballsavant.mlb.com/leaderboard/statcast-park-factors (3-yr rolling)
-# ═══════════════════════════════════════════════════════════════════════════════
-VENUE_PARK_FACTORS: dict[int, int] = {
-    1:    101,  # Angel Stadium
-    2:    100,  # Oriole Park at Camden Yards
-    3:    104,  # Fenway Park
-    4:     99,  # Rate Field (Guaranteed Rate / White Sox)
-    5:     97,  # Progressive Field
-    7:    101,  # Kauffman Stadium
-    12:   100,  # Tropicana Field
-    14:   100,  # Rogers Centre
-    15:   103,  # Chase Field
-    17:    97,  # Wrigley Field
-    19:   113,  # Coors Field
-    22:   101,  # UNIQLO Field at Dodger Stadium
-    31:    99,  # PNC Park
-    32:    97,  # American Family Field
-    680:   91,  # T-Mobile Park
-    2392: 100,  # Daikin Park
-    2394: 100,  # Comerica Park
-    2395:  97,  # Oracle Park
-    2529: 100,  # Sutter Health Park (Athletics temp)
-    2602: 103,  # Great American Ball Park
-    2680:  97,  # Petco Park
-    2681: 101,  # Citizens Bank Park
-    2889: 100,  # Busch Stadium
-    3289:  98,  # Citi Field
-    3309: 101,  # Nationals Park
-    3312: 102,  # Target Field
-    3313: 100,  # Yankee Stadium
-    4169: 101,  # loanDepot park
-    4705: 101,  # Truist Park
-    5325:  97,  # Globe Life Field
-}
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Carry-effect legend  (altitude + air pressure scale bars)
-# ═══════════════════════════════════════════════════════════════════════════════
-# Rough carry-effect data (relative to sea-level / 1013 hPa baseline)
-_ALT_TICKS = [          # (elevation_ft, label, carry_pct)
-    (0,    "0 ft",       0),
-    (600,  "600",       +1),
-    (1000, "1 000",     +2),
-    (2000, "2 000",     +4),
-    (3500, "3 500",     +6),
-    (5200, "5 200",     +9),   # Coors
-]
-_PRESS_TICKS = [        # (hPa, label, carry_pct)  lower pressure → more carry
-    (1030, "1030",      -2),
-    (1020, "1020",      -1),
-    (1013, "1013",       0),
-    (1000, "1000",      +1),
-    (990,  "990",       +2),
-    (975,  "975",       +4),
-]
-_HUMID_TICKS = [        # (%, label, carry_pct)  humid air is lighter → more carry
-    (0,   "0%",         0),
-    (25,  "25%",      +0.2),
-    (50,  "50%",      +0.5),
-    (75,  "75%",      +0.8),
-    (100, "100%",     +1.0),
-]
-
-
-class _CarryLegend(QWidget):
-    """Full-width legend with three side-by-side scale bars."""
-
-    _H = 64
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setFixedHeight(self._H)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding,
-                           QSizePolicy.Policy.Fixed)
-
-    # ── painting ──
-    def paintEvent(self, _):
-        w = self.width()
-        p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-        pad = 30                   # internal padding so edge labels aren't clipped
-        gap = 50                   # space between bars
-        usable = w - 2 * pad
-        third = (usable - gap * 2) / 3
-        bar_h = 6
-        y_bar = 32                 # vertical position of gradient bar
-
-        def draw_bar(x0, bw, title, ticks, val_range):
-            vmin, vmax = val_range
-
-            # title
-            p.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-            p.setPen(QColor(C["t2"]))
-            p.drawText(QRectF(x0, 0, bw, 16),
-                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                       title)
-
-            # gradient bar
-            steps = 80
-            for i in range(steps):
-                frac = i / steps
-                r = int(60 + (74 - 60) * (1 - frac))
-                g_c = int(90 + (222 - 90) * frac)
-                b = int(60 + (128 - 60) * frac * 0.5)
-                p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QColor(r, g_c, b, 160))
-                sx = x0 + frac * bw
-                sw = bw / steps + 1
-                p.drawRect(QRectF(sx, y_bar, sw, bar_h))
-
-            # ticks + labels
-            for val, lbl, pct in ticks:
-                frac = (val - vmin) / (vmax - vmin) if vmax != vmin else 0
-                frac = max(0.0, min(1.0, frac))
-                tx = x0 + frac * bw
-                # tick mark
-                p.setPen(QPen(QColor(C["t2"]), 1))
-                p.drawLine(QPointF(tx, y_bar - 1), QPointF(tx, y_bar + bar_h + 1))
-                # carry % — above bar
-                p.setFont(QFont("Segoe UI", 8))
-                col = C["grn"] if pct > 0 else (C["red"] if pct < 0 else C["t2"])
-                p.setPen(QColor(col))
-                sign = "+" if pct > 0 else ""
-                p.drawText(QRectF(tx - 24, y_bar - 15, 48, 13),
-                           Qt.AlignmentFlag.AlignCenter,
-                           f"{sign}{pct}%")
-                # value label — below bar
-                p.setFont(QFont("Segoe UI", 8))
-                p.setPen(QColor(C["t3"]))
-                p.drawText(QRectF(tx - 28, y_bar + bar_h + 2, 56, 13),
-                           Qt.AlignmentFlag.AlignCenter, lbl)
-
-        draw_bar(pad, third, "ALTITUDE  →  CARRY",
-                 _ALT_TICKS, (0, 5200))
-        draw_bar(pad + third + gap, third, "AIR PRESSURE  →  CARRY",
-                 _PRESS_TICKS, (1030, 975))
-        draw_bar(pad + 2 * (third + gap), third, "HUMIDITY  →  CARRY",
-                 _HUMID_TICKS, (0, 100))
-
-        p.end()
 
 
 def _sa_style():
@@ -393,11 +248,11 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
 
                 # Find the 4 periods covering the game window
                 window = []
-                for p in periods:
-                    pdt = _period_dt(p)
+                for period in periods:
+                    pdt = _period_dt(period)
                     diff = (pdt - game_local).total_seconds()
                     if -1800 <= diff < 4 * 3600:  # 30 min before → 4h after
-                        window.append(p)
+                        window.append(period)
                     if len(window) >= 4:
                         break
 
@@ -431,41 +286,41 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
 
                 # Precip: max across game window
                 window_precip = [
-                    p.get("probabilityOfPrecipitation", {}).get("value") or 0
-                    for p in window
+                    period.get("probabilityOfPrecipitation", {}).get("value") or 0
+                    for period in window
                 ]
                 result["forecast_precip"] = max(window_precip) if window_precip else None
 
                 # Condition: worst weather in the window
                 worst_cond = max(
-                    (p.get("shortForecast", "") for p in window),
+                    (period.get("shortForecast", "") for period in window),
                     key=_nws_cond_score,
                 )
                 result["forecast_condition"] = worst_cond
 
                 # Per-hour conditions for animated icon cycling
                 hourly_conds = []
-                for p in window:
-                    pdt = _period_dt(p)
+                for period in window:
+                    pdt = _period_dt(period)
                     h_lbl = pdt.astimezone().strftime("%I %p").lstrip("0")
-                    cond_txt = p.get("shortForecast", "")
-                    pr = p.get("probabilityOfPrecipitation", {}).get("value") or 0
+                    cond_txt = period.get("shortForecast", "")
+                    pr = period.get("probabilityOfPrecipitation", {}).get("value") or 0
                     # Parse wind speed from NWS string like "5 mph" or "5 to 10 mph"
-                    h_ws_str = p.get("windSpeed", "0")
+                    h_ws_str = period.get("windSpeed", "0")
                     try:
                         h_ws = int(h_ws_str.replace(" mph", "").split(" to ")[-1])
                     except Exception:
                         h_ws = 0
-                    h_wd_compass = p.get("windDirection", "")
+                    h_wd_compass = period.get("windDirection", "")
                     h_wd_deg = _NWS_COMPASS.get(h_wd_compass)
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
-                    h_rh = p.get("relativeHumidity", {}).get("value")
+                    h_rh = period.get("relativeHumidity", {}).get("value")
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
                         "humidity": h_rh,
-                        "night": not p.get("isDaytime", True),
-                        "temp": p.get("temperature"),
+                        "night": not period.get("isDaytime", True),
+                        "temp": period.get("temperature"),
                         "wind_speed": h_ws,
                         "wind_dir": h_wd_mlb,
                     })
@@ -773,9 +628,9 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
         now = datetime.now()
         now_str = now.strftime("%Y-%m-%d %H:00")
         cur_hour = None
-        for h in all_hours:
-            if h.get("time", "")[:13] == now_str[:13]:
-                cur_hour = h
+        for hour in all_hours:
+            if hour.get("time", "")[:13] == now_str[:13]:
+                cur_hour = hour
                 break
         if cur_hour:
             result["precip_pct"] = cur_hour.get("chance_of_rain", 0) or 0
@@ -1001,27 +856,27 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             f"?sportId=1&date={date_str}"
             "&hydrate=probablePitcher,venue(location,fieldInfo),weather,team"
         )
-        r = _http.get(url, timeout=10)
-        r.raise_for_status()
+        resp = _http.get(url, timeout=10)
+        resp.raise_for_status()
         raw_games = []
-        for d in r.json().get("dates", []):
-            for g in d.get("games", []):
-                if g.get("gameType", "R") in ("R", "W", "D", "L", "C"):
-                    raw_games.append(g)
+        for date_entry in resp.json().get("dates", []):
+            for game_raw in date_entry.get("games", []):
+                if game_raw.get("gameType", "R") in ("R", "W", "D", "L", "C"):
+                    raw_games.append(game_raw)
     except Exception:
         return []
 
-    def _process(g):
-        gid = g.get("gamePk", 0)
-        t = g.get("teams", {})
+    def _process(game_data):
+        gid = game_data.get("gamePk", 0)
+        t = game_data.get("teams", {})
         away_abbr = t.get("away", {}).get("team", {}).get("abbreviation", "?")
         home_abbr = t.get("home", {}).get("team", {}).get("abbreviation", "?")
         away_abbr = _ABBR_NORM.get(away_abbr, away_abbr)
         home_abbr = _ABBR_NORM.get(home_abbr, home_abbr)
 
-        status = g.get("status", {}).get("detailedState", "")
+        status = game_data.get("status", {}).get("detailedState", "")
         time_str = "TBD"
-        gd = g.get("gameDate", "")
+        gd = game_data.get("gameDate", "")
         if gd:
             try:
                 dt_utc = datetime.fromisoformat(gd.replace("Z", "+00:00"))
@@ -1082,8 +937,8 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             except Exception:
                 pass
 
-        weather = g.get("weather", {})
-        venue = g.get("venue", {})
+        weather = game_data.get("weather", {})
+        venue = game_data.get("venue", {})
         loc = venue.get("location", {})
         coords = loc.get("defaultCoordinates", {})
         fi = venue.get("fieldInfo", {})
@@ -1228,21 +1083,21 @@ def fetch_park_weather(date_str: str) -> list[dict]:
 
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=6) as pool:
-        futs = {pool.submit(_process, g): g for g in raw_games}
+        futs = {pool.submit(_process, game_raw): game_raw for game_raw in raw_games}
         try:
-            for f in as_completed(futs, timeout=20):
+            for future in as_completed(futs, timeout=20):
                 try:
-                    results.append(f.result())
+                    results.append(future.result())
                 except Exception:
                     pass
         except TimeoutError:
             # Return whatever games finished in time
-            for f in futs:
-                if f.done() and not f.exception():
+            for future in futs:
+                if future.done() and not future.exception():
                     try:
-                        r = f.result()
-                        if r not in results:
-                            results.append(r)
+                        result_item = future.result()
+                        if result_item not in results:
+                            results.append(result_item)
                     except Exception:
                         pass
 
@@ -2123,7 +1978,7 @@ class ParkFactorsPage(QWidget):
     # ── title + filter section ──
     def _build_header(self):
         wrap = QWidget()
-        wrap.setStyleSheet(f"background:{C['bg0']};")
+        wrap.setStyleSheet(f"background:{C['bg0']}; border-bottom:1px solid {C['bdr']};")
         vl = QVBoxLayout(wrap)
         vl.setContentsMargins(24, 20, 24, 0)
         vl.setSpacing(0)
@@ -2152,22 +2007,72 @@ class ParkFactorsPage(QWidget):
         self._bias_filter = _FilterBar(["ALL", "HITTER FRIENDLY", "NEUTRAL", "PITCHER FRIENDLY"])
         self._bias_filter.changed.connect(self._on_bias_filter)
         vl.addWidget(self._bias_filter)
-        vl.addSpacing(12)
+        vl.addSpacing(6)
+
+        # ── Info button: aligned bottom-right of filter container ──
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(0, 0, 0, 0)
+        info_row.addStretch()
+        _info_svg_path = os.path.join(_app_paths.APP_DIR, "assets", "info-svgrepo-com.svg")
+        _info_btn = QPushButton("Predict Calculations")
+        _ss_normal = f"QPushButton {{ background:transparent; border:none; color:{C['t3']}; font-size:11px; padding-right:4px; }}"
+        _ss_hover  = f"QPushButton {{ background:transparent; border:none; color:{C['ora']}; font-size:11px; padding-right:4px; }}"
+        try:
+            from PyQt6.QtSvg import QSvgRenderer
+            with open(_info_svg_path, "r", encoding="utf-8") as _f:
+                _svg_data = _f.read()
+            def _make_icon(color):
+                _svg = _svg_data.replace('fill="#000000"', f'fill="{color}"')
+                _pm = QPixmap(18, 18)
+                _pm.fill(QColor(0, 0, 0, 0))
+                _r = QSvgRenderer(QByteArray(_svg.encode()))
+                _p = QPainter(_pm)
+                _r.render(_p)
+                _p.end()
+                return QIcon(_pm)
+            _icon_n = _make_icon(C["t3"])
+            _icon_h = _make_icon(C["ora"])
+            _info_btn.setIcon(_icon_n)
+            _info_btn._icon_normal = _icon_n
+            _info_btn._icon_hover  = _icon_h
+            def _info_enter(e, b=_info_btn, ss=_ss_hover):
+                b.setIcon(b._icon_hover)
+                b.setStyleSheet(ss)
+                QPushButton.enterEvent(b, e)
+            def _info_leave(e, b=_info_btn, ss=_ss_normal):
+                b.setIcon(b._icon_normal)
+                b.setStyleSheet(ss)
+                QPushButton.leaveEvent(b, e)
+            _info_btn.enterEvent = _info_enter
+            _info_btn.leaveEvent = _info_leave
+        except Exception:
+            _info_btn.setIcon(QIcon(_info_svg_path))
+        _info_btn.setLayoutDirection(Qt.LayoutDirection.RightToLeft)
+        _info_btn.setIconSize(QSize(18, 18))
+        _info_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        _info_btn.setStyleSheet(_ss_normal)
+        _tip = (
+            "<b>How Predict % is calculated</b><br><br>"
+            "Each stat shows deviation from the MLB average rate (2021–2026 Statcast, 840K+ ABs).<br>"
+            "<b>0%</b> = exactly league average &nbsp;&nbsp; <b>+10%</b> = 10% more than average per game<br><br>"
+            "<table cellspacing='4'>"
+            "<tr><td><b>HR</b></td><td style='padding-right:12px'>2.3 per game</td><td style='color:#888'>(both teams combined)</td></tr>"
+            "<tr><td><b>1B</b></td><td style='padding-right:12px'>10.6 per game</td><td style='color:#888'>(both teams combined)</td></tr>"
+            "<tr><td><b>XBH</b></td><td style='padding-right:12px'>3.6 per game</td><td style='color:#888'>(2B + 3B combined, both teams)</td></tr>"
+            "</table><br>"
+            "<i>Model: Stage 0 park geometry + Stage 1A endemic climate + Stage 2 day-to-day weather.</i>"
+        )
+        def _show_tip(checked, b=_info_btn, tip=_tip):
+            QToolTip.showText(b.mapToGlobal(b.rect().bottomLeft()), tip, b)
+        _info_btn.clicked.connect(_show_tip)
+        info_row.addWidget(_info_btn)
+        vl.addLayout(info_row)
+        vl.addSpacing(6)
 
         self._roof_label = "ALL"
         self._bias_label = "ALL"
 
         self._root.addWidget(wrap)
-
-        # ── carry-effect legend row ──
-        legend_wrap = QWidget()
-        legend_wrap.setStyleSheet(
-            f"background:{C['bg1']}; border-bottom:1px solid {C['bdr']};")
-        lw_lay = QHBoxLayout(legend_wrap)
-        lw_lay.setContentsMargins(24, 8, 24, 12)
-        self._carry_legend = _CarryLegend()
-        lw_lay.addWidget(self._carry_legend)
-        self._root.addWidget(legend_wrap)
 
     # ── loading placeholder ──
     def _build_loading(self):

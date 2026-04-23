@@ -34,6 +34,16 @@ WINDOWS = {
     'last30': 30,
 }
 
+# Pitcher-specific windows: based on pitch count rather than game count.
+# Keys ending in 'p' (e.g. 'last100p') are detected in _insert_pitching_agg.
+PITCHER_WINDOWS = {
+    'season': None,
+    'last100p': 100,
+    'last200p': 200,
+    'last300p': 300,
+    'last500p': 500,
+}
+
 # ---------------------------------------------------------------------------
 # Opening Day detection
 # ---------------------------------------------------------------------------
@@ -275,6 +285,11 @@ def _create_calc_tables(cur):
         avg_launch_angle REAL,
         avg_ev REAL,
         max_ev REAL,
+        avg_bat_speed REAL,
+        squared_up_rate REAL,
+        blast_rate REAL,
+        hard_hit_pct REAL,
+        chase_rate REAL,
         PRIMARY KEY(season, player_id, matchup, window)
     )
     ''')
@@ -318,6 +333,9 @@ def _create_calc_tables(cur):
         zone_pct REAL,
         avg_velo REAL,
         top_velo REAL,
+        swstr_pct REAL,
+        gb_pct REAL,
+        fp_strike_pct REAL,
         PRIMARY KEY(season, player_id, matchup, window)
     )
     ''')
@@ -389,17 +407,16 @@ def ensure_calc_schema(conn: sqlite3.Connection) -> bool:
     schema_changed = False
 
     if old_version < _app_paths.CALC_DB_SCHEMA_VERSION:
-        if old_version > 0:
-            # Schema structure changed — DROP and recreate tables so new
-            # columns are picked up.  Data is rebuilt per-season when
-            # build_calculated_db() processes each requested season.
-            print(f'  Calc DB schema version {old_version} → {_app_paths.CALC_DB_SCHEMA_VERSION}: recreating table structures...')
-            for tbl in _CALC_TABLES:
-                conn.execute(f'DROP TABLE IF EXISTS {tbl}')
-            conn.commit()
-            _create_calc_tables(conn.cursor())
-            conn.commit()
-            schema_changed = True
+        # Schema structure changed (or no version recorded) — DROP and recreate
+        # tables so new columns are picked up.  Data is rebuilt per-season when
+        # build_calculated_db() processes each requested season.
+        print(f'  Calc DB schema version {old_version} -> {_app_paths.CALC_DB_SCHEMA_VERSION}: recreating table structures...')
+        for tbl in _CALC_TABLES:
+            conn.execute(f'DROP TABLE IF EXISTS {tbl}')
+        conn.commit()
+        _create_calc_tables(conn.cursor())
+        conn.commit()
+        schema_changed = True
         conn.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
                     (_app_paths.CALC_DB_SCHEMA_VERSION,))
 
@@ -430,9 +447,53 @@ def _last_n_game_dates_for_player(conn_raw: sqlite3.Connection, season: int, pla
     return []
 
 
+def _last_n_pitches_game_dates_for_pitcher(conn_raw: sqlite3.Connection, season: int,
+                                           player_id: int, n: int,
+                                           sc_pitches: Optional[pd.DataFrame] = None) -> List[str]:
+    """Return the game dates covering the pitcher's most recent N pitches thrown.
+    Uses sc_pitches (pitch-level Statcast) as the authoritative source.
+    Falls back to pitching_appearances COUNT(*) only if sc_pitches is unavailable."""
+    if sc_pitches is not None and 'pitcher' in sc_pitches.columns and 'game_date' in sc_pitches.columns:
+        pp = sc_pitches[sc_pitches['pitcher'] == player_id]
+        if len(pp) > 0:
+            per_game = (
+                pp.groupby('game_date').size()
+                .reset_index(name='pitch_count')
+                .sort_values('game_date', ascending=False)
+            )
+            dates: List[str] = []
+            total = 0
+            for _, row_g in per_game.iterrows():
+                dates.append(str(row_g['game_date']))
+                total += int(row_g['pitch_count'])
+                if total >= n:
+                    break
+            return dates
+        return []
+    # Fallback: pitching_appearances (one row per PA; COUNT gives PA count, not pitches — rough)
+    cur = conn_raw.cursor()
+    cur.execute("""
+        SELECT game_date, COUNT(*) AS pa_count
+        FROM pitching_appearances
+        WHERE season = ? AND pitcher_id = ?
+        GROUP BY game_date
+        ORDER BY game_date DESC
+    """, (season, player_id))
+    rows = cur.fetchall()
+    dates = []
+    total = 0
+    for game_date, count in rows:
+        dates.append(str(game_date))
+        total += count
+        if total >= n:
+            break
+    return dates
+
+
 def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connection,
                         season: int, player_id: int, player_name: Optional[str], matchup: str, window: str,
-                        sc_df: Optional[pd.DataFrame] = None):
+                        sc_df: Optional[pd.DataFrame] = None,
+                        sc_pitches: Optional[pd.DataFrame] = None):
     cur_raw = conn_raw.cursor()
     cur_calc = conn_calc.cursor()
 
@@ -494,17 +555,19 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
     # All counting stats (PA, AB, H, R, RBI, etc.) come from the MLB API
     # via the raw DB.  Statcast only enriches with detailed tracking data.
     barrel_pct = pull_pct = avg_launch_angle = avg_ev = max_ev = None
+    avg_bat_speed = squared_up_rate = blast_rate = hard_hit_pct = chase_rate = None
 
     # --- Raw DB batted-ball stats (always available, covers all games) ---
     raw_bb_sql = f"""
         SELECT
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND barrel = 1 THEN 1 ELSE 0 END) AS barrels,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed_angle = 6 THEN 1 ELSE 0 END) AS barrels,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull IS NOT NULL THEN 1 ELSE 0 END) AS pull_eligible,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull = 1 THEN 1 ELSE 0 END) AS pulls,
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_angle IS NOT NULL THEN launch_angle END) AS avg_la,
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
-            MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev
+            MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard
         FROM plate_appearances{matchup_join}
         WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
     """
@@ -516,12 +579,52 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             pull_elig = raw_bb[2] or 0
             if pull_elig > 0:
                 pull_pct = round((raw_bb[3] or 0) / pull_elig, 3)
+            hard_hit_pct = round((raw_bb[7] or 0) / raw_bbe, 3)
         if raw_bb[4] is not None:
             avg_launch_angle = round(raw_bb[4], 1)
         if raw_bb[5] is not None:
             avg_ev = round(raw_bb[5], 1)
         if raw_bb[6] is not None:
             max_ev = round(raw_bb[6], 1)
+
+    # --- Raw DB bat speed, squared-up rate, blast rate, and chase rate ---
+    # Blast: approximate theoretical_max_EV using avg plate_speed (91 mph fastball * 0.92 decay = 83.7 mph)
+    # when sc_pitches pitch-level data is unavailable (e.g. recent call-ups, pkl lag).
+    # Chase: out-of-zone (zone > 9) swings from raw DB when sc_pitches unavailable.
+    _AVG_PLATE_SPEED = 83.7  # mph — used only for raw DB blast approximation
+    raw_bat_sql = f"""
+        SELECT
+            AVG(CASE WHEN bat_speed IS NOT NULL THEN bat_speed END) AS avg_bs,
+            SUM(CASE WHEN bat_speed IS NOT NULL AND launch_speed IS NOT NULL AND bb_type IS NOT NULL
+                      AND launch_speed >= bat_speed * 1.2 THEN 1 ELSE 0 END) AS sq_up,
+            SUM(CASE WHEN bat_speed IS NOT NULL AND launch_speed IS NOT NULL AND bb_type IS NOT NULL
+                      THEN 1 ELSE 0 END) AS sq_denom,
+            -- Blast fallback: (EV / (1.23*bs + 0.23*avg_plate_spd))*100 + bs >= 164
+            SUM(CASE WHEN bat_speed IS NOT NULL AND launch_speed IS NOT NULL AND bb_type IS NOT NULL
+                      AND (launch_speed / (1.23 * bat_speed + {_AVG_PLATE_SPEED} * 0.23)) * 100 + bat_speed >= 164
+                      THEN 1 ELSE 0 END) AS blasts,
+            SUM(CASE WHEN bat_speed IS NOT NULL AND launch_speed IS NOT NULL
+                      AND bb_type IS NOT NULL THEN 1 ELSE 0 END) AS blast_denom,
+            -- Chase fallback: swings at pitches out of zone (zone > 9)
+            SUM(CASE WHEN zone IS NOT NULL AND zone > 9
+                      AND description IN ('swinging_strike','swinging_strike_blocked','foul','foul_tip',
+                                          'foul_bunt','hit_into_play','hit_into_play_score',
+                                          'hit_into_play_no_out','missed_bunt')
+                      THEN 1 ELSE 0 END) AS ooz_swings,
+            SUM(CASE WHEN zone IS NOT NULL AND zone > 9 THEN 1 ELSE 0 END) AS ooz_pitches
+        FROM plate_appearances{matchup_join}
+        WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
+    """
+    raw_bat = cur_raw.execute(raw_bat_sql, params).fetchone()
+    if raw_bat:
+        if raw_bat[0] is not None:
+            avg_bat_speed = round(raw_bat[0], 1)
+        if raw_bat[2] and raw_bat[2] > 0:
+            squared_up_rate = round((raw_bat[1] or 0) / raw_bat[2], 3)
+        if raw_bat[4] and raw_bat[4] > 0:
+            blast_rate = round((raw_bat[3] or 0) / raw_bat[4], 3)
+        if raw_bat[6] and raw_bat[6] > 0:
+            chase_rate = round((raw_bat[5] or 0) / raw_bat[6], 3)
 
     # --- Statcast enrichment: overrides raw DB when it has MORE data ---
     if sc_df is not None:
@@ -542,17 +645,27 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             # Statcast covers all BBE — use its richer data
             barrel_count = int((bbe['launch_speed_angle'] == 6).sum())
             barrel_pct = round(barrel_count / len(bbe), 3)
-            hcxy = bbe[bbe['hc_x'].notna() & bbe['hc_y'].notna()]
-            if len(hcxy) > 0:
-                # Spray angle: 0° = centre-field, negative = 3B side, positive = 1B side
-                spray = np.degrees(np.arctan2(
-                    hcxy['hc_x'].values - 125.42,
-                    198.27 - hcxy['hc_y'].values))
-                stand = hcxy['stand'].values
-                # Pull zone: spray > 16° for LHH, spray < -16° for RHH
-                is_pull = (((stand == 'R') & (spray < -16))
-                           | (((stand == 'L') | (stand == 'S')) & (spray > 16)))
-                pull_pct = round(int(is_pull.sum()) / len(hcxy), 3)
+            # pull_pct: hit_location field zones (best available match to Statcast pull%)
+            # RHH pull zones: GB→[5,6,7] (3B/SS/LF), FB→[7] (LF), LD→[7] (LF)
+            # LHH pull zones: GB→[3,4]   (1B/2B),    FB→[9] (RF), LD→[9] (RF)
+            # Popups excluded from numerator; denominator = all BBE
+            if 'hit_location' in bbe.columns and 'stand' in bbe.columns:
+                _stand_vals = bbe['stand'].mode()
+                if len(_stand_vals) > 0:
+                    _stand = _stand_vals.iloc[0]
+                    _bbe_loc = bbe[bbe['hit_location'].notna()]
+                    if _stand == 'R':
+                        _gb_locs, _fb_locs, _ld_locs = [5,6,7], [7], [7]
+                    else:
+                        _gb_locs, _fb_locs, _ld_locs = [3,4], [9], [9]
+                    _gb = _bbe_loc[_bbe_loc['bb_type']=='ground_ball']
+                    _fb = _bbe_loc[_bbe_loc['bb_type']=='fly_ball']
+                    _ld = _bbe_loc[_bbe_loc['bb_type']=='line_drive']
+                    _pull_n = (int(_gb['hit_location'].isin(_gb_locs).sum()) +
+                               int(_fb['hit_location'].isin(_fb_locs).sum()) +
+                               int(_ld['hit_location'].isin(_ld_locs).sum()))
+                    if len(bbe) > 0:
+                        pull_pct = round(_pull_n / len(bbe), 3)
             la_vals = bbe['launch_angle'].dropna()
             if len(la_vals) > 0:
                 avg_launch_angle = round(float(la_vals.mean()), 1)
@@ -560,6 +673,100 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             if len(ev_vals) > 0:
                 avg_ev = round(float(ev_vals.mean()), 1)
                 max_ev = round(float(ev_vals.max()), 1)
+            # Hard Hit% from pkl
+            ev_all = bbe['launch_speed'].dropna()
+            if len(ev_all) > 0:
+                hard_hit_pct = round(float((ev_all >= 95).sum()) / len(bbe), 3)
+            # NOTE: avg_bat_speed computed below from sc_pitches (all swings, top 90%)
+            # NOTE: squared_up_rate computed below from sc_pitches (pitch-level)
+            # using Statcast formula: EV >= 0.8*(1.23*bat_speed + 0.23*pitch_speed)
+            # with denominator = all contacts (BBE + fouls with tracked EV)
+
+    # Chase rate + squared-up rate — both require pitch-level Statcast (sc_pitches)
+    # Statcast zones: 1-9 in zone, 11-14 out of zone; chase = swing at out-of-zone pitch
+    # Squared-up: EV >= 0.8*(1.23*bat_speed + 0.23*pitch_speed)
+    #   denom = all contacts with tracked EV (BBE + fouls), bat_speed >= 40
+    if sc_pitches is not None:
+        pb = sc_pitches[sc_pitches['batter'] == player_id]
+        # apply same matchup filter as sc_df
+        if matchup == 'vs_lefty':
+            pb = pb[pb['p_throws'] == 'L']
+        elif matchup == 'vs_righty':
+            pb = pb[pb['p_throws'] == 'R']
+        # apply same date filter
+        if dates is not None:
+            pb = pb[pb['game_date'].astype(str).isin(dates)]
+
+        # ── Avg bat speed: top 90% of tracked swings (Statcast definition) ──
+        if 'bat_speed' in pb.columns:
+            _bs_all = pb['bat_speed'].dropna()
+            if len(_bs_all) > 0:
+                _bs_10th_cut = _bs_all.quantile(0.10)
+                avg_bat_speed = round(float(_bs_all[_bs_all >= _bs_10th_cut].mean()), 1)
+
+        # ── Squared-up contact rate ──────────────────────────────────────
+        # Statcast methodology:
+        #   Pitch speed in formula = plate speed ≈ release_speed * 0.92 (velocity decays ~8% in flight)
+        #   Theoretical max EV = 1.23 * bat_speed + 0.23 * plate_speed
+        #   Denominator = competitive swings: fastest 90% of player's swings (by bat_speed)
+        #                 + any swing ≥60 mph bat_speed that produced EV ≥90 mph
+        #   Numerator = BBE (hit_into_play*) in that denominator set where EV ≥ 80% of theoretical max
+        #   Fouls penalise the rate (count in denom) but never contribute to numerator.
+        if 'bat_speed' in pb.columns and 'launch_speed' in pb.columns and 'release_speed' in pb.columns:
+            _bbe_desc = frozenset(['hit_into_play', 'hit_into_play_score', 'hit_into_play_no_out'])
+            # All swings with tracked bat_speed and pitch speed (fouls may lack launch_speed — that's OK)
+            _tracked = pb[
+                pb['bat_speed'].notna() &
+                pb['release_speed'].notna()
+            ]
+            if len(_tracked) > 0:
+                # Competitive swings: top 90% by bat_speed within this player-season
+                _bs_10th = _tracked['bat_speed'].quantile(0.10)
+                _fast_90 = _tracked[_tracked['bat_speed'] >= _bs_10th]
+                # Include any ≥60 mph swing that produced ≥90 mph EV regardless of threshold
+                if 'description' in pb.columns:
+                    _bonus = _tracked[
+                        (_tracked['bat_speed'] >= 60) &
+                        (_tracked['launch_speed'].notna()) &
+                        (_tracked['launch_speed'] >= 90) &
+                        ~_tracked.index.isin(_fast_90.index)
+                    ]
+                    all_contacts = (
+                        pd.concat([_fast_90, _bonus])
+                        if len(_bonus) > 0 else _fast_90
+                    )
+                else:
+                    all_contacts = _fast_90
+                if len(all_contacts) > 0:
+                    # Numerator: BBE rows in competitive set that have EV ≥ 80% of theoretical max
+                    if 'description' in all_contacts.columns:
+                        bbe_c = all_contacts[
+                            all_contacts['description'].isin(_bbe_desc) &
+                            all_contacts['launch_speed'].notna()
+                        ]
+                    else:
+                        bbe_c = all_contacts[all_contacts['launch_speed'].notna()]
+                    plate_speed = bbe_c['release_speed'] * 0.92
+                    theoretical_max_ev = 1.23 * bbe_c['bat_speed'] + 0.23 * plate_speed
+                    sq_count = int((bbe_c['launch_speed'] >= 0.8 * theoretical_max_ev).sum())
+                    squared_up_rate = round(sq_count / len(all_contacts), 3)
+                    # ── Blast rate ───────────────────────────────────────────
+                    # Per-swing: sq_pct * 100 + bat_speed >= 164
+                    # Same competitive-swings denominator as squared_up_rate
+                    _per_swing_sq = bbe_c['launch_speed'] / theoretical_max_ev
+                    _blast_scores = _per_swing_sq * 100 + bbe_c['bat_speed']
+                    blast_rate = round(int((_blast_scores >= 164).sum()) / len(all_contacts), 3)
+
+        # ── Chase rate ───────────────────────────────────────────────────
+        if 'zone' in pb.columns and 'description' in pb.columns:
+            _chase_swing_desc = frozenset(['swinging_strike', 'swinging_strike_blocked',
+                                           'foul', 'foul_tip', 'foul_bunt',
+                                           'hit_into_play', 'hit_into_play_score',
+                                           'hit_into_play_no_out', 'missed_bunt'])
+            ooz = pb[pb['zone'].notna() & (pb['zone'] > 9)]
+            if len(ooz) > 0:
+                chases = int(ooz['description'].isin(_chase_swing_desc).sum())
+                chase_rate = round(chases / len(ooz), 3)
 
     def safe_div(a, b):
         try:
@@ -583,13 +790,15 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             season, player_id, player_name, matchup, window,
             plate_appearances, at_bats, hits, singles, doubles, triples, home_runs,
             runs, rbis, total_bases, walks, strikeouts, avg, slg, obp, k_pct, bb_pct,
-            barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev,
+            avg_bat_speed, squared_up_rate, blast_rate, hard_hit_pct, chase_rate
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         season, player_id, player_name or '', matchup, window,
         pa or 0, ab or 0, hits or 0, singles or 0, doubles or 0, triples or 0, hrs or 0,
         runs or 0, rbis or 0, total_bases or 0, walks or 0, so or 0, avg, slg, obp, k_pct, bb_pct,
-        barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev
+        barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev,
+        avg_bat_speed, squared_up_rate, blast_rate, hard_hit_pct, chase_rate
     ))
 
 
@@ -605,8 +814,17 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     # Resolve window → game dates
     dates: Optional[List[str]] = None
     if window != 'season':
-        n = int(window.replace('last', ''))
-        dates = _last_n_game_dates_for_player(conn_raw, season, player_id, 'pitcher', n)
+        if window.endswith('p'):
+            # Pitch-count window: use sc_pitches (accurate pitch-level Statcast)
+            # if available, otherwise fall back to pitching_appearances.
+            n = int(window[4:-1])  # strip 'last' prefix and 'p' suffix
+            # Use the unified helper that combines sc_pitches counts with
+            # plate_appearances-based estimation for games not in sc_pitches.
+            dates = _last_n_pitches_game_dates_for_pitcher(conn_raw, season, player_id, n, sc_pitches)
+        else:
+            # Game-count window (e.g. 'last5' = last 5 games)
+            n = int(window.replace('last', ''))
+            dates = _last_n_game_dates_for_player(conn_raw, season, player_id, 'pitcher', n)
         if not dates:
             cur_calc.execute('INSERT OR REPLACE INTO calculated_pitching_stats(season, player_id, player_name, matchup, window, plate_appearances) VALUES (?, ?, ?, ?, ?, ?)',
                              (season, player_id, player_name or '', matchup, window, 0))
@@ -639,7 +857,10 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
       SUM(COALESCE(is_home_run,0)),
       SUM(COALESCE(runs,0)),
       SUM(COALESCE(outs_recorded,0)),
-      SUM(COALESCE(earned_runs,0))
+      SUM(COALESCE(earned_runs,0)),
+      SUM(COALESCE(is_sac_fly,0)),
+      SUM(COALESCE(is_hbp,0)),
+      SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END)
     FROM plate_appearances
     WHERE season = ? AND pitcher_id = ? {matchup_sql} {date_sql}
     """
@@ -649,7 +870,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     if row:
         (pa, k, bb, hits_allowed, singles_allowed, doubles_allowed,
          triples_allowed, hrs_allowed, runs_allowed, outs_recorded,
-         earned_runs) = (
+         earned_runs, sf_allowed, hbp_allowed, bbe_allowed) = (
             int(v or 0) for v in row)
 
     if not pa:
@@ -675,11 +896,13 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     era = safe_rate(earned_runs, innings, 9.0) if innings > 0 else None
 
     # ── New advanced stats: SLG-against, Hard%, xOBA, BABIP ──────────────
-    ab = pa - bb  # approximate AB (PA minus walks; HBP/SF not tracked separately here)
+    # AB = PA - BB - SF - HBP  (correct MLB definition)
+    ab = pa - bb - sf_allowed - hbp_allowed
     total_bases = singles_allowed + 2 * doubles_allowed + 3 * triples_allowed + 4 * hrs_allowed
     slg_against = round(total_bases / ab, 3) if ab and ab > 0 else None
 
-    babip_denom = ab - k - hrs_allowed  # AB - K - HR  (approximation without SF)
+    # BABIP = (H - HR) / (BBE - HR)  — BBE = batted balls in play (no Ks, walks, etc.)
+    babip_denom = bbe_allowed - hrs_allowed
     babip_against = round((hits_allowed - hrs_allowed) / babip_denom, 3) if babip_denom and babip_denom > 0 else None
 
     # ── WHIP ────────────────────────────────────────────────────────────
@@ -691,6 +914,9 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     barrel_pct = None
     ld_pct = None
     soft_pct = None
+    gb_pct = None
+    swstr_pct = None
+    fp_strike_pct = None
 
     raw_date_params: List = []
     raw_date_sql = ''
@@ -707,12 +933,13 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     raw_bb_sql = f"""
         SELECT
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND barrel = 1 THEN 1 ELSE 0 END) AS barrels,
+            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed_angle = 6 THEN 1 ELSE 0 END) AS barrels,
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
             MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed < 88 THEN 1 ELSE 0 END) AS soft,
-            SUM(CASE WHEN bb_type = 'line_drive' THEN 1 ELSE 0 END) AS ld
+            SUM(CASE WHEN bb_type = 'popup' THEN 1 ELSE 0 END) AS soft,
+            SUM(CASE WHEN bb_type = 'line_drive' THEN 1 ELSE 0 END) AS ld,
+            SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) AS gb
         FROM plate_appearances
         WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
     """
@@ -724,6 +951,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             hard_pct = round((raw_bb[4] or 0) / raw_bbe, 3)
             soft_pct = round((raw_bb[5] or 0) / raw_bbe, 3)
             ld_pct = round((raw_bb[6] or 0) / raw_bbe, 3)
+            gb_pct = round((raw_bb[7] or 0) / raw_bbe, 3)
 
     # ── Raw DB xOBA (estimated_woba_using_speedangle) ────────────────────
     raw_xoba_sql = f"""
@@ -787,11 +1015,13 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             if n_bip > 0 and n_bip >= raw_bbe_count:
                 ev = pf.loc[bip_mask, 'launch_speed']
                 hard_pct = round(float((ev >= 95).sum()) / n_bip, 3)
-                soft_pct = round(float((ev < 88).sum()) / n_bip, 3)
+                soft_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'popup').sum()) / n_bip, 3)
                 ld_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'line_drive').sum()) / n_bip, 3)
                 # Barrel%: launch_speed_angle == 6 is barrel classification
                 if 'launch_speed_angle' in pf.columns:
                     barrel_pct = round(float((pf.loc[bip_mask, 'launch_speed_angle'] == 6).sum()) / n_bip, 3)
+                if 'bb_type' in pf.columns:
+                    gb_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'ground_ball').sum()) / n_bip, 3)
         # xOBA (expected wOBA using Statcast speed+angle)
         if 'estimated_woba_using_speedangle' in pf.columns:
             xwoba = pf['estimated_woba_using_speedangle'].dropna()
@@ -826,6 +1056,11 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
                     whiff_events = frozenset(['swinging_strike', 'swinging_strike_blocked'])
                     t_whiffs = int(pp['description'].isin(whiff_events).sum())
                     whiff_pct = round(t_whiffs / t_swings, 3)
+                    # SwStr% = swinging strikes / total pitches
+                    swstr_events = frozenset(['swinging_strike', 'swinging_strike_blocked'])
+                    t_swstr = int(pp['description'].isin(swstr_events).sum())
+                    if sc_pitches_count > 0:
+                        swstr_pct = round(t_swstr / sc_pitches_count, 3)
             if 'zone' in pp.columns:
                 zone_vals = pp['zone'].dropna()
                 if len(zone_vals) > 0:
@@ -836,6 +1071,36 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
                 if len(velo) > 0:
                     avg_velo = round(float(velo.mean()), 1)
                     top_velo = round(float(velo.max()), 1)
+
+    # ── SwStr% fallback from pitching_appearances when pkl unavailable ────
+    if swstr_pct is None:
+        swstr_sql = f"""
+            SELECT
+                SUM(CASE WHEN swing = 1 AND contact = 0 THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM pitching_appearances
+            WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
+        """
+        swstr_row = cur_raw.execute(swstr_sql, raw_params).fetchone()
+        if swstr_row and swstr_row[1] and swstr_row[1] > 0:
+            swstr_pct = round((swstr_row[0] or 0) / swstr_row[1], 3)
+
+    # ── First Pitch Strike% from sc_pitches (pitch-level Statcast) ────────
+    # pitching_appearances.swing/zone are always NULL, so we use sc_pitches.
+    # type 'S' = strike (called/swinging/foul), 'X' = in play — both count as
+    # first-pitch strikes. 'B' = ball.
+    if sc_pitches is not None and 'pitcher' in sc_pitches.columns and 'pitch_number' in sc_pitches.columns and 'type' in sc_pitches.columns:
+        pp = sc_pitches[sc_pitches['pitcher'] == player_id]
+        if matchup == 'vs_lefty':
+            pp = pp[pp['stand'] == 'L'] if 'stand' in pp.columns else pp
+        elif matchup == 'vs_righty':
+            pp = pp[pp['stand'] == 'R'] if 'stand' in pp.columns else pp
+        if dates is not None:
+            pp = pp[pp['game_date'].astype(str).isin(dates)] if 'game_date' in pp.columns else pp
+        fp = pp[pp['pitch_number'] == 1]
+        if len(fp) > 0:
+            fp_strikes = fp[fp['type'].isin(['S', 'X'])]
+            fp_strike_pct = round(len(fp_strikes) / len(fp), 3)
 
     # ── Raw DB whiff fallback (when pkl is unavailable) ──────────────────
     if whiff_pct is None and raw_swings > 0:
@@ -868,8 +1133,8 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
             slg_against, hard_pct, xoba_against, babip_against,
             whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-            avg_velo, top_velo
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         season, player_id, player_name or '', matchup, window,
         pa, outs_recorded, innings, k, bb,
@@ -878,7 +1143,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
         k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
         slg_against, hard_pct, xoba_against, babip_against,
         whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-        avg_velo, top_velo
+        avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct
     ))
 
 
@@ -1148,7 +1413,7 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
         name = pr[0] if pr else ''
         for matchup in ('all', 'vs_lefty', 'vs_righty'):
             for window in WINDOWS.keys():
-                _insert_batting_agg(conn_raw, conn_calc, season, batter_id, name, matchup, window, sc_df=sc_df)
+                _insert_batting_agg(conn_raw, conn_calc, season, batter_id, name, matchup, window, sc_df=sc_df, sc_pitches=sc_pitches)
         _calc_done += 1
     conn_calc.commit()
 
@@ -1160,7 +1425,7 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
         pr = cur_raw.fetchone()
         name = pr[0] if pr else ''
         for matchup in ('all', 'vs_lefty', 'vs_righty'):
-            for window in WINDOWS.keys():
+            for window in PITCHER_WINDOWS.keys():
                 _insert_pitching_agg(conn_raw, conn_calc, season, pitcher_id, name, matchup, window,
                                      sc_df=sc_df, sc_pitches=sc_pitches)
         _calc_done += 1
@@ -1235,11 +1500,7 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
 
     # decide which seasons to process
     if not seasons:
-        # prefer 2026,2025 if present otherwise last two
-        want = [y for y in [2026, 2025] if y in all_seasons]
-        if not want:
-            want = all_seasons[:2]
-        seasons = want
+        seasons = all_seasons
 
     print('Seasons to process:', seasons)
 
@@ -1282,7 +1543,7 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
             name = pr[0] if pr else ''
             for matchup in ('all', 'vs_lefty', 'vs_righty'):
                 for window in WINDOWS.keys():
-                    _insert_batting_agg(conn_raw, conn_calc, season, b, name, matchup, window, sc_df=sc_df)
+                    _insert_batting_agg(conn_raw, conn_calc, season, b, name, matchup, window, sc_df=sc_df, sc_pitches=sc_pitches)
         conn_calc.commit()
         print(f'  Batters: {len(batters)} done')
 
@@ -1294,7 +1555,7 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
             pr = cur_raw.fetchone()
             name = pr[0] if pr else ''
             for matchup in ('all', 'vs_lefty', 'vs_righty'):
-                for window in WINDOWS.keys():
+                for window in PITCHER_WINDOWS.keys():
                     _insert_pitching_agg(conn_raw, conn_calc, season, p, name, matchup, window,
                                          sc_df=sc_df, sc_pitches=sc_pitches)
         conn_calc.commit()

@@ -9,12 +9,12 @@ Frozen    – read-only assets come from the PyInstaller bundle;
 import os
 import sys
 
-APP_VERSION = "1.1.2"
+APP_VERSION = "1.2.0"
 
 # Database schema versions — bump these when tables/columns change.
 # The app checks these on startup and runs migrations or forces a recalc.
 RAW_DB_SCHEMA_VERSION = 2       # v1 = initial, v2 = added outs_recorded/earned_runs/statcast_at_bat_number/base + SB/CS parsing fixes
-CALC_DB_SCHEMA_VERSION = 3      # v1 = initial, v2 = aligned with raw v2 parsing fixes, v3 = added h_per_9 to pitching stats
+CALC_DB_SCHEMA_VERSION = 9      # v1 = initial, v2 = aligned with raw v2 parsing fixes, v3 = added h_per_9 to pitching stats, v4 = added bat speed/squared-up/hard hit/chase rate for batters; SwStr%/GB%/F-Strike% for pitchers, v5 = pitcher windows changed to pitch-count (last50p/100p/150p/200p), v6 = added avg_bat_speed/squared_up_rate/hard_hit_pct/chase_rate columns, v7 = pitcher windows 100/200/300/500 pitches, v8 = blast_rate added; squared-up uses plate speed (release*0.92) + competitive-swings denominator, v9 = formula corrections: barrel=LSA6, soft=popup%, avg_bat_speed=top90% swings, slg/babip denominators fixed
 
 _frozen = getattr(sys, "frozen", False)
 
