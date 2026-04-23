@@ -4,19 +4,7 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
-## ⚠️ Upgrade Notice — v1.2.0
-
-> **If you are updating from a previous version (not a fresh install):**
->
-> The calculated stats database schema has been updated. You must replace your local databases with the fresh versions bundled in this release — otherwise stats tables may show incorrect or missing data.
->
-> **To do this:** Re-run the installer and select **"Force replace ALL local databases"** under *Database Troubleshooting* on the installer options screen.
->
-> After installing, **run Update Data on first launch** (top-right button) to ensure all stats are current.
-
----
-
-## v1.2.0 — 2026-04-18
+## v1.2.1 — 2026-04-20
 
 ### Park & Weather
 
@@ -42,6 +30,12 @@ All notable changes to Seam Analytics are documented here.
 - Weather Profiles: Nationals temp neg 2.40→0.95, Wrigley temp neg 1.80→1.05 + pressure 1.00→0.60, Progressive temp neg 1.45→0.80 + pressure 1.00→0.20, Sutter wind 2.20→1.00
 - Hit Factors (XBH/1B): Adjusted 12 parks — Fenway 2B 1.18→1.29 (Green Monster doubles), Coors 2B 1.31→1.16, Yankee 2B 0.88→1.01, PNC 2B 1.10→1.00, Target 2B 1.03→1.11, Citizens Bank 2B 0.97→1.02/1B 0.98→1.04, loanDepot 1B 0.99→1.07, Angel 2B 0.91→0.94, Progressive 2B 1.03→0.99/1B 0.94→1.00, T-Mobile 2B 0.85→0.82/1B 0.94→0.91, Wrigley 1B 1.01→1.04
 - Final accuracy against BPP: Perfect (≤2): 13, Close (3-5): 2, Off (>5): 0
+
+---
+
+## v1.2.0 — 2026-04-18
+
+### Park & Weather
 
 **Hourly Precipitation & Humidity Updates**
 - Conditions container now updates precipitation and humidity values when toggling between hourly weather slots
