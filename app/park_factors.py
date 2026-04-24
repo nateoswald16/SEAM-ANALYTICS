@@ -135,11 +135,27 @@ def _compass_to_mlb_wind(deg: float, azimuth: float = 0) -> str:
 # ── Circuit breaker config ───────────────────────────────────────────────────
 _CB_THRESHOLD = 3  # consecutive failures before tripping
 
+# ── Weather cache TTL ────────────────────────────────────────────────────────
+# Disk cache older than this will be re-fetched even for non-today dates.
+# Keeps tomorrow's weather forecast from going stale overnight.
+_WEATHER_CACHE_TTL_SECS = 60 * 60   # 1 hour
+
+# ── Static venue coordinate overrides ───────────────────────────────────────
+# Used when the MLB Stats API returns no lat/lon for a venue.
+# Format: venue_id → (lat, lon, elev_ft, azimuth_deg)
+#   azimuth = compass bearing from home plate toward CF (0=N, 90=E, etc.)
+_VENUE_COORD_OVERRIDE: dict[int, tuple[float, float, float, float]] = {
+    # Estadio Alfredo Harp Helú — Mexico City (MLB API returns None for all coords)
+    # Coords: 19.3618 N, 99.1567 W  |  elev 7349 ft (2240 m)  |  azimuth ~45° (CF faces NE)
+    5340: (19.3618, -99.1567, 7349.0, 45.0),
+}
+
 # ── NWS (National Weather Service) — primary provider ───────────────────────
 _nws_fail_count = 0   # consecutive failures; >= _CB_THRESHOLD → skip calls
 _nws_grid_cache: dict[str, dict] = {}   # "(lat,lon)" → {"hourly_url": ..., "stations_url": ...}
 _nws_grid_lock = threading.Lock()
 _nws_grid_pending: dict[str, threading.Event] = {}  # per-key fetch-in-progress events
+_nws_grid_seed_pool = ThreadPoolExecutor(max_workers=6, thread_name_prefix="seam-nws")
 
 _NWS_HEADERS = {"User-Agent": "SeamAnalytics/1.0 (mlb-park-weather)", "Accept": "application/geo+json"}
 
@@ -201,6 +217,26 @@ def _nws_resolve_grid(lat, lon) -> dict:
             evt.set()
             _nws_grid_pending.pop(key, None)
         return {}
+
+
+def _approx_sunset_hour(lat: float, lon: float, date_obj) -> float:
+    """Approximate sunset as UTC decimal hour using Spencer (1971) formula.
+    Accurate to ±5 min for MLB venue latitudes (25–48 °N), April–September.
+    Callers convert to local time by adding the venue UTC offset in hours.
+    """
+    doy = date_obj.timetuple().tm_yday
+    B = 2 * math.pi * (doy - 81) / 364
+    decl = math.radians(23.45 * math.sin(B))
+    lat_r = math.radians(lat)
+    cos_ha = (
+        -math.sin(math.radians(-0.83))   # atmospheric refraction + solar disk
+        - math.sin(lat_r) * math.sin(decl)
+    ) / (math.cos(lat_r) * math.cos(decl))
+    cos_ha = max(-1.0, min(1.0, cos_ha))
+    ha_deg = math.degrees(math.acos(cos_ha))
+    eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+    sunset_utc_min = 720 - 4 * lon - eot + 4 * ha_deg
+    return (sunset_utc_min / 60.0) % 24
 
 
 def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
@@ -298,11 +334,21 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
                 )
                 result["forecast_condition"] = worst_cond
 
+                # Compute actual sunset for accurate day/night determination
+                _w0 = _period_dt(window[0])
+                _nws_tz_ofs = (
+                    _w0.utcoffset().total_seconds() / 3600
+                    if _w0.utcoffset() else -5)
+                _nws_sunset_utc_h = _approx_sunset_hour(lat, lon, _w0.date())
+                _nws_sunset_local_hr = (_nws_sunset_utc_h + _nws_tz_ofs) % 24
+                result["sunset_hour"] = round(_nws_sunset_local_hr, 2)
+
                 # Per-hour conditions for animated icon cycling
                 hourly_conds = []
                 for period in window:
                     pdt = _period_dt(period)
-                    h_lbl = pdt.astimezone().strftime("%I %p").lstrip("0")
+                    h_local = pdt.astimezone()
+                    h_lbl = h_local.strftime("%I %p").lstrip("0")
                     cond_txt = period.get("shortForecast", "")
                     pr = period.get("probabilityOfPrecipitation", {}).get("value") or 0
                     # Parse wind speed from NWS string like "5 mph" or "5 to 10 mph"
@@ -315,11 +361,12 @@ def _fetch_nws(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
                     h_wd_deg = _NWS_COMPASS.get(h_wd_compass)
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
                     h_rh = period.get("relativeHumidity", {}).get("value")
+                    _h_dec = pdt.hour + pdt.minute / 60.0
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
                         "humidity": h_rh,
-                        "night": not period.get("isDaytime", True),
+                        "night": _h_dec > _nws_sunset_local_hr + 0.75 or pdt.hour < 6,
                         "temp": period.get("temperature"),
                         "wind_speed": h_ws,
                         "wind_dir": h_wd_mlb,
@@ -462,6 +509,15 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 _ofs = data.get("utc_offset_seconds", 0) or 0
                 _venue_tz = timezone(timedelta(seconds=_ofs))
                 game_venue = game_dt.astimezone(_venue_tz)
+                # Compute actual sunset for accurate day/night determination
+                _om_sunset_utc_h = _approx_sunset_hour(lat, lon, game_dt.date())
+                _om_sunset_utc_dt = (
+                    datetime(game_dt.year, game_dt.month, game_dt.day,
+                             0, 0, tzinfo=timezone.utc)
+                    + timedelta(hours=_om_sunset_utc_h))
+                _om_sl = _om_sunset_utc_dt.astimezone(_venue_tz)
+                _om_sunset_local_hr = _om_sl.hour + _om_sl.minute / 60.0
+                result["sunset_hour"] = round(_om_sunset_local_hr, 2)
                 game_hour = game_venue.strftime("%Y-%m-%dT%H:00")
                 # Find start index
                 if game_hour in times:
@@ -524,8 +580,10 @@ def _fetch_open_meteo(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                         h_dt = datetime.fromisoformat(t_str)
                         # Display in user's local timezone
                         h_dt_aware = h_dt.replace(tzinfo=_venue_tz)
-                        h_lbl = h_dt_aware.astimezone().strftime("%I %p").lstrip("0")
-                        is_night = h_dt.hour >= 19 or h_dt.hour < 6
+                        h_local = h_dt_aware.astimezone()
+                        h_lbl = h_local.strftime("%I %p").lstrip("0")
+                        _h_dec = h_dt_aware.hour + h_dt_aware.minute / 60.0
+                        is_night = _h_dec > _om_sunset_local_hr + 0.75 or h_dt_aware.hour < 6
                     except Exception:
                         h_lbl = ""
                         is_night = False
@@ -588,11 +646,17 @@ def _load_weatherapi_key() -> str | None:
     return _weatherapi_key
 
 
-def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0):
+def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float = 0,
+                      elev_ft: float = 0.0):
     """Fallback: fetch forecast data from WeatherAPI.com.
 
     Returns the same dict shape as _fetch_open_meteo so the caller
     doesn't need to know which provider answered.
+
+    WeatherAPI always reports pressure in mb as mean-sea-level (MSL) pressure.
+    When *elev_ft* is provided the value is converted to actual surface
+    pressure using the standard atmosphere formula so it matches Open-Meteo's
+    ``surface_pressure`` field and is physically correct for elevated parks.
     """
     global _wa_fail_count
     if _wa_fail_count >= _CB_THRESHOLD:
@@ -610,9 +674,14 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
         data = r.json()
 
         cur = data.get("current", {})
+        # WeatherAPI pressure_mb is MSL-adjusted; convert to actual surface
+        # pressure when elevation is known (standard atmosphere formula).
+        _h_m = float(elev_ft) * 0.3048
+        _surf_factor = (1.0 - 2.25577e-5 * _h_m) ** 5.25588 if _h_m > 0 else 1.0
+        _msl_now = cur.get("pressure_mb", 0) or 0
         result = {
             "precip_pct": None,
-            "pressure_hpa": round(cur.get("pressure_mb", 0) or 0, 1),
+            "pressure_hpa": round(_msl_now * _surf_factor, 1),
             "humidity_pct": cur.get("humidity"),
         }
 
@@ -654,6 +723,15 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                     _wa_venue_tz = game_local.tzinfo  # fallback: assume same tz
                 game_venue = game_dt.astimezone(_wa_venue_tz)
                 game_hour_str = game_venue.strftime("%Y-%m-%d %H:00")
+                # Compute actual sunset for accurate day/night determination
+                _wa_sunset_utc_h = _approx_sunset_hour(lat, lon, game_dt.date())
+                _wa_sunset_utc_dt = (
+                    datetime(game_dt.year, game_dt.month, game_dt.day,
+                             0, 0, tzinfo=timezone.utc)
+                    + timedelta(hours=_wa_sunset_utc_h))
+                _wa_sl = _wa_sunset_utc_dt.astimezone(_wa_venue_tz)
+                _wa_sunset_local_hr = _wa_sl.hour + _wa_sl.minute / 60.0
+                result["sunset_hour"] = round(_wa_sunset_local_hr, 2)
 
                 # Find starting hour index
                 start_idx = None
@@ -681,7 +759,9 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 result["forecast_temp"] = match.get("temp_f")
                 result["forecast_wind_speed"] = match.get("wind_mph")
                 result["forecast_wind_deg"] = match.get("wind_degree")
-                result["forecast_pressure"] = match.get("pressure_mb")
+                _msl_fc = match.get("pressure_mb")
+                result["forecast_pressure"] = (
+                    round(_msl_fc * _surf_factor, 1) if _msl_fc is not None else None)
                 result["forecast_humidity"] = match.get("humidity")
 
                 # Precip: max chance across the game window
@@ -714,22 +794,28 @@ def _fetch_weatherapi(lat, lon, game_utc_iso: str | None = None, azimuth: float 
                 hourly_conds = []
                 for wh in window:
                     t_str = wh.get("time", "")
+                    h_local_hour = 12  # fallback: treat as daytime
+                    h_dt_aware = None
                     try:
                         h_dt = datetime.fromisoformat(t_str)
                         # Display in user's local timezone
                         h_dt_aware = h_dt.replace(tzinfo=_wa_venue_tz)
-                        h_lbl = h_dt_aware.astimezone().strftime("%I %p").lstrip("0")
+                        h_local = h_dt_aware.astimezone()
+                        h_lbl = h_local.strftime("%I %p").lstrip("0")
+                        h_local_hour = h_local.hour
                     except Exception:
                         h_lbl = ""
                     cond_txt = wh.get("condition", {}).get("text", "")
                     pr = wh.get("chance_of_rain")
                     h_wd_deg = wh.get("wind_degree")
                     h_wd_mlb = _compass_to_mlb_wind(h_wd_deg, azimuth) if h_wd_deg is not None else ""
+                    _wa_h_dec = (h_dt_aware.hour + h_dt_aware.minute / 60.0
+                                 if h_dt_aware is not None else float(h_local_hour))
                     hourly_conds.append({
                         "hour": h_lbl, "condition": cond_txt,
                         "precip": pr,
                         "humidity": wh.get("humidity"),
-                        "night": not wh.get("is_day", 1),
+                        "night": _wa_h_dec > _wa_sunset_local_hr + 0.75 or h_local_hour < 6,
                         "temp": wh.get("temp_f"),
                         "wind_speed": wh.get("wind_mph"),
                         "wind_dir": h_wd_mlb,
@@ -990,6 +1076,16 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             except Exception:
                 pass
 
+        # Static coord override for venues where MLB API provides no coordinates
+        # (e.g. international venues like Estadio Alfredo Harp Helú).
+        if not result["lat"] and result["venue_id"] in _VENUE_COORD_OVERRIDE:
+            _ov = _VENUE_COORD_OVERRIDE[result["venue_id"]]
+            result["lat"]       = _ov[0]
+            result["lon"]       = _ov[1]
+            result["elevation"] = result["elevation"] or _ov[2]
+            if not result["azimuth"]:
+                result["azimuth"] = _ov[3]
+
         # Retractable roofs: determine open/closed from MLB condition field.
         # Only trust the API condition as an official roof indicator within
         # 1 hour of game time (or once the game is live).  Earlier than that,
@@ -1030,7 +1126,8 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                             game_utc_iso=gd or None, azimuth=_az)
             if not om:
                 om = _fetch_weatherapi(result["lat"], result["lon"],
-                                       game_utc_iso=gd or None, azimuth=_az)
+                                       game_utc_iso=gd or None, azimuth=_az,
+                                       elev_ft=result.get("elevation") or 0)
             if not om:
                 om = _fetch_open_meteo(result["lat"], result["lon"],
                                        game_utc_iso=gd or None, azimuth=_az)
@@ -1040,10 +1137,14 @@ def fetch_park_weather(date_str: str) -> list[dict]:
             result["pressure_hpa"] = om.get("pressure_hpa")
             result["humidity_pct"] = om.get("humidity_pct")
 
-            # Fill missing MLB weather from hourly forecast
+            # Fill missing MLB weather from hourly forecast.
+            # forecast_condition is the WORST condition across the game window
+            # (computed by the weather provider from all game-hour slots) —
+            # always prefer it over the MLB Stats API observation which may
+            # reflect current conditions far from game time.
             if not result["temp"] and om.get("forecast_temp") is not None:
                 result["temp"] = str(round(om["forecast_temp"]))
-            if not result["condition"] and om.get("forecast_condition"):
+            if om.get("forecast_condition"):
                 result["condition"] = om["forecast_condition"]
             if result["wind_speed"] == 0 and om.get("forecast_wind_speed") is not None:
                 result["wind_speed"] = round(om["forecast_wind_speed"])
@@ -1074,6 +1175,9 @@ def fetch_park_weather(date_str: str) -> list[dict]:
                     _hourly = _fallback_h
             if _hourly:
                 result["hourly_conditions"] = _hourly
+            # Store sunset hour from the weather provider for day/night logic
+            if om.get("sunset_hour") is not None:
+                result["sunset_hour"] = om["sunset_hour"]
 
         # Predictive roof status for retractable venues (pregame only)
         if _is_retractable and not _roof_confirmed:
@@ -1674,6 +1778,19 @@ def _weather_cache_path(date_str: str) -> str:
     return os.path.join(_WEATHER_CACHE_DIR, f"{date_str}.json")
 
 
+def _weather_cache_is_stale(date_str: str) -> bool:
+    """Return True if the disk cache for *date_str* is older than _WEATHER_CACHE_TTL_SECS."""
+    import time as _time
+    path = _weather_cache_path(date_str)
+    if not os.path.isfile(path):
+        return True
+    try:
+        age = _time.time() - os.path.getmtime(path)
+        return age > _WEATHER_CACHE_TTL_SECS
+    except Exception:
+        return True
+
+
 def _load_weather_from_disk(date_str: str) -> list[dict] | None:
     """Load weather data from the disk cache, or None if absent/corrupt."""
     path = _weather_cache_path(date_str)
@@ -1718,6 +1835,31 @@ def _cleanup_old_weather_cache(keep_days: int = 4):
         pass
 
 
+def _seed_nws_grid_cache(games: list[dict]) -> None:
+    """Submit NWS grid resolution for each game venue in the background.
+
+    Uses the existing dedup logic inside _nws_resolve_grid (pending events),
+    so concurrent or duplicate calls are safe.
+    """
+    seen: set[str] = set()
+    for g in games:
+        lat, lon = g.get("lat"), g.get("lon")
+        if lat is None or lon is None:
+            continue
+        key = f"{round(lat, 3)},{round(lon, 3)}"
+        if key in seen:
+            continue
+        seen.add(key)
+        # Skip if already cached
+        with _nws_grid_lock:
+            if key in _nws_grid_cache:
+                continue
+        try:
+            _nws_grid_seed_pool.submit(_nws_resolve_grid, lat, lon)
+        except Exception:
+            pass
+
+
 def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
     """Seed the in-memory cache from disk, then re-fetch fresh data.
 
@@ -1732,6 +1874,12 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
     date_str = date_str or _dt.date.today().isoformat()
     is_today = (date_str == _dt.date.today().isoformat())
 
+    # Only preserve hourly windows for games actively in progress —
+    # preserving for Scheduled games locks in any bad data from the first fetch.
+    _LIVE_PRESERVE_STATUSES = frozenset({
+        "In Progress", "Warmup", "Delayed", "Delayed Start", "Suspended",
+    })
+
     if is_today or force_refresh:
         # Preserve original hourly_conditions from existing cache before
         # clearing — weather APIs drop past hours on re-fetch, which would
@@ -1741,7 +1889,7 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
         if prev:
             for g in prev:
                 hc = g.get("hourly_conditions")
-                if hc and len(hc) >= 4:
+                if hc and len(hc) >= 4 and g.get("status", "") in _LIVE_PRESERVE_STATUSES:
                     gid = g.get("game_id")
                     if gid:
                         _prev_hourly[gid] = hc
@@ -1760,10 +1908,31 @@ def prefetch_weather(date_str: str | None = None, force_refresh: bool = False):
         # For non-today dates, use existing cache if available
         existing = get_cached_weather(date_str)
         if existing is not None:
-            return
+            # Re-fetch if any game is missing coords that can be filled via
+            # a static override (e.g. international venues added after the
+            # cache was built).
+            needs_refresh = any(
+                not g.get("lat") and g.get("venue_id") in _VENUE_COORD_OVERRIDE
+                for g in existing
+            )
+            if not needs_refresh:
+                return
+            # Invalidate stale cache so we fall through to a fresh fetch
+            try:
+                stale = _weather_cache_path(date_str)
+                if os.path.isfile(stale):
+                    os.remove(stale)
+            except Exception:
+                pass
+            with _weather_lock:
+                _weather_cache.pop(date_str, None)
 
     # Fetch fresh data and update cache + disk
     data = fetch_park_weather(date_str)
+
+    # Pre-populate NWS grid cache for all venues — eliminates first-request
+    # latency when weather widgets open later.
+    _seed_nws_grid_cache(data)
 
     # Restore original hourly_conditions so the 4-hour window stays
     # anchored to game start rather than shifting to "now".
@@ -1810,20 +1979,30 @@ class _WeatherWorker(QThread):
         import datetime as _dt
         is_today = (self._date == _dt.date.today().isoformat())
 
-        # For non-today dates, use existing cache if it has pressure data
+        # For non-today dates, use existing cache only if it is fresh (< TTL).
+        # Stale cache means the forecast has aged out and needs a live re-fetch.
         if not is_today:
-            cached = get_cached_weather(self._date)
-            if cached and all(g.get("pressure_hpa") for g in cached):
-                self.finished.emit(cached)
-                return
+            if not _weather_cache_is_stale(self._date):
+                cached = get_cached_weather(self._date)
+                if cached and all(g.get("pressure_hpa") for g in cached):
+                    self.finished.emit(cached)
+                    return
+            else:
+                # Stale — clear from memory so prefetch_weather will re-fetch
+                with _weather_lock:
+                    _weather_cache.pop(self._date, None)
 
-        # Preserve original hourly_conditions before re-fetch
+        # Preserve original hourly_conditions before re-fetch —
+        # only for live games to avoid locking in bad data from early fetches.
+        _LIVE_PRESERVE_STATUSES = frozenset({
+            "In Progress", "Warmup", "Delayed", "Delayed Start", "Suspended",
+        })
         _prev_hourly: dict[int, list[dict]] = {}
         prev = get_cached_weather(self._date)
         if prev:
             for g in prev:
                 hc = g.get("hourly_conditions")
-                if hc and len(hc) >= 4:
+                if hc and len(hc) >= 4 and g.get("status", "") in _LIVE_PRESERVE_STATUSES:
                     gid = g.get("game_id")
                     if gid:
                         _prev_hourly[gid] = hc
@@ -1975,6 +2154,11 @@ class ParkFactorsPage(QWidget):
         self._worker.finished.connect(self._on_refresh)
         self._worker.start()
 
+    def showEvent(self, event):
+        """Re-fetch weather whenever the page becomes visible (nav-back)."""
+        super().showEvent(event)
+        self.refresh_weather()
+
     # ── title + filter section ──
     def _build_header(self):
         wrap = QWidget()
@@ -2058,7 +2242,7 @@ class ParkFactorsPage(QWidget):
             "<table cellspacing='4'>"
             "<tr><td><b>HR</b></td><td style='padding-right:12px'>2.3 per game</td><td style='color:#888'>(both teams combined)</td></tr>"
             "<tr><td><b>1B</b></td><td style='padding-right:12px'>10.6 per game</td><td style='color:#888'>(both teams combined)</td></tr>"
-            "<tr><td><b>XBH</b></td><td style='padding-right:12px'>3.6 per game</td><td style='color:#888'>(2B + 3B combined, both teams)</td></tr>"
+            "<tr><td><b>2B/3B</b></td><td style='padding-right:12px'>3.6 per game</td><td style='color:#888'>(2B + 3B combined, both teams)</td></tr>"
             "</table><br>"
             "<i>Model: Stage 0 park geometry + Stage 1A endemic climate + Stage 2 day-to-day weather.</i>"
         )

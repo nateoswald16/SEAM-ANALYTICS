@@ -1,0 +1,10 @@
+{
+  "batting": {
+    "#": true,
+    "Chase%": true,
+    "Blast%": true,
+    "BatSpd": true,
+    "FB%": true,
+    "MaxEV": true
+  }
+}

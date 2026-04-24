@@ -48,6 +48,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
     QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QCheckBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread, QSize, QSettings, QByteArray
 from PyQt6 import sip
@@ -181,6 +182,17 @@ def _fmt_ip(outs):
     remainder = outs % 3
     return f"{full}.{remainder}"
 
+# ── Column definitions (module-level — avoid redefinition per call) ──────────
+_PIT_COLS = ["PITCHER", "IP", "OUTS", "K%", "BB%",
+             "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "Zone%", "F-Strike%",
+             "Barrel%", "LD%", "Hard%", "GB%", "Contact%", "Velo", "Top", "Whiff%", "SwStr%"]
+_PIT_HI = frozenset({3, 21})  # K%, Whiff%
+_BAT_COLS = ["#", "POS", "PLAYER", "PA", "AVG", "ISO", "K%", "BB%",
+             "H", "1B", "2B", "3B", "HR", "R", "RBI", "TB",
+             "Brl%", "PullAir%", "EV50", "MaxEV", "FB%",
+             "Hard%", "BatSpd", "SqUp%", "Blast%", "Chase%"]
+_BAT_HI = frozenset({4, 5})
+
 # ── Pre-compiled regex for handedness suffix on player names ─────────────────
 import re as _re
 from collections import OrderedDict as _OrderedDict
@@ -218,37 +230,65 @@ def _cache_pitcher(pid, pname=None, throws=None):
             entry['throws'] = throws
         _PITCHER_CACHE[pid] = entry
 
+# ── Column visibility preferences ──────────────────────────────────────────
+def _load_col_prefs() -> dict:
+    try:
+        if os.path.exists(_app_paths.COLUMN_PREFS_FILE):
+            with open(_app_paths.COLUMN_PREFS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+def _save_col_prefs(prefs: dict) -> None:
+    try:
+        with open(_app_paths.COLUMN_PREFS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(prefs, f, indent=2)
+    except Exception:
+        log.exception("_save_col_prefs")
+
+_COL_PREFS: dict = _load_col_prefs()
+
+# Section keys per tab index (tab 0=Batting, 1=Pitching, 2=BR, 3=BvP, 4=Bullpen)
+_TAB_SECTION_KEYS = [
+    ["batting"],
+    ["pitching"],
+    ["br_pitcher", "br_catcher", "br_runners"],
+    ["bvp_pitcher", "bvp_batting", "bvp_br_pitcher", "bvp_br_catcher", "bvp_br_runners"],
+    ["bullpen"],
+]
+_TAB_SECTION_LABELS = {
+    "batting":        "Batting",
+    "pitching":       "Pitching",
+    "br_pitcher":     "Pitcher SB",
+    "br_catcher":     "Catcher SB",
+    "br_runners":     "Base Runners",
+    "bvp_pitcher":    "BvP — Pitcher",
+    "bvp_batting":    "BvP — Batters",
+    "bvp_br_pitcher": "BvP — Pitcher BR",
+    "bvp_br_catcher": "BvP — Catcher BR",
+    "bvp_br_runners": "BvP — Runner BR",
+    "bullpen":        "Bullpen",
+}
+
 # ── Module-level combobox stylesheet (avoid re-parsing on each filter bar build)
 _CB_STYLE = f"""
-    QComboBox {{
-        background:{C['bg2']}; color:{C['t1']};
-        padding:5px 22px 5px 8px;
-        border:1px solid {C['bdr']}; border-radius:4px;
-        font-family:'Segoe UI','Inter',sans-serif; font-size:11px; font-weight:500;
-    }}
-    QComboBox:focus {{ border:1px solid {C['bdrl']}; outline:none; }}
-    QComboBox:on {{ border:1px solid {C['bdrl']}; outline:none; }}
-    QComboBox::drop-down {{
-        subcontrol-origin: padding; subcontrol-position: center right;
-        width:18px; border:none; background:transparent;
-    }}
-    QComboBox::down-arrow {{ image:none; width:0; height:0; }}
     QComboBox QAbstractItemView {{
         background:{C['bg2']}; color:{C['t1']};
         border:1px solid {C['bdrl']};
         selection-background-color:{C['bg3']}; selection-color:{C['t1']};
         outline:none; padding:4px 0;
-        font-family:'Segoe UI','Inter',sans-serif; font-size:11px;
+        font-family:'Segoe UI'; font-size:10px;
     }}
     QComboBox QAbstractItemView::item {{ padding:5px 10px; min-height:24px; }}
-    QComboBox QAbstractItemView::item:hover {{ background:{C['bg3']}; }}
+    QComboBox QAbstractItemView::item:hover {{ background:{C['bg3']}; color:{C['t1']}; }}
 """
 _CB_VIEW_STYLE = f"""
     background:{C['bg2']}; color:{C['t1']};
     border:1px solid {C['bdrl']};
     selection-background-color:{C['bg3']}; selection-color:{C['t1']};
     outline:none; padding:4px 0;
-    font-family:'Segoe UI','Inter',sans-serif; font-size:11px;
+    font-family:'Segoe UI'; font-size:10px;
 """
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -287,21 +327,25 @@ def _init_logos():
         except Exception as e:
             log.warning("Logo download failed for %s: %s", abbr, e)
 
-    with ThreadPoolExecutor(max_workers=min(6, len(to_download))) as _logo_pool:
-        for abbr, url, local in to_download:
-            _logo_pool.submit(_dl, abbr, url, local)
+    for abbr, url, local in to_download:
+        _bg_pool.submit(_dl, abbr, url, local)
+
+_LOGO_MISS = object()  # sentinel for absent/invalid logo entries
 
 def get_team_pixmap(abbr: str, size: int = 20) -> QPixmap | None:
     """Return a cached QPixmap for the team abbreviation, or None."""
     key = (abbr, size)
-    if key in _LOGO_PIXMAPS:
-        return _LOGO_PIXMAPS[key]
+    cached = _LOGO_PIXMAPS.get(key)
+    if cached is not None:
+        return None if cached is _LOGO_MISS else cached
     svg_path = _LOGO_MAP.get(abbr)
     if not svg_path or not os.path.exists(svg_path):
+        _LOGO_PIXMAPS[key] = _LOGO_MISS
         return None
     try:
         renderer = QSvgRenderer(svg_path)
         if not renderer.isValid():
+            _LOGO_PIXMAPS[key] = _LOGO_MISS
             return None
         img = QImage(size, size, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(0)
@@ -312,6 +356,7 @@ def get_team_pixmap(abbr: str, size: int = 20) -> QPixmap | None:
         _LOGO_PIXMAPS[key] = pm
         return pm
     except Exception:
+        _LOGO_PIXMAPS[key] = _LOGO_MISS
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -919,15 +964,49 @@ class DataManager:
                     'inhole_batter_name': game.get('inhole_batter_name', ''),
                     'inhole_batter_hand': game.get('inhole_batter_hand', ''),
                 })
+            # Persist to disk so the next launch can skip this network call
+            if out:
+                self._save_schedule_disk_cache(date_str, out)
             return out
         except Exception:
             return []
 
+    def _save_schedule_disk_cache(self, date_str: str, games: list) -> None:
+        """Persist processed game list to a gzip JSON file keyed by date."""
+        import gzip as _gz
+        path = os.path.join(_app_paths.DATA_DIR, f"schedule_{date_str}.json.gz")
+        try:
+            with _gz.open(path, 'wt', encoding='utf-8') as f:
+                json.dump(games, f)
+        except Exception:
+            pass
+
+    def load_schedule_disk_cache(self, date_str: str):
+        """Load a previously saved game list from disk.
+
+        Returns the list of game dicts, or None if the file is missing or
+        (for today) older than 4 hours.
+        """
+        import gzip as _gz, time as _t
+        path = os.path.join(_app_paths.DATA_DIR, f"schedule_{date_str}.json.gz")
+        if not os.path.exists(path):
+            return None
+        today = dt.date.today().isoformat()
+        if date_str == today:
+            age = _t.time() - os.path.getmtime(path)
+            if age > 4 * 3600:   # stale after 4 hours — re-fetch
+                return None
+        try:
+            with _gz.open(path, 'rt', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return None
+
     def _format_and_cache_lineup(self, game_id, lineup):
         """Convert API lineup dict into table rows and cache to disk."""
         cache_file = os.path.join(self.cache_dir, f"{game_id}.json")
-        BAT_COLS = ["#","POS","PLAYER","PA","AVG","ISO","K%","BB%","H","1B","2B","3B","HR","R","RBI","TB","Brl%","Pull%","EV","MaxEV","AVG LA","Hard%","BatSpd","SqUp%","Blast%","Chase%"]
-        BAT_HI = {4, 5}
+        BAT_COLS = _BAT_COLS
+        BAT_HI = _BAT_HI
         # Build structured player lists (preserve batting order). Include player_id when available.
         def build_players_from_api(lst):
             out = []
@@ -1257,7 +1336,7 @@ class DataManager:
             pa = 0
             avg = iso = k_pct = bb_pct = None
             hits = singles = doubles = triples = hrs = runs = rbi = total_bases = 0
-            barrel_pct = pull_pct = avg_ev = max_ev = avg_la = None
+            barrel_pct = pulled_air_pct = ev50 = max_ev = fb_pct = None
             hard_hit_pct = avg_bat_speed = squared_up_rate = blast_rate = chase_rate = None
             display_name = f"{name} {hand}".strip() if hand else name
             empty = [pos, display_name, "0", "", "", "", "", "0", "0", "0", "0", "0", "0", "0", "0", "", "", "", "", "", "", "", "", "", ""]
@@ -1275,7 +1354,7 @@ class DataManager:
                         SELECT plate_appearances, at_bats, hits, singles, doubles, triples,
                                home_runs, runs, rbis, total_bases, walks, strikeouts,
                                avg, slg, obp, k_pct, bb_pct,
-                               barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev,
+                               barrel_pct, pulled_air_pct, iso, fb_pct, ev50, max_ev,
                                avg_bat_speed, squared_up_rate, blast_rate, hard_hit_pct, chase_rate
                         FROM calculated_batting_stats
                         WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
@@ -1302,10 +1381,10 @@ class DataManager:
                         k_pct = round(_sf(crow["k_pct"]), 2) if crow["k_pct"] is not None else None
                         bb_pct = round(_sf(crow["bb_pct"]), 2) if crow["bb_pct"] is not None else None
                         barrel_pct = round(_sf(crow["barrel_pct"]), 3) if crow["barrel_pct"] is not None else None
-                        pull_pct = round(_sf(crow["pull_pct"]), 3) if crow["pull_pct"] is not None else None
+                        pulled_air_pct = round(_sf(crow["pulled_air_pct"]), 3) if crow["pulled_air_pct"] is not None else None
                         iso = round(_sf(crow["iso"]), 3) if crow["iso"] is not None else None
-                        avg_la = round(_sf(crow["avg_launch_angle"]), 1) if crow["avg_launch_angle"] is not None else None
-                        avg_ev = round(_sf(crow["avg_ev"]), 1) if crow["avg_ev"] is not None else None
+                        fb_pct = round(_sf(crow["fb_pct"]), 3) if crow["fb_pct"] is not None else None
+                        ev50 = round(_sf(crow["ev50"]), 1) if crow["ev50"] is not None else None
                         max_ev = round(_sf(crow["max_ev"]), 1) if crow["max_ev"] is not None else None
                         avg_bat_speed = round(_sf(crow["avg_bat_speed"]), 1) if crow["avg_bat_speed"] is not None else None
                         squared_up_rate = round(_sf(crow["squared_up_rate"]), 3) if crow["squared_up_rate"] is not None else None
@@ -1366,10 +1445,7 @@ class DataManager:
                       SUM(COALESCE(is_strikeout,0)) as so,
                       SUM(CASE WHEN bb_type IS NOT NULL AND launch_speed_angle = 6 THEN 1 ELSE 0 END) as barrels,
                       SUM(CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END) as barrel_denom,
-                      SUM(CASE WHEN hc_x IS NOT NULL AND ((stand='R' AND hc_x<125.42) OR (stand='L' AND hc_x>125.42)) THEN 1 ELSE 0 END) as pulls,
-                      SUM(CASE WHEN hc_x IS NOT NULL THEN 1 ELSE 0 END) as pull_denom,
-                      AVG(CASE WHEN bb_type IS NOT NULL AND launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
-                      AVG(CASE WHEN bb_type IS NOT NULL AND launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
+                      SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) as fly_balls,
                       MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw
                     FROM plate_appearances
                     WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
@@ -1393,8 +1469,8 @@ class DataManager:
                         so = _si(r[11])
                         barrels = _si(r[12])
                         barrel_denom = _si(r[13])
-                        pulls = _si(r[14])
-                        pull_denom = _si(r[15])
+                        fly_balls = _si(r[14])
+                        max_ev = round(float(r[15]), 1) if r[15] is not None else None
 
                         avg = round(float(hits) / float(ab), 3) if ab and ab > 0 else None
                         slg = round(float(total_bases) / float(ab), 3) if ab and ab > 0 else None
@@ -1402,26 +1478,57 @@ class DataManager:
                         k_pct = round(float(so) / float(pa), 2) if pa and pa > 0 else None
                         bb_pct = round(float(walks) / float(pa), 2) if pa and pa > 0 else None
                         barrel_pct = round(float(barrels) / float(barrel_denom), 3) if barrel_denom and barrel_denom > 0 else None
-                        pull_pct = round(float(pulls) / float(pull_denom), 3) if pull_denom and pull_denom > 0 else None
-                        avg_la = round(float(r[16]), 1) if r[16] is not None else None
-                        avg_ev = round(float(r[17]), 1) if r[17] is not None else None
-                        max_ev = round(float(r[18]), 1) if r[18] is not None else None
+                        fb_pct = round(float(fly_balls) / float(barrel_denom), 3) if barrel_denom and barrel_denom > 0 else None
+
+                        # EV50 and Pulled Air%: require per-row fetch
+                        import math as _math
+                        detail_sql = f"""
+                            SELECT launch_speed, hc_x, hc_y, stand, bb_type
+                            FROM plate_appearances
+                            WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
+                              AND bb_type IS NOT NULL AND bb_type != ''
+                        """
+                        cur.execute(detail_sql, params)
+                        detail_rows = cur.fetchall()
+                        if detail_rows:
+                            import numpy as _np
+                            ev_list = sorted([row[0] for row in detail_rows if row[0] is not None], reverse=True)
+                            if ev_list:
+                                top_n = max(1, len(ev_list) // 2)
+                                ev50 = round(sum(ev_list[:top_n]) / top_n, 1)
+                            total_bbe = len(detail_rows)
+                            # Vectorized pulled air calculation
+                            air_rows = [(r[1], r[2], r[3]) for r in detail_rows
+                                        if r[4] != 'ground_ball' and r[1] is not None and r[2] is not None and r[3] is not None]
+                            if air_rows:
+                                hc_x_arr = _np.array([r[0] for r in air_rows], dtype=float)
+                                hc_y_arr = _np.array([r[1] for r in air_rows], dtype=float)
+                                stand_arr = _np.array([r[2] for r in air_rows])
+                                dy = 198.27 - hc_y_arr
+                                valid = dy != 0
+                                raw_ang = _np.where(valid, _np.arctan((hc_x_arr - 125.42) / _np.where(valid, dy, 1)) * (180 / _np.pi) * 0.75, 0)
+                                adj_ang = _np.where(stand_arr == 'R', raw_ang, -raw_ang)
+                                pulled_air_count = int(_np.sum((adj_ang < -17) & valid))
+                            else:
+                                pulled_air_count = 0
+                            if total_bbe > 0:
+                                pulled_air_pct = round(pulled_air_count / total_bbe, 3)
 
                 except Exception:
                     pa = 0
                     avg = iso = k_pct = bb_pct = None
                     hits = singles = doubles = triples = hrs = runs = rbi = total_bases = 0
-                    barrel_pct = pull_pct = avg_ev = max_ev = avg_la = None
+                    barrel_pct = pulled_air_pct = ev50 = max_ev = fb_pct = None
 
             display_name = f"{name} {hand}".strip() if hand else name
             return [pos, display_name, str(pa), _fmt3(avg), _fmt3(iso), _fmt_pct(k_pct), _fmt_pct(bb_pct),
                     str(hits), str(singles), str(doubles), str(triples), str(hrs), str(runs), str(rbi), str(total_bases),
-                    _fmt_pct(barrel_pct), _fmt_pct(pull_pct), _fmt1(avg_ev), _fmt1(max_ev), _fmt_deg(avg_la),
+                    _fmt_pct(barrel_pct), _fmt_pct(pulled_air_pct), _fmt1(ev50), _fmt1(max_ev), _fmt_pct(fb_pct),
                     _fmt_pct(hard_hit_pct), _fmt1(avg_bat_speed), _fmt_pct(squared_up_rate), _fmt_pct(blast_rate), _fmt_pct(chase_rate)]
 
         # try cache
-        BAT_COLS = ["#","POS","PLAYER","PA","AVG","ISO","K%","BB%","H","1B","2B","3B","HR","R","RBI","TB","Brl%","Pull%","EV","MaxEV","AVG LA","Hard%","BatSpd","SqUp%","Blast%","Chase%"]
-        BAT_HI = {4, 5}
+        BAT_COLS = _BAT_COLS
+        BAT_HI = _BAT_HI
         try:
             if os.path.exists(cache_file):
                 with open(cache_file, 'r', encoding='utf-8') as f:
@@ -1472,8 +1579,8 @@ class DataManager:
 
         detected_season = self._detect_season(cur, game_id)
 
-        BAT_COLS = ["#","POS","PLAYER","PA","AVG","ISO","K%","BB%","H","1B","2B","3B","HR","R","RBI","TB","Brl%","Pull%","EV","MaxEV","AVG LA","Hard%","BatSpd","SqUp%","Blast%","Chase%"]
-        BAT_HI = {4, 5}
+        BAT_COLS = _BAT_COLS
+        BAT_HI = _BAT_HI
 
         eff_season = season if season is not None else detected_season
         eff_matchup = matchup or 'all'
@@ -1832,10 +1939,8 @@ class DataManager:
         {id, name, throws} dicts), builds rows for every pitcher in each
         list and skips the starter-detection logic (used by bullpen page).
         """
-        PIT_COLS = ["PITCHER", "IP", "OUTS", "K%", "BB%",
-                    "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "Zone%", "F-Strike%",
-                    "Barrel%", "LD%", "Hard%", "GB%", "Contact%", "Velo", "Top", "Whiff%", "SwStr%"]
-        PIT_HI = {3, 21}  # K%, Whiff%
+        PIT_COLS = _PIT_COLS
+        PIT_HI = _PIT_HI
 
         conn = self.connect()
         if not conn:
@@ -1952,6 +2057,8 @@ class DataManager:
             box = resp.json()
         except Exception:
             log.exception("_fetch_boxscore: API fetch")
+            # Cache failure with short TTL to avoid hammering on transient errors
+            self._boxscore_cache[game_id] = (_time.monotonic(), None)
             return None
         self._boxscore_cache[game_id] = (_time.monotonic(), box)
         # Cap cache size
@@ -2001,6 +2108,11 @@ class DataManager:
         if not box:
             return None
 
+        # Probable starter IDs per side (to distinguish opener from true starter)
+        pp_data = {}
+        if self.api and hasattr(self.api, 'probable_pitchers'):
+            pp_data = self.api.probable_pitchers.get(str(game_id), {})
+
         away_pitchers = []
         home_pitchers = []
         for side, plist in [('away', away_pitchers), ('home', home_pitchers)]:
@@ -2009,8 +2121,18 @@ class DataManager:
             pitcher_ids = team_data.get('pitchers', [])
             players = team_data.get('players', {})
 
-            # pitchers[0] is the starter — relievers are pitchers[1:]
-            relievers_used = pitcher_ids[1:] if len(pitcher_ids) > 1 else []
+            # Determine the true starter: pitchers[0] is skipped unless it's an
+            # opener (i.e. pitchers[0] != the probable starter → include in bullpen)
+            probable_starter_id = pp_data.get(side, {}).get('id') if pp_data.get(side) else None
+            first_is_true_starter = (not pitcher_ids or
+                                     probable_starter_id is None or
+                                     pitcher_ids[0] == probable_starter_id)
+            if first_is_true_starter:
+                # Normal game: skip pitchers[0] (starter shown on Pitching tab)
+                relievers_used = pitcher_ids[1:] if len(pitcher_ids) > 1 else []
+            else:
+                # Opener game: pitchers[0] is the opener — include all pitcher_ids
+                relievers_used = pitcher_ids
 
             # Combine: relievers who already entered + those still available
             seen = set()
@@ -2245,10 +2367,8 @@ class DataManager:
             return '', []
 
         # ── BvP Pitching: aggregate pitcher stats from PAs vs lineup batters ──
-        BVP_PIT_COLS = ["PITCHER", "IP", "OUTS", "K%", "BB%",
-                        "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "Zone%", "F-Strike%",
-                        "Barrel%", "LD%", "Hard%", "GB%", "Contact%", "Velo", "Top", "Whiff%", "SwStr%"]
-        BVP_PIT_HI = {3, 21}
+        BVP_PIT_COLS = _PIT_COLS
+        BVP_PIT_HI = _PIT_HI
 
         def _build_bvp_pitcher_row(pid, pname, p_throws, batter_ids, window):
             # Resolve full name from DB (API may pass abbreviated "F. Last")
@@ -2297,7 +2417,8 @@ class DataManager:
                   SUM(CASE WHEN zone BETWEEN 1 AND 9 THEN 1 ELSE 0 END) as in_zone,
                   COUNT(zone) as total_pitches_z,
                   AVG(CASE WHEN release_speed IS NOT NULL THEN release_speed END) as avg_velo,
-                  MAX(release_speed) as top_velo
+                  MAX(release_speed) as top_velo,
+                  SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) as gb_ct
                 FROM plate_appearances pa
                 WHERE pa.pitcher_id = ? AND pa.batter_id IN ({placeholders}) {date_sql}
                 """
@@ -2330,6 +2451,7 @@ class DataManager:
                     total_pitches_z = _si(r[22])
                     avg_velo = _sf(r[23])
                     top_velo = _sf(r[24])
+                    gb_ct = _si(r[25])
                     innings = outs / 3.0
                     k_pct = round(k / pa, 2) if pa > 0 else None
                     bb_pct = round(bb / pa, 2) if pa > 0 else None
@@ -2345,14 +2467,34 @@ class DataManager:
                     barrel_pct = round(barrel_ct / bip, 3) if bip > 0 else None
                     zone_pct = round(in_zone / total_pitches_z, 3) if total_pitches_z > 0 else None
                     contact_pct = round((swings - whiffs) / swings, 3) if swings > 0 else None
+                    gb_pct = round(gb_ct / bip, 3) if bip > 0 else None
                     fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
+                    # SwStr%: whiffs / total pitches (pitch-level count from pitching_appearances)
+                    swstr_pct = None
+                    fp_strike_pct = None
+                    try:
+                        pa_date_sql = date_sql.replace('pa.game_date', 'game_date') if date_sql else ''
+                        pitch_row = cur.execute(
+                            f"SELECT COUNT(*), "
+                            f"  SUM(CASE WHEN pitch_number = 1 AND (swing = 1 OR (swing = 0 AND zone BETWEEN 1 AND 9)) THEN 1 ELSE 0 END), "
+                            f"  SUM(CASE WHEN pitch_number = 1 THEN 1 ELSE 0 END) "
+                            f"FROM pitching_appearances "
+                            f"WHERE pitcher_id=? AND batter_id IN ({placeholders}) {pa_date_sql}",
+                            [pid] + list(batter_ids) + date_params
+                        ).fetchone()
+                        if pitch_row and pitch_row[0] and pitch_row[0] > 0:
+                            swstr_pct = round(whiffs / pitch_row[0], 3)
+                        if pitch_row and pitch_row[2] and pitch_row[2] > 0:
+                            fp_strike_pct = round((pitch_row[1] or 0) / pitch_row[2], 3)
+                    except Exception:
+                        pass
                     return [display_name, _fmt_ip(outs), str(outs),
                             fmt_pct(k_pct), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                            _fmt2(era), fmt3(slg), fmt_pct(zone_pct), "",
-                            fmt_pct(barrel_pct), fmt_pct(ld_pct), fmt_pct(hard_pct), "",
+                            _fmt2(era), fmt3(slg), fmt_pct(zone_pct), fmt_pct(fp_strike_pct),
+                            fmt_pct(barrel_pct), fmt_pct(ld_pct), fmt_pct(hard_pct), fmt_pct(gb_pct),
                             fmt_pct(contact_pct),
-                            fmt_velo(avg_velo), fmt_velo(top_velo), fmt_pct(whiff_pct), ""]
+                            fmt_velo(avg_velo), fmt_velo(top_velo), fmt_pct(whiff_pct), fmt_pct(swstr_pct)]
             except Exception:
                 log.exception("_build_bvp_pitcher_row")
             return empty
@@ -2360,7 +2502,7 @@ class DataManager:
         # ── BvP Batting: each batter's stats vs the pitcher ──
         BVP_BAT_COLS = ["POS", "PLAYER", "PA", "AVG", "ISO", "K%", "BB%",
                         "H", "1B", "2B", "3B", "HR", "R", "RBI", "TB",
-                        "Brl%", "Pull%", "EV", "MaxEV", "AVG LA"]
+                        "Brl%", "PullAir%", "EV50", "MaxEV", "FB%"]
         BVP_BAT_HI = {3, 4}
 
         def _build_bvp_batter_row(pid, pos, name, hand, pitcher_id, window):
@@ -2387,10 +2529,7 @@ class DataManager:
                   SUM(COALESCE(is_strikeout,0)) as so,
                   SUM(CASE WHEN bb_type IS NOT NULL AND launch_speed_angle = 6 THEN 1 ELSE 0 END) as barrels,
                   SUM(CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END) as barrel_denom,
-                  SUM(CASE WHEN hc_x IS NOT NULL AND ((stand='R' AND hc_x<125.42) OR (stand='L' AND hc_x>125.42)) THEN 1 ELSE 0 END) as pulls,
-                  SUM(CASE WHEN hc_x IS NOT NULL THEN 1 ELSE 0 END) as pull_denom,
-                  AVG(CASE WHEN bb_type IS NOT NULL AND launch_angle IS NOT NULL THEN launch_angle END) as avg_la_raw,
-                  AVG(CASE WHEN bb_type IS NOT NULL AND launch_speed IS NOT NULL THEN launch_speed END) as avg_ev_raw,
+                  SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) as fly_balls,
                   MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw
                 FROM plate_appearances pa
                 WHERE pa.batter_id = ? AND pa.pitcher_id = ? {date_sql}
@@ -2413,8 +2552,8 @@ class DataManager:
                     so = _si(r[11])
                     barrels = _si(r[12])
                     barrel_denom = _si(r[13])
-                    pulls = _si(r[14])
-                    pull_denom = _si(r[15])
+                    fly_balls = _si(r[14])
+                    max_ev = round(float(r[15]), 1) if r[15] is not None else None
 
                     avg = round(float(hits) / float(ab), 3) if ab > 0 else None
                     slg = round(float(total_bases) / float(ab), 3) if ab > 0 else None
@@ -2422,17 +2561,48 @@ class DataManager:
                     k_pct = round(float(so) / float(pa), 2) if pa > 0 else None
                     bb_pct = round(float(walks) / float(pa), 2) if pa > 0 else None
                     barrel_pct = round(float(barrels) / float(barrel_denom), 3) if barrel_denom > 0 else None
-                    pull_pct = round(float(pulls) / float(pull_denom), 3) if pull_denom > 0 else None
-                    avg_la = round(float(r[16]), 1) if r[16] is not None else None
-                    avg_ev = round(float(r[17]), 1) if r[17] is not None else None
-                    max_ev = round(float(r[18]), 1) if r[18] is not None else None
+                    fb_pct = round(float(fly_balls) / float(barrel_denom), 3) if barrel_denom > 0 else None
+
+                    # EV50 and Pulled Air% from per-row detail
+                    import math as _math
+                    detail_sql = f"""
+                        SELECT launch_speed, hc_x, hc_y, stand, bb_type
+                        FROM plate_appearances
+                        WHERE batter_id = ? AND pitcher_id = ? {date_sql}
+                          AND bb_type IS NOT NULL AND bb_type != ''
+                    """
+                    cur.execute(detail_sql, params)
+                    detail_rows = cur.fetchall()
+                    ev50 = pulled_air_pct = None
+                    if detail_rows:
+                        ev_list = sorted([dr[0] for dr in detail_rows if dr[0] is not None], reverse=True)
+                        if ev_list:
+                            top_n = max(1, len(ev_list) // 2)
+                            ev50 = round(sum(ev_list[:top_n]) / top_n, 1)
+                        total_bbe = len(detail_rows)
+                        pulled_air_count = 0
+                        for dr in detail_rows:
+                            _ls, hc_x, hc_y, stand, bb_type = dr
+                            if bb_type == 'ground_ball':
+                                continue
+                            if hc_x is None or hc_y is None or stand is None:
+                                continue
+                            denom_y = 198.27 - hc_y
+                            if denom_y == 0:
+                                continue
+                            raw_ang = _math.atan((hc_x - 125.42) / denom_y) * (180 / _math.pi) * 0.75
+                            adj_ang = raw_ang if stand == 'R' else -raw_ang
+                            if adj_ang < -17:
+                                pulled_air_count += 1
+                        if total_bbe > 0:
+                            pulled_air_pct = round(pulled_air_count / total_bbe, 3)
 
                     return [pos, display_name, str(pa), fmt3(avg), fmt3(iso),
                             fmt_pct(k_pct), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
                             str(runs), str(rbi), str(total_bases),
-                            fmt_pct(barrel_pct), fmt_pct(pull_pct),
-                            fmt1(avg_ev), fmt1(max_ev), fmt_deg(avg_la)]
+                            fmt_pct(barrel_pct), fmt_pct(pulled_air_pct),
+                            fmt1(ev50), fmt1(max_ev), fmt_pct(fb_pct)]
             except Exception:
                 log.exception("_build_bvp_batter_row")
             return empty
@@ -2685,28 +2855,39 @@ class DataManager:
 _DM = DataManager()
 # prefer system date (today) for games/lineups; if DB has entries for today use them,
 # otherwise try live schedule for today; fallback to most recent DB games or placeholders
+#
+# Startup fast-path: if a fresh disk cache from today exists, load it instantly
+# (~5ms vs 300-800ms network call).  A background refresh kicks off immediately
+# after the window is shown to bring live scores/status up to date.
+_SCHEDULE_NEEDS_REFRESH = False   # set True when we used a disk cache shortcut
+GAMES = []
 try:
     today = dt.date.today().isoformat()
-    live_today = _DM.fetch_live_games(today)
-    if live_today:
-        GAMES = live_today
+    _disk_games = _DM.load_schedule_disk_cache(today)
+    if _disk_games:
+        GAMES = _disk_games
+        _SCHEDULE_NEEDS_REFRESH = True   # window will trigger immediate poll
     else:
-        db_games_today = _DM.get_games_for_date(today)
-        if db_games_today:
-            GAMES = db_games_today
+        live_today = _DM.fetch_live_games(today)
+        if live_today:
+            GAMES = live_today
         else:
-            recent = _DM.get_most_recent_game_date()
-            if recent:
-                db_games = _DM.get_games_for_date(recent)
-                if db_games:
-                    GAMES = db_games
+            db_games_today = _DM.get_games_for_date(today)
+            if db_games_today:
+                GAMES = db_games_today
+            else:
+                recent = _DM.get_most_recent_game_date()
+                if recent:
+                    db_games = _DM.get_games_for_date(recent)
+                    if db_games:
+                        GAMES = db_games
 except Exception:
     log.exception("module_level_init")
 
 
 def _game_batting(away, home):
-    BAT_COLS = ["#","POS","PLAYER","PA","AVG","ISO","K%","BB%","H","1B","2B","3B","HR","R","RBI","TB","Brl%","Pull%","EV","MaxEV","AVG LA","Hard%","BatSpd","SqUp%","Blast%","Chase%"]
-    BAT_HI   = {4, 5}
+    BAT_COLS = _BAT_COLS
+    BAT_HI = _BAT_HI
     away_rows = [
         ["1","CF","A. Judge R","110",".318",".296","26.4%","14.5%","35","15","8","0","12","18","28","69","19.8%","41.2%","95.2","118.4","12.3°"],
         ["2","SS","A. Volpe R","104",".261",".160","22.1%","7.7%","27","16","6","0","5","14","17","42","10.5%","38.0%","88.1","109.2","10.8°"],
@@ -2733,10 +2914,8 @@ def _game_batting(away, home):
  
  
 def _game_pitching(away, home, away_p, home_p):
-    PIT_COLS = ["PITCHER", "IP", "OUTS", "K%", "BB%",
-                "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "Zone%", "F-Strike%",
-                "Barrel%", "LD%", "Hard%", "GB%", "Contact%", "Velo", "Top", "Whiff%", "SwStr%"]
-    PIT_HI   = {3, 21}
+    PIT_COLS = _PIT_COLS
+    PIT_HI   = _PIT_HI
     away_rows = [
         [f"{away_p} R", "38.1", "48", "0.28", "0.05",
          "24", "16", "4", "0", "4", "1.64",
@@ -2901,10 +3080,10 @@ STAT_TOOLTIPS = {
     "RBI":        ("Runs Batted In\nTotal runs driven in by the batter.",),
     "TB":         ("Total Bases\n1B×1 + 2B×2 + 3B×3 + HR×4. Raw measure of offensive production.",),
     "Brl%":       ("Barrel Rate\n% of batted balls classified as a 'Barrel' (high EV + optimal launch angle). Strongly correlates with HR and XBH. 10%+ is elite.",),
-    "Pull%":      ("Pull Rate\n% of batted balls hit to the pull side of the field.",),
-    "EV":         ("Average Exit Velocity\nAverage speed off the bat (mph) on contact. League avg ~88 mph. 91+ mph is elite.",),
+    "PullAir%":  ("Pulled Air Rate\n% of all batted balls that are airballs (non-grounders) hit to the pull side (spray angle < −17°).",),
+    "EV50":        ("EV50\nAverage exit velocity of the top 50% hardest-hit balls (mph). A power/contact quality metric less sensitive to weak contact.",),
     "MaxEV":      ("Max Exit Velocity\nHardest single ball hit (mph). Proxy for raw power.",),
-    "AVG LA":     ("Average Launch Angle\nAverage vertical angle (degrees) the ball leaves the bat. ~10–15° correlates with line drives and good production.",),
+    "FB%":        ("Fly Ball Rate\n% of batted ball events classified as fly balls.",),
     "Hard%":      ("Hard Hit Rate\n% of batted balls at 95+ mph exit velocity. League avg ~38%. 45%+ is elite.",),
     "BatSpd":     ("Bat Speed\nAverage speed of the bat head (mph) through the hitting zone. Higher = more raw power potential.",),
     "SqUp%":      ("Squared-Up Rate\n% of swings where bat-ball contact is near the sweet spot. Higher = more solid contact.",),
@@ -3308,7 +3487,112 @@ class StatsTable(QTableWidget):
             header_h = self.horizontalHeader().height()
             total_h = header_h + (len(data) * ROW_H) + 2
             self.setFixedHeight(total_h)
+
+    def apply_col_visibility(self, hidden_cols: set):
+        """Show/hide columns by name. Always-visible columns are never hidden."""
+        for c, name in enumerate(self._cols):
+            self.setColumnHidden(c, name in hidden_cols and name not in _ALWAYS_VISIBLE_COLS)
  
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Column picker popup
+# ═══════════════════════════════════════════════════════════════════════════════
+# Columns that are always shown and cannot be hidden
+_ALWAYS_VISIBLE_COLS = {"#", "POS", "PLAYER", "PITCHER", "CATCHER", "PA", "IP"}
+
+class _ColPickerPopup(QFrame):
+    """Floating popup with per-section column visibility checkboxes."""
+    changed = pyqtSignal(str, str, bool)  # section_key, col_name, visible
+
+    _CB_SS = (
+        f"QCheckBox {{ color:{C['t1']}; font-family:'Segoe UI'; font-size:11px; "
+        f"background:transparent; spacing:6px; padding:1px 0; }}"
+        f"QCheckBox::indicator {{ width:13px; height:13px; border-radius:2px; }}"
+        f"QCheckBox::indicator:unchecked {{ border:1px solid {C['bdr']}; background:{C['bg1']}; }}"
+        f"QCheckBox::indicator:checked {{ border:1px solid {C['ora']}; background:{C['ora']}; }}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.WindowType.Popup)
+        self.setObjectName("colPickerPopup")
+        self.setStyleSheet(
+            f"QFrame#colPickerPopup {{ background:{C['bg2']}; border:1px solid {C['bdrl']}; border-radius:6px; }}"
+            f"QFrame {{ border:none; }}")
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self._sa = QScrollArea()
+        self._sa.setWidgetResizable(True)
+        self._sa.setStyleSheet(
+            f"QScrollArea {{ background:{C['bg2']}; border:none; }}"
+            f"QScrollBar:vertical {{ background:transparent; width:4px; margin:0; }}"
+            f"QScrollBar::handle:vertical {{ background:{C['bdrl']}; border-radius:2px; min-height:20px; }}"
+            f"QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height:0; }}")
+        outer.addWidget(self._sa)
+        self._inner = QWidget()
+        self._inner.setStyleSheet(f"background:{C['bg2']};")
+        self._vl = QVBoxLayout(self._inner)
+        self._vl.setContentsMargins(12, 10, 12, 10)
+        self._vl.setSpacing(3)
+        self._sa.setWidget(self._inner)
+        self._section_widgets: list = []
+        self._checkboxes: dict = {}  # (section_key, col) → QCheckBox
+
+    def populate(self, tab_idx: int, tab_cols: dict, col_prefs: dict):
+        """Rebuild popup content for the given tab."""
+        for w in self._section_widgets:
+            self._vl.removeWidget(w)
+            w.deleteLater()
+        self._section_widgets.clear()
+        self._checkboxes.clear()
+
+        section_keys = _TAB_SECTION_KEYS[tab_idx] if tab_idx < len(_TAB_SECTION_KEYS) else []
+        has_content = False
+
+        for sk in section_keys:
+            cols = tab_cols.get(sk)
+            if not cols:
+                continue
+            has_content = True
+            lbl = QLabel(_TAB_SECTION_LABELS.get(sk, sk).upper())
+            lbl.setStyleSheet(
+                f"color:{C['t3']}; font-family:'Segoe UI'; font-size:9px; "
+                f"letter-spacing:1px; font-weight:600; background:transparent; padding-top:6px;")
+            self._vl.addWidget(lbl)
+            self._section_widgets.append(lbl)
+
+            sec_prefs = col_prefs.get(sk, {})
+            for col in cols:
+                if col in _ALWAYS_VISIBLE_COLS:
+                    continue
+                visible = sec_prefs.get(col, True)
+                cb = QCheckBox(col)
+                cb.setChecked(visible)
+                cb.setStyleSheet(self._CB_SS)
+                cb.toggled.connect(lambda checked, s=sk, c=col: self.changed.emit(s, c, checked))
+                self._vl.addWidget(cb)
+                self._section_widgets.append(cb)
+                self._checkboxes[(sk, col)] = cb
+
+            sep = QFrame()
+            sep.setFixedHeight(1)
+            sep.setStyleSheet(f"background:{C['bdr']}; margin:3px 0;")
+            self._vl.addWidget(sep)
+            self._section_widgets.append(sep)
+
+        if not has_content:
+            lbl = QLabel("Navigate to a tab to configure columns")
+            lbl.setStyleSheet(
+                f"color:{C['t3']}; font-family:'Segoe UI'; font-size:11px; "
+                f"background:transparent; padding:6px 0;")
+            self._vl.addWidget(lbl)
+            self._section_widgets.append(lbl)
+
+        self._inner.adjustSize()
+        h = min(self._inner.sizeHint().height() + 20, 520)
+        w = max(self._inner.sizeHint().width() + 20, 190)
+        self.resize(w, h)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Reusable section wrapper  (title bar + StatsTable)
@@ -4803,12 +5087,67 @@ class GameBanner(QFrame):
 # Combo box with hamburger (☰) indicator
 # ═══════════════════════════════════════════════════════════════════════════════
 class _MenuComboBox(QComboBox):
-    """QComboBox that draws a 3-line hamburger icon in the drop-down area."""
+    """QComboBox drawn entirely as a button matching _HamburgerButton — transparent, dim, hamburger right."""
+    def showPopup(self):
+        """Position the popup directly below the button, never overlapping it."""
+        super().showPopup()
+        popup = self.view().window()
+        pos = self.mapToGlobal(QPoint(0, self.height() + 4))
+        popup.move(pos)
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        is_active = self.underMouse() or self.view().isVisible()
+
+        bg_col  = QColor(C["bg3"]) if is_active else QColor(0, 0, 0, 0)
+        bdr_col = QColor(C["bdrl"]) if is_active else QColor(C["bdr"])
+        txt_col = QColor(C["t1"])   if is_active else QColor(C["t3"])
+
+        r = self.rect()
+
+        # background
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(bg_col))
+        p.drawRoundedRect(r, 3, 3)
+
+        # border — disable AA so 1px strokes sit cleanly on the pixel grid
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        pen = QPen(bdr_col, 1)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.drawRoundedRect(QRectF(r).adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # text
+        font = QFont("Segoe UI")
+        font.setPixelSize(10)
+        font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1)
+        p.setFont(font)
+        p.setPen(QPen(txt_col))
+        p.drawText(r.adjusted(10, 0, -26, 0),
+                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self.currentText().upper())
+
+        # hamburger icon
+        p.setPen(QPen(txt_col, 1.2))
+        x = self.width() - 16
+        cy = self.height() / 2
+        w = 8
+        for dy in (-3, 0, 3):
+            p.drawLine(int(x), int(cy + dy), int(x + w), int(cy + dy))
+
+        p.end()
+
+
+class _HamburgerButton(QPushButton):
+    """QPushButton with the same 3-line hamburger icon as _MenuComboBox, drawn on the right."""
     def paintEvent(self, event):
         super().paintEvent(event)
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setPen(QPen(QColor(C["t3"]), 1.2))
+        is_active = self.underMouse() or self.isDown()
+        p.setPen(QPen(QColor(C["t1"] if is_active else C["t3"]), 1.2))
         x = self.width() - 16
         cy = self.height() / 2
         w = 8
@@ -4849,6 +5188,11 @@ class GameDetailPanel(QWidget):
         self._inner_stack = None
         self._pending_data = None
         self._built_tabs = set()
+        self._tab_cols = {}
+        # Close any open column picker (stale columns)
+        picker = getattr(self, '_col_picker', None)
+        if picker and not _is_deleted(picker):
+            picker.hide()
         for attr in ('_team_stack', '_pit_stack', '_br_stack', '_bvp_stack', '_bullpen_stack',
                       '_br_tables', '_bvp_tables'):
             try:
@@ -5076,16 +5420,27 @@ class GameDetailPanel(QWidget):
 
     def _build_filter_bar(self, away, home):
         """Create the filter bar and insert it above the inner stack."""
-        self.season_cb = _MenuComboBox()
-        self.season_cb.addItem(str(dt.date.today().year))
-        self.matchup_cb = _MenuComboBox()
-        self.matchup_cb.addItems(["Both", "RHP", "LHP"])
-        self.window_cb = _MenuComboBox()
-        self.window_cb.addItems(["All Games", "Last 5 Games", "Last 10 Games", "Last 15 Games", "Last 30 Games"])
+        _item_font = QFont("Segoe UI")
+        _item_font.setPixelSize(11)
+        _item_font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1)
+
+        def _make_cb(items):
+            cb = _MenuComboBox()
+            for txt in items:
+                cb.addItem(txt)
+                idx = cb.model().index(cb.count() - 1, 0)
+                cb.model().setData(idx, _item_font, Qt.ItemDataRole.FontRole)
+            return cb
+
+        self.season_cb = _make_cb([str(dt.date.today().year)])
+        self.matchup_cb = _make_cb(["Both", "RHP", "LHP"])
+        self.window_cb = _make_cb(["All Games", "Last 5 Games", "Last 10 Games", "Last 15 Games", "Last 30 Games"])
 
         for cb in (self.season_cb, self.matchup_cb, self.window_cb):
             cb.setFixedHeight(28)
+            cb.setFont(_item_font)
             cb.setStyleSheet(_CB_STYLE)
+            cb.view().setFont(_item_font)
             cb.view().setMinimumWidth(150)
             container = cb.view().window()
             container.setWindowFlags(
@@ -5095,9 +5450,9 @@ class GameDetailPanel(QWidget):
             container.setStyleSheet("background:transparent; border:none; margin:0; padding:0;")
             cb.view().setAutoFillBackground(True)
             cb.view().setStyleSheet(_CB_VIEW_STYLE)
-        self.season_cb.setMinimumWidth(46)
-        self.matchup_cb.setMinimumWidth(40)
-        self.window_cb.setMinimumWidth(80)
+        self.season_cb.setMinimumWidth(70)
+        self.matchup_cb.setMinimumWidth(66)
+        self.window_cb.setMinimumWidth(100)
         self.season_cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.matchup_cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self.window_cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
@@ -5131,6 +5486,17 @@ class GameDetailPanel(QWidget):
         fhl.addWidget(self.matchup_cb)
         fhl.addWidget(mk_label("Time", color=C['t3'], size=10))
         fhl.addWidget(self.window_cb)
+
+        self._cols_btn = _HamburgerButton("COLS")
+        self._cols_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cols_btn.setFixedHeight(28)
+        self._cols_btn.setStyleSheet(
+            f"QPushButton {{ background:transparent; color:{C['t3']}; "
+            f"border:1px solid {C['bdr']}; border-radius:3px; "
+            f"padding:4px 24px 4px 10px; font-family:'Segoe UI'; font-size:10px; letter-spacing:1px; }}"
+            f"QPushButton:hover {{ background:{C['bg3']}; color:{C['t1']}; border-color:{C['bdrl']}; }}")
+        self._cols_btn.clicked.connect(self._open_col_picker)
+        fhl.addWidget(self._cols_btn)
 
         self._vl.addWidget(filt_hdr)
 
@@ -5247,6 +5613,7 @@ class GameDetailPanel(QWidget):
             bv.addWidget(self._team_stack)
             bv.addStretch()
             self._bat_bv = bv
+            self._tab_cols['batting'] = bat_cols
             inner.insertWidget(idx, self._scroll_page(bat_w))
 
         elif idx == 1:
@@ -5267,6 +5634,7 @@ class GameDetailPanel(QWidget):
             self._pit_stack.setFixedHeight(PIT_SECTION_H)
             self._pit_cols = pit_cols
             self._pit_hi = pit_hi
+            self._tab_cols['pitching'] = pit_cols
             pv.addWidget(self._pit_stack)
             pv.addStretch()
             inner.insertWidget(idx, self._scroll_page(pit_w))
@@ -5331,6 +5699,10 @@ class GameDetailPanel(QWidget):
             self._br_stack.setCurrentIndex(0)
             brl.addWidget(self._br_stack)
             brl.addStretch()
+            if br_data:
+                self._tab_cols['br_pitcher'] = br_data['pit_cols']
+                self._tab_cols['br_catcher'] = br_data['cat_cols']
+                self._tab_cols['br_runners'] = br_data['br_cols']
             inner.insertWidget(idx, self._scroll_page(br_w))
 
         elif idx == 3:
@@ -5399,7 +5771,7 @@ class GameDetailPanel(QWidget):
                         "[ SINCE 2021 ]",
                         ["POS", "PLAYER", "PA", "AVG", "ISO", "K%", "BB%",
                          "H", "1B", "2B", "3B", "HR", "R", "RBI", "TB",
-                         "Brl%", "Pull%", "EV", "MaxEV", "AVG LA"], [], {3, 4})
+                         "Brl%", "PullAir%", "EV50", "MaxEV", "FB%"], [], {3, 4})
                     svl.addWidget(sec); side_tables.append(sec._table)
                 svl.addStretch()
                 self._bvp_stack.addWidget(side_w)
@@ -5408,6 +5780,12 @@ class GameDetailPanel(QWidget):
             self._bvp_stack.setCurrentIndex(0)
             bvl.addWidget(self._bvp_stack)
             bvl.addStretch()
+            if bvp_data:
+                self._tab_cols['bvp_pitcher'] = bvp_data['pit_cols']
+                self._tab_cols['bvp_batting'] = bvp_data['bat_cols']
+                self._tab_cols['bvp_br_pitcher'] = bvp_data['pit_br_cols']
+                self._tab_cols['bvp_br_catcher'] = bvp_data['cat_br_cols']
+                self._tab_cols['bvp_br_runners'] = bvp_data['br_cols']
             inner.insertWidget(idx, self._scroll_page(bvp_w))
 
         elif idx == 4:
@@ -5439,6 +5817,7 @@ class GameDetailPanel(QWidget):
             self._bullpen_stack.setCurrentIndex(0)
             self._bp_cols = bp_cols if bp_data else bp_cols
             self._bp_hi = bp_hi if bp_data else bp_hi
+            self._tab_cols['bullpen'] = bp_cols
             bpv.addWidget(self._bullpen_stack)
             bpv.addStretch()
             inner.insertWidget(idx, self._scroll_page(bp_w))
@@ -5455,6 +5834,100 @@ class GameDetailPanel(QWidget):
             stack = getattr(self, stack_name, None)
             if stack and not _is_deleted(stack) and stack.currentIndex() != toggle_idx:
                 stack.setCurrentIndex(toggle_idx)
+        # Apply saved column visibility prefs to this freshly-built tab
+        self._apply_col_prefs_to_tab(idx)
+
+    # ── Column picker methods ────────────────────────────────────────────────
+
+    def _open_col_picker(self):
+        """Toggle the column picker popup."""
+        try:
+            if _is_deleted(self):
+                return
+            picker = getattr(self, '_col_picker', None)
+            if picker is None or _is_deleted(picker):
+                picker = _ColPickerPopup()
+                picker.changed.connect(self._on_col_pref_changed)
+                self._col_picker = picker
+            if picker.isVisible():
+                picker.hide()
+                return
+            tab_idx = getattr(self, '_current_subnav_idx', 0)
+            picker.populate(tab_idx, getattr(self, '_tab_cols', {}), _COL_PREFS)
+            btn = self._cols_btn
+            btn_global = btn.mapToGlobal(QPoint(0, 0))
+            screen = QApplication.screenAt(btn_global)
+            if screen is None:
+                screen = QApplication.primaryScreen()
+            sg = screen.availableGeometry()
+            pw, ph = picker.width(), picker.height()
+            # Prefer below the button; flip above if not enough room
+            x = btn_global.x()
+            y_below = btn_global.y() + btn.height() + 4
+            y_above = btn_global.y() - ph - 4
+            y = y_below if y_below + ph <= sg.bottom() else y_above
+            # Clamp horizontally so popup stays on screen
+            x = max(sg.left(), min(x, sg.right() - pw))
+            y = max(sg.top(), y)
+            picker.move(x, y)
+            picker.show()
+        except Exception:
+            log.exception("_open_col_picker")
+
+    def _on_col_pref_changed(self, section_key: str, col_name: str, visible: bool):
+        """Save a changed column pref and immediately apply to current tables."""
+        if section_key not in _COL_PREFS:
+            _COL_PREFS[section_key] = {}
+        _COL_PREFS[section_key][col_name] = visible
+        _save_col_prefs(_COL_PREFS)
+        self._apply_col_prefs_to_tab(getattr(self, '_current_subnav_idx', 0))
+
+    def _apply_col_prefs_to_tab(self, idx: int):
+        """Apply saved column visibility prefs to all tables in the given tab."""
+        def _apply(table, section_key):
+            try:
+                if not table or _is_deleted(table):
+                    return
+                prefs = _COL_PREFS.get(section_key, {})
+                hidden = {col for col, vis in prefs.items() if not vis}
+                table.apply_col_visibility(hidden)
+            except (RuntimeError, SystemError):
+                pass
+
+        def _stack_tables(stack):
+            if not stack or _is_deleted(stack):
+                return
+            for i in range(stack.count()):
+                w = stack.widget(i)
+                if w and hasattr(w, '_table') and not _is_deleted(w._table):
+                    yield w._table
+
+        try:
+            if idx == 0:
+                for t in _stack_tables(getattr(self, '_team_stack', None)):
+                    _apply(t, 'batting')
+            elif idx == 1:
+                for t in _stack_tables(getattr(self, '_pit_stack', None)):
+                    _apply(t, 'pitching')
+            elif idx == 2:
+                br_tables = getattr(self, '_br_tables', None) or []
+                for side in br_tables:
+                    if len(side) > 0: _apply(side[0], 'br_pitcher')
+                    if len(side) > 1: _apply(side[1], 'br_catcher')
+                    if len(side) > 2: _apply(side[2], 'br_runners')
+            elif idx == 3:
+                bvp_tables = getattr(self, '_bvp_tables', None) or []
+                bvp_keys = ['bvp_pitcher', 'bvp_batting', 'bvp_br_pitcher',
+                            'bvp_br_catcher', 'bvp_br_runners']
+                for side in bvp_tables:
+                    for k_idx, sk in enumerate(bvp_keys):
+                        if k_idx < len(side):
+                            _apply(side[k_idx], sk)
+            elif idx == 4:
+                for t in _stack_tables(getattr(self, '_bullpen_stack', None)):
+                    _apply(t, 'bullpen')
+        except Exception:
+            log.exception("_apply_col_prefs_to_tab")
 
     def _on_filters_changed(self, *args):
         """Unified handler for filter change events — refresh only the active tab."""
@@ -5487,6 +5960,11 @@ class GameDetailPanel(QWidget):
             # Lazy-build the tab if it hasn't been built yet
             self._build_tab(idx)
             _fade_switch(self._inner_stack, idx)
+
+            # Update column picker contents if it's open
+            picker = getattr(self, '_col_picker', None)
+            if picker and not _is_deleted(picker) and picker.isVisible():
+                picker.populate(idx, getattr(self, '_tab_cols', {}), _COL_PREFS)
 
             # Reset all filters to defaults when switching subpages
             if idx != prev:
@@ -5668,11 +6146,13 @@ class GameDetailPanel(QWidget):
                 home_sec = table_section(self._home_title, "[ ©SA ]", new_cols, new_home, new_hi)
                 stack.addWidget(away_sec)
                 stack.addWidget(home_sec)
+            self._tab_cols['batting'] = new_cols
             stack.setCurrentIndex(cur_idx)
             cur_w = stack.currentWidget()
             if cur_w:
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
+            self._apply_col_prefs_to_tab(0)
         except Exception:
             log.exception("_refresh_lineups")
 
@@ -5732,9 +6212,11 @@ class GameDetailPanel(QWidget):
                     f"{away_name}  PITCHING", "[ ©SA ]", new_cols, new_away, new_hi, 140))
                 stack.addWidget(table_section(
                     f"{home_name}  PITCHING", "[ ©SA ]", new_cols, new_home, new_hi, 140))
+            self._tab_cols['pitching'] = new_cols
             stack.setCurrentIndex(cur_idx)
             stack.setFixedHeight(PIT_SECTION_H)
             stack.updateGeometry()
+            self._apply_col_prefs_to_tab(1)
         except Exception:
             log.exception("_refresh_pitching")
 
@@ -5774,11 +6256,13 @@ class GameDetailPanel(QWidget):
                     f"{away_name}  BULLPEN", "[ ©SA ]", new_cols, new_away, new_hi, 140))
                 stack.addWidget(table_section(
                     f"{home_name}  BULLPEN", "[ ©SA ]", new_cols, new_home, new_hi, 140))
+            self._tab_cols['bullpen'] = new_cols
             stack.setCurrentIndex(cur_idx)
             cur_w = stack.currentWidget()
             if cur_w:
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
+            self._apply_col_prefs_to_tab(4)
         except Exception:
             log.exception("_apply_bullpen_data")
 
@@ -5935,6 +6419,7 @@ class GameDetailPanel(QWidget):
                 if cur_w:
                     stack.setFixedHeight(cur_w.sizeHint().height())
                 stack.updateGeometry()
+                self._apply_col_prefs_to_tab(2)
                 return
 
             # Full rebuild if no existing tables to recycle
@@ -5984,6 +6469,10 @@ class GameDetailPanel(QWidget):
             if cur_w:
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
+            self._tab_cols['br_pitcher'] = br_data['pit_cols']
+            self._tab_cols['br_catcher'] = br_data['cat_cols']
+            self._tab_cols['br_runners'] = br_data['br_cols']
+            self._apply_col_prefs_to_tab(2)
         except Exception:
             log.exception("_apply_br_data")
 
@@ -6027,6 +6516,7 @@ class GameDetailPanel(QWidget):
                 if cur_w:
                     stack.setFixedHeight(cur_w.sizeHint().height())
                 stack.updateGeometry()
+                self._apply_col_prefs_to_tab(3)
                 return
 
             # Full rebuild if no existing tables to recycle
@@ -6098,6 +6588,12 @@ class GameDetailPanel(QWidget):
             if cur_w:
                 stack.setFixedHeight(cur_w.sizeHint().height())
             stack.updateGeometry()
+            self._tab_cols['bvp_pitcher'] = bvp_data.get('pit_cols', [])
+            self._tab_cols['bvp_batting'] = bvp_data.get('bat_cols', [])
+            self._tab_cols['bvp_br_pitcher'] = bvp_data.get('pit_br_cols', [])
+            self._tab_cols['bvp_br_catcher'] = bvp_data.get('cat_br_cols', [])
+            self._tab_cols['bvp_br_runners'] = bvp_data.get('br_cols', [])
+            self._apply_col_prefs_to_tab(3)
         except Exception:
             log.exception("_apply_bvp_data")
 
@@ -6700,6 +7196,11 @@ class SeamStatsApp(QMainWindow):
         self._score_timer.setInterval(30_000)  # 30s initial delay; drops to 5s after first poll
         self._score_timer.timeout.connect(self._poll_scores)
         self._score_timer.start()
+
+        # If we loaded GAMES from disk cache, kick off a live refresh right away
+        # (fires after the event loop starts so the window is already visible)
+        if _SCHEDULE_NEEDS_REFRESH:
+            QTimer.singleShot(800, self._poll_scores)
 
         # Play-by-play notifier
         self._plays_notifier = _PlaysNotifier()
@@ -7834,8 +8335,10 @@ class SeamStatsApp(QMainWindow):
             on_click=None,
             date=self._selected_date))
         self._stack.addWidget(QWidget())  # Lineups placeholder (actual view is IDX_GAME)
-        self._park_page = ParkFactorsPage(date_str=self._selected_date.isoformat())
-        self._stack.addWidget(self._park_page)
+        # Park Factors page is built lazily on first visit to avoid a QThread
+        # start and weather fetch network call at app startup.
+        self._park_page = None
+        self._stack.addWidget(QWidget())  # park placeholder
 
         # Fetch leaderboard data in background thread
         class _LBNotifier(QObject):
@@ -7867,7 +8370,7 @@ class SeamStatsApp(QMainWindow):
                     bat_no_min = _DM.get_leaderboards_batch(
                         _bat, ["hits", "home_runs", "rbis", "singles", "doubles", "triples"], pt)
                     bat_with_min = _DM.get_leaderboards_batch(
-                        _bat, ["avg", "barrel_pct", "avg_ev"], pt,
+                        _bat, ["avg", "barrel_pct", "ev50"], pt,
                         min_col=_min_pa[0], min_val=_min_pa[1])
                     hit_lbs = [
                         ("HITS (H)",       bat_no_min["hits"],       _fmt_int),
@@ -7878,7 +8381,7 @@ class SeamStatsApp(QMainWindow):
                         ("DOUBLES (2B)",   bat_no_min["doubles"],    _fmt_int),
                         ("TRIPLES (3B)",   bat_no_min["triples"],    _fmt_int),
                         ("BARREL %",       bat_with_min["barrel_pct"], _fmt_pct),
-                        ("EXIT VELO",      bat_with_min["avg_ev"],   _fmt_spd),
+                        ("EV50",           bat_with_min["ev50"],     _fmt_spd),
                         ("HIT STREAK",     _DM.get_streak_leaderboard(pt, 'is_hit'),     _fmt_streak, "GAMES"),
                         ("HR STREAK",      _DM.get_streak_leaderboard(pt, 'is_home_run'), _fmt_streak, "GAMES"),
                         ("HR + SB GAMES",  _DM.get_hr_sb_game_leaderboard(pt),            _fmt_streak, "GAMES"),
@@ -7948,9 +8451,17 @@ class SeamStatsApp(QMainWindow):
             if not self._lb_fetched and idx in (self.IDX_HIT, self.IDX_PITCH, self.IDX_BR):
                 self._lb_fetched = True
                 _bg_pool.submit(self._fetch_lb)
-            # Refresh weather when navigating back to Park Factors
-            if idx == self.IDX_PARK and hasattr(self, '_park_page') and self._park_page:
-                self._park_page.refresh_weather()
+            # Lazy-build and refresh Park Factors page on first visit
+            if idx == self.IDX_PARK:
+                if self._park_page is None:
+                    # First visit: build and replace placeholder
+                    self._park_page = ParkFactorsPage(date_str=self._selected_date.isoformat())
+                    placeholder = self._stack.widget(self.IDX_PARK)
+                    self._stack.removeWidget(placeholder)
+                    placeholder.deleteLater()
+                    self._stack.insertWidget(self.IDX_PARK, self._park_page)
+                elif hasattr(self._park_page, 'refresh_weather'):
+                    self._park_page.refresh_weather()
             # Lineups tab → load first game and show game detail
             if idx == self.IDX_LINEUP:
                 if (hasattr(self, '_games') and self._games) or GAMES:

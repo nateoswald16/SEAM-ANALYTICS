@@ -11,6 +11,7 @@ import logging
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 
+import numpy as np
 import pandas as pd
 import pybaseball
 import _app_paths
@@ -221,7 +222,7 @@ def get_player_stats(player_id, is_pitcher=False, calc_db=None):
                        singles, doubles, triples, home_runs,
                        runs, rbis, total_bases, walks, strikeouts,
                        avg, obp, slg, k_pct, bb_pct, iso,
-                       barrel_pct, pull_pct, avg_launch_angle, avg_ev, max_ev
+                       barrel_pct, pulled_air_pct, fb_pct, ev50, max_ev
                 FROM calculated_batting_stats
                 WHERE player_id = ? AND matchup = 'all' AND window = 'season'
                 ORDER BY season DESC
@@ -296,19 +297,47 @@ def _fmt1(v):
 # Hit direction data
 # ═════════════════════════════════════════════════════════════════════
 
+def _compute_hit_zones(rows):
+    """Vectorized 5-zone spray computation from list of (hc_x, hc_y) tuples."""
+    if not rows:
+        return [0.0] * 5, 0
+    arr = np.array(rows, dtype=float)
+    hc_x = arr[:, 0]
+    hc_y = arr[:, 1]
+    spray = np.degrees(np.arctan2(hc_x - 125.42, 198.27 - hc_y))
+    mask = (spray >= -45) & (spray <= 45)
+    spray = spray[mask]
+    zones = np.zeros(5, dtype=int)
+    zones[0] = int(np.sum(spray < -34))
+    zones[1] = int(np.sum((spray >= -34) & (spray < -12)))
+    zones[2] = int(np.sum((spray >= -12) & (spray <= 12)))
+    zones[3] = int(np.sum((spray > 12) & (spray <= 34)))
+    zones[4] = int(np.sum(spray > 34))
+    total = int(zones.sum())
+    pcts = [z / total for z in zones] if total else [0.0] * 5
+    return pcts, total
+
+
 def get_hit_zones(player_id, p_throws_filter=None, vs_pitcher_id=None,
-                  since_season=None, db_path=None):
+                  since_season=None, db_path=None, conn=None):
     """Compute 5-zone hit direction percentages from raw plate appearances.
 
     Zones map to field positions left-to-right as seen from home plate:
       [far_left, left_center, center, right_center, far_right].
     Returns dict: {'zones': [5 floats 0-1], 'total': int}.
+
+    *conn* — optional existing sqlite3 connection to reuse (not closed by this fn).
     """
     db_path = db_path or _app_paths.RAW_DB
-    if not os.path.exists(db_path):
-        return None
+    _own_conn = conn is None
+    if _own_conn:
+        if not os.path.exists(db_path):
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+        except Exception:
+            return None
     try:
-        conn = sqlite3.connect(db_path, timeout=10)
         cur = conn.cursor()
         where = ["batter_id = ?", "hc_x IS NOT NULL", "hc_y IS NOT NULL",
                  "bb_type IN ('ground_ball','fly_ball','line_drive')"]
@@ -326,45 +355,36 @@ def get_hit_zones(player_id, p_throws_filter=None, vs_pitcher_id=None,
             f"SELECT hc_x, hc_y FROM plate_appearances "
             f"WHERE {' AND '.join(where)}", params)
         rows = cur.fetchall()
-        conn.close()
         if not rows:
             return {'zones': [0.0] * 5, 'total': 0}
-        zones = [0, 0, 0, 0, 0]
-        for hc_x, hc_y in rows:
-            # Raw spray angle: negative = left field, positive = right field
-            spray = math.degrees(math.atan2(hc_x - 125.42, 198.27 - hc_y))
-            if spray < -45 or spray > 45:
-                continue
-            if spray < -34:
-                zones[0] += 1      # far left field
-            elif spray < -12:
-                zones[1] += 1      # left-center
-            elif spray <= 12:
-                zones[2] += 1      # center
-            elif spray <= 34:
-                zones[3] += 1      # right-center
-            else:
-                zones[4] += 1      # far right field
-        total = sum(zones)
-        pcts = [z / total for z in zones] if total else [0.0] * 5
+        pcts, total = _compute_hit_zones(rows)
         return {'zones': pcts, 'total': total}
     except Exception:
         log.exception("get_hit_zones")
         return None
+    finally:
+        if _own_conn and conn:
+            conn.close()
 
 
 def get_pitcher_hit_zones(pitcher_id, stand_filter=None,
-                          since_season=None, db_path=None):
+                          since_season=None, db_path=None, conn=None):
     """Compute 5-zone hit direction percentages for hits *allowed* by a pitcher.
 
     Same zone logic as get_hit_zones but queries by pitcher_id.
     stand_filter: 'L' or 'R' to filter by batter handedness.
+    *conn* — optional existing sqlite3 connection to reuse (not closed by this fn).
     """
     db_path = db_path or _app_paths.RAW_DB
-    if not os.path.exists(db_path):
-        return None
+    _own_conn = conn is None
+    if _own_conn:
+        if not os.path.exists(db_path):
+            return None
+        try:
+            conn = sqlite3.connect(db_path, timeout=10)
+        except Exception:
+            return None
     try:
-        conn = sqlite3.connect(db_path, timeout=10)
         cur = conn.cursor()
         where = ["pitcher_id = ?", "hc_x IS NOT NULL", "hc_y IS NOT NULL",
                  "bb_type IN ('ground_ball','fly_ball','line_drive')"]
@@ -379,30 +399,16 @@ def get_pitcher_hit_zones(pitcher_id, stand_filter=None,
             f"SELECT hc_x, hc_y FROM plate_appearances "
             f"WHERE {' AND '.join(where)}", params)
         rows = cur.fetchall()
-        conn.close()
         if not rows:
             return {'zones': [0.0] * 5, 'total': 0}
-        zones = [0, 0, 0, 0, 0]
-        for hc_x, hc_y in rows:
-            spray = math.degrees(math.atan2(hc_x - 125.42, 198.27 - hc_y))
-            if spray < -45 or spray > 45:
-                continue
-            if spray < -34:
-                zones[0] += 1
-            elif spray < -12:
-                zones[1] += 1
-            elif spray <= 12:
-                zones[2] += 1
-            elif spray <= 34:
-                zones[3] += 1
-            else:
-                zones[4] += 1
-        total = sum(zones)
-        pcts = [z / total for z in zones] if total else [0.0] * 5
+        pcts, total = _compute_hit_zones(rows)
         return {'zones': pcts, 'total': total}
     except Exception:
         log.exception("get_pitcher_hit_zones")
         return None
+    finally:
+        if _own_conn and conn:
+            conn.close()
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -1887,7 +1893,7 @@ class PlayerProfileDialog(QDialog):
         row2.addWidget(_stat_tile("K%", _fmt_pct(s.get('k_pct'))))
         row2.addWidget(_stat_tile("BB%", _fmt_pct(s.get('bb_pct'))))
         row2.addWidget(_stat_tile("Brl%", _fmt_pct(s.get('barrel_pct'))))
-        row2.addWidget(_stat_tile("EV", _fmt1(s.get('avg_ev'))))
+        row2.addWidget(_stat_tile("EV50", _fmt1(s.get('ev50'))))
         self._stats_container.addLayout(row2)
 
     def _build_pitching_stats(self, s):

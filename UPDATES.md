@@ -4,9 +4,125 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
-## v1.2.1 — 2026-04-20
+## v1.2.1 — 2026-04-24
 
-### Park & Weather
+> [!WARNING]
+> **Database Rebuild Required for Existing Users**
+> This update includes schema changes to both `mlb_raw.db` and `mlb_calculated.db`. Users updating from a previous version (not fresh-installing) **must** fully rebuild both databases before use. After the rebuild completes, immediately run **Daily Update** inside the app to ensure all data is fully populated and current. Fresh installs are unaffected.
+
+### Network & Performance Optimizations
+
+- **Faster startup**: schedule fetched from disk cache on repeat same-day launches (~5 ms vs. 300–800 ms network call); live scores refresh in background 800 ms after window appears
+- **Lazy Park Factors page**: weather thread and network call deferred until the tab is first opened
+- **Thread pool reuse**: logo prefetch and handedness fetching reuse module-level pools instead of creating/destroying one per call
+- **Caching improvements**: logo miss-caching, boxscore failure caching, in-flight headshot dedup, and `PRAGMA table_info` results cached per table
+- **Vectorized spray angle math**: `pulled_air_pct` and hit-zone calculations use numpy instead of Python row loops
+- **JSON cache compression**: `_JsonCache` now writes `.json.gz` files; falls back to plain `.json` for migration
+- **NWS grid pre-population**: venue grid endpoints resolved in background at startup so Park Factors cards open without per-card latency
+
+### Filter Bar UI Polish
+
+**Unified Filter Button Styling**
+- Replaced stock QComboBox rendering with fully custom `paintEvent` on `_MenuComboBox` — transparent background, `t3` dim text, 1px `bdr` border, 3px radius; hover/open state switches to `bg3` fill, `bdrl` border, `t1` bright text, matching the COLS button exactly
+- Added `_HamburgerButton` QPushButton subclass that draws the same 3-line hamburger icon on the right side via `paintEvent`; icon color tracks hover/pressed state
+- COLS button converted from `QPushButton("☰  COLS")` to `_HamburgerButton("COLS")` with `padding-right:24px` to clear the icon
+- All filter dropdown items uppercased via `.currentText().upper()` in `paintEvent`
+- Dropdown font set via `QFont.setPixelSize(11)` applied to `cb.setFont()`, `cb.view().setFont()`, and `Qt.ItemDataRole.FontRole` on each model item to guarantee size regardless of Qt delegate path
+- `showPopup()` override on `_MenuComboBox` repositions the popup 4px below the button so it never overlaps the filter bar
+- Border crispness fix: border drawn on `QRectF` inset 0.5px on all sides with `Antialiasing` disabled, putting the 1px stroke exactly on the pixel grid
+- Minimum widths bumped (season: 70px, pitcher: 66px, time: 100px) to prevent text truncation
+
+### Column Visibility Picker
+
+**Configurable Column Customization**
+- Added `☰  COLS` button to the filter bar on all game detail tabs
+- Clicking the button opens a floating popup listing all configurable columns for the active tab, grouped by section (Batting, Pitching, Baserunning, etc.)
+- Each column has a checkbox — unchecking hides that column from the table; preferences persist across sessions in `column_prefs.json`
+- All columns default to visible on first launch
+- Added `COLUMN_PREFS_FILE` path constant to `_app_paths.py`
+- Added module-level `_load_col_prefs()`, `_save_col_prefs()`, `_COL_PREFS` global, `_TAB_SECTION_KEYS`, and `_TAB_SECTION_LABELS` infrastructure
+- Added `StatsTable.apply_col_visibility(hidden_cols)` method — hides/shows columns by name
+- Added `_ColPickerPopup` class: floating `Qt.WindowType.Popup` QFrame with scrollable per-section checkboxes, emits `changed(section_key, col_name, visible)` signal
+- Added `GameDetailPanel._open_col_picker()`, `_on_col_pref_changed()`, `_apply_col_prefs_to_tab()` methods
+- `_build_tab` hooks populate `_tab_cols` for all 5 tabs; `_apply_col_prefs_to_tab` called after each tab build and on every data refresh
+- `_on_subnav_changed` refreshes the open picker when switching tabs
+
+**Column Picker Bug Fixes**
+- Fixed popup opening off-screen: position now clamped to available screen geometry via `QApplication.screenAt()`; opens above button when insufficient room below, clamps right edge to screen
+- Fixed checked checkbox color: indicator now uses orange (`#f07020`) for both fill and border, making checked vs. unchecked immediately distinct
+- Fixed always-visible columns appearing in the picker: `#`, `POS`, `PLAYER`, `PITCHER`, `CATCHER`, `PA`, `IP` are locked — no checkbox shown and they can never be hidden
+- Fixed section label "BATTING" / "PITCHING" etc. rendering with a visible container box: scoped popup `QFrame` border to root element only via `QFrame#colPickerPopup` object name selector
+
+---
+
+### Batting & Pitching Stat Columns
+
+**New `calculated_batting_stats` Columns**
+- `barrel_pct` (Brl%) — barrels (launch speed-angle = 6) / total BBE
+- `pulled_air_pct` (PullAir%) — pulled airballs / all BBE; airball counted when spray angle < −17° on pull side (non-ground-balls only); per-row `stand` field corrects for switch hitters; raw DB formula uses hc_x/hc_y geometry, Statcast pkl preferred when it covers ≥ raw BBE count
+- `ev50` (EV50) — average of top 50% exit velocities by BBE count (replaces simple avg_ev); pkl preferred over raw DB
+- `max_ev` (MaxEV) — max exit velocity on any BBE
+- `fb_pct` (FB%) — fly balls / total BBE (replaces avg launch angle)
+- `hard_hit_pct` (Hard%) — BBE with exit velocity ≥ 95 mph / total BBE
+- `avg_bat_speed` (BatSpd) — average bat speed across top 90% of tracked swings (Statcast methodology); raw DB fallback uses `AVG(bat_speed)` from `plate_appearances`
+- `squared_up_rate` (SqUp%) — fraction of competitive swings (top 90% by bat_speed) where EV ≥ 80% of theoretical max EV (1.23 × bat_speed + 0.23 × plate_speed); plate_speed = release_speed × 0.92; fouls count in denominator but not numerator; bonus inclusion: any ≥60 mph swing producing ≥90 mph EV
+- `blast_rate` (Blast%) — fraction of competitive swings where per-swing sq_pct × 100 + bat_speed ≥ 164; same denominator as `squared_up_rate`
+- `chase_rate` (Chase%) — swings at out-of-zone pitches (zone > 9) / total out-of-zone pitches; Statcast sc_pitches preferred, raw DB zone column fallback
+
+**Batting stat data sources**
+- Counting stats (PA, AB, H, R, RBI, K, BB, etc.) always come from raw DB `plate_appearances` — covers all games regardless of Statcast coverage
+- Batted-ball metrics (barrel%, hard%, fb%, max EV, EV50, PullAir%) use raw DB as baseline; Statcast pkl overrides when it covers ≥ the raw BBE count
+- Bat speed, squared-up, blast, chase use pitch-level `sc_pitches` Statcast data; raw DB `plate_appearances` columns (`bat_speed`, `zone`, `description`) used as fallback
+
+**New `calculated_pitching_stats` Columns**
+- `slg_against` (SLG) — total bases allowed / AB against (AB = PA − BB − SF − HBP)
+- `babip_against` — (H − HR) / (BBE − HR)
+- `whip` — (BB + H) / IP
+- `xoba_against` — mean `estimated_woba_using_speedangle` on BBE; pkl preferred over raw DB
+- `barrel_pct` (Barrel%) — barrels (LSA = 6) / BBE
+- `hard_pct` (Hard%) — BBE with EV ≥ 95 mph / total BBE
+- `ld_pct` (LD%) — line drives / total BBE
+- `soft_pct` — popups / total BBE
+- `gb_pct` (GB%) — ground balls / total BBE
+- `contact_pct` (Contact%) — contacts / swings
+- `zone_pct` (Zone%) — pitches landing in zones 1–9 / all pitches with zone data
+- `avg_velo` (Velo) — mean release speed; sc_pitches preferred, raw DB `release_speed` fallback
+- `top_velo` (Top) — max release speed
+- `swstr_pct` (SwStr%) — swinging strikes / total pitches; sc_pitches preferred, `pitching_appearances` fallback
+- `fp_strike_pct` (F-Strike%) — first-pitch strikes (type S or X) / total first pitches; requires sc_pitches
+
+**Pitcher time windows changed to pitch-count**
+- Windows are now `last100p`, `last200p`, `last300p`, `last500p` (pitches thrown) instead of game-count windows (`last5`, `last10`, etc.)
+- `_last_n_pitches_game_dates_for_pitcher()` resolves pitch-count windows by combining sc_pitches counts with raw `pitching_appearances` estimates for games not yet in pkl
+
+**Calc DB schema bumped v3 → v11 over these changes**
+- v3: added `h_per_9`, `k_per_9`, `bb_per_9` to pitching stats
+- v4: bat speed / squared-up / hard hit / chase rate for batters; SwStr% / GB% / F-Strike% for pitchers
+- v5–v7: pitcher windows migrated to pitch-count; window sizes refined to 100/200/300/500
+- v8: `blast_rate` added; squared-up upgraded to plate_speed formula (release × 0.92) + competitive-swings denominator
+- v9: formula corrections — barrel uses LSA = 6, soft% = popup%, avg_bat_speed = top-90% swings, SLG/BABIP denominators fixed
+- v10: `avg_ev` → `ev50` (top-50% avg), `avg_launch_angle` → `fb_pct` (fly ball rate), `pull_pct` → `pulled_air_pct` (spray-angle airballs / all BBE)
+- v11: forced full rebuild to apply v10 column renames that did not take effect
+
+---
+
+
+
+**Estadio Alfredo Harp Helú — Mexico City (venue 5340)**
+- Added full park profile for the two April 25/27 MLB games at Estadio Alfredo Harp Helú
+- Venue rated `137` in `VENUE_PARK_FACTORS` — more extreme than Coors (113) per altitude physics; ball flies 7–8% farther than MLB standard at 7,349 ft (2,200 ft above Coors)
+- Dimensions: 325 ft foul poles / 375 ft gaps / 400 ft CF — half-circle wall shape; larger total OF area than a typical park but plays short due to altitude
+- Artificial turf, 8 ft uniform walls, 20,062-seat compact venue (foul territory rating 2)
+- All 13 `park_widget.py` data tables populated: `VENUE_PARK_FACTORS`, `VENUE_HIT_FACTORS`, `VENUE_DIMENSIONS`, `VENUE_WALL_HEIGHTS`, `VENUE_WX_PROFILE`, `_VENUE_ENDEMIC_WIND_CARRY`, `_VENUE_ENDEMIC_1B`, `_VENUE_ENDEMIC_XBH`, `_VENUE_TEMP_REF_OFFSET`, `_VENUE_MONTHLY_NEUTRAL`, `_VENUE_DAY_NIGHT`, `_VENUE_SKY_MULT`, `_VENUE_RAIN_MULT`
+- Physics test results (neutral April game, S0+S1A): HR +35.7 pct-pts (PF ~136), XBH +23.6 pct-pts, 1B +22.9 pct-pts; HR advantage over Coors: +39.6 pct-pts
+
+**Mexico City Weather Pipeline Fix (`park_factors.py`)**
+- MLB Stats API returns `None` for all coordinates on venue 5340 (no lat/lon/elevation/azimuth)
+- Added `_VENUE_COORD_OVERRIDE` dict to `park_factors.py` with static fallback coordinates for API-deficient venues
+- Venue 5340 entry: `(19.3618, -99.1567, 7349 ft, 45°)` — NWS will 404 (US-only) and fall through to Open-Meteo as intended
+- Confirmed live Open-Meteo fetch working: 781 hPa surface pressure, 0% precip, 64% RH
+
+---
 
 **Wall-Height Dimension Splits**
 - Added `VENUE_WALL_HEIGHTS` dict with effective pull-zone wall heights (LF wall, RF wall) for all 30 MLB venues extracted from BallparkPal stadium diagrams
@@ -24,12 +140,6 @@ All notable changes to Seam Analytics are documented here.
 **Fixed Dome Roof Check Bug**
 - `_compute_hits_rating()` now checks `roof_status in ("dome", "closed", "Closed")` instead of `== "Closed"`
 - Fixed Tropicana Field showing uneven LHB/RHB splits when it should be symmetric (fixed dome)
-
-**BPP Calibration Round 2 (Total Deviation 271→20)**
-- Park Factors (HR): Angel 103→108, Coors 121→126, Sutter 132→121
-- Weather Profiles: Nationals temp neg 2.40→0.95, Wrigley temp neg 1.80→1.05 + pressure 1.00→0.60, Progressive temp neg 1.45→0.80 + pressure 1.00→0.20, Sutter wind 2.20→1.00
-- Hit Factors (XBH/1B): Adjusted 12 parks — Fenway 2B 1.18→1.29 (Green Monster doubles), Coors 2B 1.31→1.16, Yankee 2B 0.88→1.01, PNC 2B 1.10→1.00, Target 2B 1.03→1.11, Citizens Bank 2B 0.97→1.02/1B 0.98→1.04, loanDepot 1B 0.99→1.07, Angel 2B 0.91→0.94, Progressive 2B 1.03→0.99/1B 0.94→1.00, T-Mobile 2B 0.85→0.82/1B 0.94→0.91, Wrigley 1B 1.01→1.04
-- Final accuracy against BPP: Perfect (≤2): 13, Close (3-5): 2, Off (>5): 0
 
 ---
 

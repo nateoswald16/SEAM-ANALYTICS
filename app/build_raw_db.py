@@ -30,6 +30,9 @@ import requests
 from pybaseball import statcast
 
 import _app_paths
+from _http_utils import create_http_session as _create_http_session
+
+_http = _create_http_session()
 
 ROOT = _app_paths.APP_DIR
 DB_PATH = _app_paths.RAW_DB
@@ -128,6 +131,9 @@ def create_db(db_path: str = DB_PATH):
 
     conn.close()
 
+    # Invalidate schema column cache since migrations may have added columns
+    clear_table_columns_cache()
+
     # Write version marker file for installer version checks
     version_file = db_path + '.schema_version'
     with open(version_file, 'w') as f:
@@ -152,6 +158,14 @@ _VALID_PA_COLS = frozenset({
 _VALID_PA_IDCOLS = frozenset({
     'pitcher_id', 'batter_id',
 })
+
+# Module-level cache for PRAGMA table_info results — invalidated by clear_table_columns_cache()
+_TABLE_COLUMNS_CACHE: Dict[str, List[str]] = {}
+
+
+def clear_table_columns_cache():
+    """Invalidate the table columns cache (call after schema migrations)."""
+    _TABLE_COLUMNS_CACHE.clear()
 
 
 def fetch_schedule(start_date: str, end_date: str, only_completed: bool = False) -> List[Dict[str, Any]]:
@@ -197,7 +211,7 @@ def fetch_schedule(start_date: str, end_date: str, only_completed: bool = False)
 
 def fetch_game_feed(game_pk: int) -> Dict[str, Any]:
     url = GAME_FEED_URL.format(gamePk=game_pk)
-    r = requests.get(url, timeout=30)
+    r = _http.get(url, timeout=30)
     r.raise_for_status()
     return r.json()
 
@@ -205,8 +219,13 @@ def fetch_game_feed(game_pk: int) -> Dict[str, Any]:
 def get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:
     if table not in _VALID_TABLES:
         raise ValueError(f"Invalid table name: {table}")
+    cached = _TABLE_COLUMNS_CACHE.get(table)
+    if cached is not None:
+        return cached
     cur = conn.execute(f"PRAGMA table_info({table})")
-    return [row[1] for row in cur.fetchall()]
+    cols = [row[1] for row in cur.fetchall()]
+    _TABLE_COLUMNS_CACHE[table] = cols
+    return cols
 
 
 def insert_rows(conn: sqlite3.Connection, table: str, rows: List[Dict[str, Any]], commit: bool = True):
@@ -631,6 +650,10 @@ def parse_stolen_events(feed: Dict[str, Any], season: int) -> List[Dict[str, Any
                     is_pickoff = True
 
             if not is_pickoff:
+                continue
+
+            # Only store confirmed pickoffs (runner put out), not mere attempts
+            if not details.get('isOut', False):
                 continue
 
             # Identify runner from playEvent players or matchup

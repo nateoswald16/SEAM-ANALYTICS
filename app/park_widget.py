@@ -3,7 +3,7 @@
 Weather Detail Widget — Seam Analytics
 
 Expanded weather card with stadium outline, wind arrows, HR carry ring,
-hourly switcher, HR rating, wind insight, and conditions table.
+hourly switcher, HR rating, weather insight, and conditions table.
 
 Designed as a plug-in replacement for ParkWeatherCard: accepts the same
 ``data: dict`` from the weather cache.
@@ -89,6 +89,73 @@ _TEAM_TO_STADIUM = {
 
 # MLB API → app abbreviation normalisation (logo filenames, CSV, etc.)
 _ABBR_NORM: dict[str, str] = {"AZ": "ARI"}
+
+
+def _make_arc_segments(lf_ft: float, cf_ft: float,
+                       foul_ang_deg: float = 45.6,
+                       track_ft: float = 20.0,
+                       inf_outer_ft: float = 195.0) -> dict:
+    """Generic circular-arc stadium segments for a symmetric park.
+
+    Fits a circle through the two foul poles (at *lf_ft* distance) and
+    the CF wall (*cf_ft* distance), then generates all segment dicts in
+    the pybaseball coordinate system.
+    """
+    import math as _m
+    SCALE   = 2.481
+    HP_X, HP_Y = 125.42, 198.27
+    FA = _m.radians(foul_ang_deg)
+
+    lf_x = HP_X - (lf_ft / SCALE) * _m.sin(FA)
+    lf_y = HP_Y - (lf_ft / SCALE) * _m.cos(FA)
+    rf_x = HP_X + (lf_ft / SCALE) * _m.sin(FA)
+    rf_y = lf_y
+    cf_y = HP_Y - cf_ft / SCALE
+
+    dx = HP_X - lf_x
+    cy = (dx * dx + lf_y * lf_y - cf_y * cf_y) / (2.0 * (lf_y - cf_y))
+    R_wall = abs(cy - cf_y)
+    TRACK  = track_ft / SCALE
+
+    ang_lf = _m.atan2(lf_y - cy, lf_x - HP_X)
+    ang_rf = _m.atan2(rf_y - cy, rf_x - HP_X)
+
+    def _arc(radius: float, n: int = 41) -> list:
+        pts = []
+        for i in range(n):
+            t = ang_lf + i * (ang_rf - ang_lf) / (n - 1)
+            pts.append((HP_X + radius * _m.cos(t),
+                        cy   + radius * _m.sin(t)))
+        return pts
+
+    def _hp_arc(ft: float, n: int = 21) -> list:
+        r = ft / SCALE
+        return [(HP_X + r * _m.sin(-FA + i * 2 * FA / (n - 1)),
+                 HP_Y - r * _m.cos(-FA + i * 2 * FA / (n - 1)))
+                for i in range(n)]
+
+    d = (90.0 / SCALE) / _m.sqrt(2)
+    inf_inner = [
+        (HP_X,     HP_Y - 2 * d),
+        (HP_X - d, HP_Y - d),
+        (HP_X,     HP_Y),
+        (HP_X + d, HP_Y - d),
+        (HP_X,     HP_Y - 2 * d),
+    ]
+
+    return {
+        "outfield_outer": _arc(R_wall),
+        "outfield_inner": _arc(R_wall - TRACK),
+        "infield_outer":  _hp_arc(inf_outer_ft),
+        "infield_inner":  inf_inner,
+        "foul_lines":     [(lf_x, lf_y), (HP_X, HP_Y), (rf_x, rf_y)],
+    }
+
+
+# Synthetic segments keyed by venue_id (for parks absent from pybaseball CSV)
+_VENUE_SYNTHETIC_SEGMENTS: dict[int, dict] = {
+    5340: _make_arc_segments(325.0, 400.0),  # Estadio Alfredo Harp Helú
+}
 
 
 def _get_stadium_segments(team_abbrev):
@@ -196,6 +263,7 @@ VENUE_PARK_FACTORS: dict[int, int] = {
     4169: 101,  # loanDepot park
     4705: 101,  # Truist Park
     5325:  97,  # Globe Life Field
+    5340: 137,  # Estadio Alfredo Harp Helú (Mexico City) — altitude 7349 ft, more extreme than Coors
 }
 
 # Per-venue hit-type park factors (venue_id → {1B, 2B, 3B})
@@ -233,6 +301,7 @@ VENUE_HIT_FACTORS: dict[int, dict[str, float]] = {
     4169: {"1B": 1.07, "2B": 0.97, "3B": 0.97},  # loanDepot park       XBH -3%, 1B +7%
     4705: {"1B": 0.98, "2B": 0.96, "3B": 0.96},  # Truist Park          XBH -4%, 1B -2%
     5325: {"1B": 0.99, "2B": 1.02, "3B": 1.02},  # Globe Life Field     XBH +2%, 1B -1%
+    5340: {"1B": 1.22, "2B": 1.28, "3B": 1.28},  # Estadio Harp Helú     altitude+short dims; extreme hit environment
 }
 
 # Per-venue weather sensitivity profile — asymmetric (pos, neg) multipliers.
@@ -263,6 +332,7 @@ VENUE_WX_PROFILE: dict[int, dict[str, tuple[float, float]]] = {
     3:    {"w": (0.90, 1.58), "t": (1.20, 1.50), "h": (0.80, 1.40), "p": (1.00, 1.00)},  # Fenway — headwind amplified by Monster; tailwind dampened (Monster absorbs carry); cold temps amplified
 
     # ── Altitude-driven parks ──
+    5340: {"w": (0.20, 0.01), "t": (0.10, 0.03), "h": (2.00, 0.05), "p": (3.50, 0.01)},  # Estadio Harp Helú — altitude 7349ft dominates; wind almost irrelevant; pressure strongest driver of any MLB venue
     19:   {"w": (0.30, 0.02), "t": (0.15, 0.05), "h": (1.80, 0.10), "p": (2.50, 0.02)},  # Coors — altitude dominant (5190ft); steep grandstands block gusts; altitude is main carry driver
     15:   {"w": (0.60, 0.60), "t": (0.65, 0.50), "h": (0.80, 0.50), "p": (1.50, 1.50)},  # Chase — tall walls block wind; extreme AZ heat + dry ball strongly contribute when open; pressure amplified
 
@@ -337,6 +407,8 @@ _VENUE_TEMP_REF_OFFSET: dict[int, float] = {
     680:  -5.0,   # T-Mobile Park — Seattle marine layer
     2395: -3.0,   # Oracle Park — SF marine layer
     2680: -3.0,   # Petco Park — San Diego coastal
+    # Altitude parks (mild absolute temps but altitude-modified feel)
+    5340:  -3.0,   # Estadio Harp Helú — Mexico City mild (avg ~64°F); altitude physics dominates over temp offset
     # Warm/hot parks
     15:   +8.0,   # Chase Field — Phoenix desert heat
     5325: +4.0,   # Globe Life Field — Texas heat
@@ -370,6 +442,9 @@ _VENUE_MONTHLY_NEUTRAL: dict[int, dict[int, tuple[float, float]]] = {
     680: {4:(51,72), 5:(56,73), 6:(61,73), 7:(63,72), 8:(64,72), 9:(60,72)},  # T-Mobile Park
     # ---- SAN FRANCISCO ----
     2395: {4:(55,75), 5:(56,75), 6:(57,75), 7:(58,75), 8:(60,75), 9:(60,74)}, # Oracle Park
+    # ---- MEXICO CITY ----
+    # NOAA CDMX mean temps: Apr 63°F/35% RH (dry season), rainy season Jun-Sep
+    5340: {4:(63,35), 5:(66,43), 6:(65,60), 7:(64,67), 8:(65,68), 9:(64,68)},   # Estadio Harp Helú
     # ---- DENVER ----
     19: {4:(48,32), 5:(58,35), 6:(69,40), 7:(75,45), 8:(73,44), 9:(64,38)},   # Coors Field
     # ---- PHOENIX — DOME/RETRACTABLE ----
@@ -485,6 +560,7 @@ _VENUE_ENDEMIC_WIND_CARRY: dict[int, float] = {
     3313:   +5.0,  # Yankee Stadium — short RF porch + urban channelling (conservative)
     22:     +6.0,  # Dodger Stadium — warm LA basin (conservative; player quality risk)
     2680:   +5.0,  # Petco Park — San Diego coastal, partial marine-layer offset
+    5340:   +6.0,  # Estadio Harp Helú — altitude 7349 ft; stronger thermals than Coors
     19:     +4.0,  # Coors Field — high-altitude thermals above 5200 ft
     4705:   -8.0,  # Truist Park — empirical -3.4 % HR; raised suppression from -5 (player quality bias less likely after 5-yr sample)
     # ── Small or neutral effects ──────────────────────────────────────────────
@@ -514,6 +590,7 @@ _VENUE_ENDEMIC_WIND_CARRY: dict[int, float] = {
 # Derived from 5-yr (2021-2026) empirical home/road PF Δ.
 _VENUE_ENDEMIC_1B: dict[int, float] = {
     # ── Positive: more singles than model ────────────────────────────────────
+    5340:  +15.0,  # Estadio Harp Helú — altitude 7349 ft + turf; physics model already +8, net target ~+23
     19:   +16.0,  # Coors — altitude boosts all hit types; empirical +13.0, model -3
     7:     +9.0,  # Kauffman — spacious OF, balls stay in play; empirical +5.8, model -3
     2889:  +6.0,  # Busch — spacious layout; empirical +3.2, model -3
@@ -540,6 +617,7 @@ _VENUE_ENDEMIC_1B: dict[int, float] = {
 # Applied ONLY in the open-roof / outdoor branch of _endemic_climate.
 _VENUE_ENDEMIC_XBH: dict[int, float] = {
     # ── Positive: more XBH than model ────────────────────────────────────────
+    5340:  +20.0,  # Estadio Harp Helú — altitude compensates for shallow gaps; net target ~+21.6
     19:   +10.0,  # Coors — altitude; empirical +18.9, model +9
     7:     +9.0,  # Kauffman — spacious gaps; empirical +6.4, model -3
     22:    +6.0,  # Dodger — empirical +6.7, model +1
@@ -644,6 +722,7 @@ _VENUE_DAY_NIGHT: dict[int, tuple[float, float]] = {
     17:               (+1.5,  -1.0),    # Wrigley — solar glare severe; night = consistent lighting
     3:                (-1.5,  +1.0),    # Fenway — night neutralizes Green Monster shadows; cold AM
     4705:             (-1.8,  +1.8),    # Truist — SSE shadows favor pitchers PM; offense jumps at night
+    5340:             (+2.0,  -2.0),    # Estadio Harp Helú — day dry altitude carry extreme; night rapid cooling above 7300 ft
     19:               (+1.5,  -1.5),    # Coors — daytime dry heat = extreme carry; night rapid cooling
     2529:             (+1.5,  -0.5),    # Sutter — day temps boost already strong baseline; moderate night
     680:              (+1.0,  -1.2),    # T-Mobile — night air significantly denser than daytime coastal
@@ -678,6 +757,231 @@ _VENUE_DAY_NIGHT: dict[int, tuple[float, float]] = {
 _DEFAULT_DAY_MOD  = -0.3     # day default: slight pitcher edge
 _DEFAULT_NIGHT_MOD = +0.0    # night default: neutral
 
+# ── Venue-specific structural/environmental narrative notes ──
+# Appended to park_line in _compute_weather_insight to surface iconic factors
+# that define each park's identity beyond what the generic profile model captures.
+# Keep each string concise — it follows a generated sentence in the UI.
+_VENUE_PARK_NARRATIVE: dict[int, str] = {
+    # ── AL East ──
+    3:    ("Fenway Park's 37-foot Green Monster in left field is the defining structural factor — "
+           "it converts routine fly balls into singles and doubles while robbing would-be HRs off "
+           "the wall. Atlantic coastal winds create strong variable gusts with the Monster causing "
+           "unusual LF deflection, making Fenway the second most wind-affected park behind Wrigley. "
+           "LHB are heavily advantaged by the 310 ft line; RHB face a deep RF triangle that "
+           "neutralises power to the opposite side. Cold damp New England springs (40s-50s°F in "
+           "April/May) significantly suppress fly ball carry, while warm summer games produce "
+           "dramatically more carry than early season."),
+    3313: ("Yankee Stadium's short right-field porch (314 ft) is one of the most LHB-friendly "
+           "dimensions in baseball — pull-side wind blowing toward RF dramatically increases HR "
+           "probability while in-blowing wind from center is a common suppressor. Cold spring/fall "
+           "games in the Bronx suppress carry while summer heat amplifies the already short porch "
+           "effect. NYC coastal humidity adds moderate density in summer that partially offsets "
+           "the high-temperature carry boost."),
+    2:    ("Camden Yards benefits from Baltimore's mid-Atlantic heat and humidity — summers "
+           "regularly exceed 90°F, meaningfully increasing fly ball distance over spring "
+           "conditions. The Chesapeake Bay location raises humidity above average, adding slight "
+           "density that moderates carry on the warmest days. Variable wind patterns "
+           "shift direction between in/out and particularly affect fly balls toward the LF "
+           "warehouse. Baltimore sits in a weather belt where both heat and wind create "
+           "meaningful day-to-day variance."),
+    12:   ("Tropicana Field's permanent dome makes it the only park in MLB with zero weather "
+           "variance — temperature, wind, humidity, and pressure are fully controlled year-round. "
+           "Fly ball outcomes are driven entirely by the park's dimensions and artificial turf, "
+           "never by atmospheric conditions outside. No weather adjustments are applicable here."),
+    # ── AL Central ──
+    4:    ("Guaranteed Rate Field shares Chicago's wide seasonal range — cold April/May games "
+           "suppress fly balls while hot July/August games with out-blowing wind create the most "
+           "favorable HR conditions. Its more sheltered architecture moderates wind impact "
+           "compared to Wrigley, but direction still matters greatly for fly ball outcomes "
+           "particularly toward LF. Lake Michigan humidity adds moderate density, less impactful "
+           "than at Wrigley but still measurable on the most humid summer days."),
+    5:    ("Progressive Field sees one of the largest seasonal carry swings in the AL — April "
+           "games can be 40°F with cold lake wind off Erie while July games hit 90°F, "
+           "creating an extreme temperature range. Lake-effect wind produces cold gusty "
+           "conditions blowing in frequently in spring, and even at moderate speeds that cold "
+           "in-blowing wind dramatically reduces fly ball carry. High lake humidity compounds "
+           "cold-weather suppression in spring, making early-season games among the most "
+           "pitcher-friendly environments in MLB."),
+    7:    ("Kauffman Stadium led MLB in HRs lost to wind (67 over two seasons) — its plains "
+           "location with minimal obstruction creates extreme wind exposure where direction "
+           "is the critical variable. Strong out-blowing wind to LF dramatically increases "
+           "carry for pull-side fly balls while in-blowing wind in cold spring conditions "
+           "creates the most pitcher-friendly environment in the park. Kansas City summer "
+           "heat amplifies carry on favorable wind days, and Missouri humidity adds moderate "
+           "density that partially offsets the temperature boost."),
+    2394: ("Comerica Park runs one of the harshest early-season environments in MLB — "
+           "April/May games near Lake Erie are routinely below 50°F, suppressing fly ball "
+           "carry by up to 16 feet versus peak summer. Lake Erie creates cold gusty wind that "
+           "frequently blows in from center/left in spring, compounding the already severe "
+           "cold temperature suppression. Great Lakes humidity adds density most impactful "
+           "in spring when temperatures are already cold, further tightening the window for "
+           "fly balls to carry over the deep 420-ft center field fence."),
+    3312: ("Target Field features extreme early-season suppression — April temperatures below "
+           "40°F with no roof make it one of the coldest game environments in the sport. "
+           "Minnesota plains wind adds a secondary suppression layer on cold spring days, "
+           "capable of reducing fly ball carry by 15+ feet and turning potential HRs into "
+           "deep fly ball outs. Dry continental air here means less humidity than Great Lakes "
+           "parks, making humidity a weaker factor but temperature and wind the dominant "
+           "suppressors for a longer portion of the season."),
+    # ── AL West ──
+    1:    ("Angel Stadium's mild, stable Southern California climate (avg 74°F) provides "
+           "consistent moderate carry boost year-round with minimal seasonal variance — one of "
+           "the most temperature-stable parks in the league. The inland location reduces marine "
+           "air density compared to coastal parks, and protected architecture with consistent "
+           "onshore breezes rarely shift direction enough to materially impact fly ball outcomes. "
+           "Day/night humidity swings are more impactful than seasonal changes here."),
+    680:  ("T-Mobile Park's partial roof doesn't fully enclose the park — wind and temperature "
+           "still affect play even with it closed, and wind uniquely impacts pitch movement on "
+           "the way to the plate affecting the entire at-bat, not just fly ball carry. Seattle's "
+           "cool marine climate (avg 62°F) from Puget Sound suppresses carry significantly, "
+           "and even summer games can be surprisingly cool. High Pacific Northwest humidity "
+           "(avg 72%) adds notable air density that compounds the temperature suppression — "
+           "Seattle is consistently one of the most humid parks in the league."),
+    5325: ("Globe Life Field's retractable roof closes when temperatures drop below 65-80°F "
+           "combined with >50% humidity or >25 mph wind — factors that trigger closure for "
+           "most of the Texas summer. When closed, conditions are fully controlled at ~72°F "
+           "with zero weather impact on fly balls. When open in spring or fall, Arlington's "
+           "heat (98°F+ in summer) would massively boost carry, but the roof negates "
+           "virtually all of this. The roof decision is the single most important variable."),
+    14:   ("Rogers Centre's retractable roof is open for roughly a third of games, primarily "
+           "in the summer months when Toronto weather cooperates. When closed — the majority "
+           "of the season — conditions are fully controlled with zero weather impact on fly "
+           "balls. When open, Toronto's cold springs (40s°F in April/May) significantly "
+           "suppress carry while summer heat and humidity (avg 70°F/70% RH in July) create "
+           "a moderate boost. The roof decision is the primary variable; closed games are "
+           "essentially weather-neutral regardless of outdoor conditions."),
+    2529: ("Sutter Health Park sees the single biggest temperature differential of any recent "
+           "relocation — the Sacramento Central Valley runs 15-19°F warmer than the Oakland "
+           "Coliseum for equivalent game times, with afternoon games at 95°F+ creating extreme "
+           "carry conditions. Sacramento's very low humidity (22-35% RH, among the driest in "
+           "the league) means thin dry air that amplifies carry instead of suppressing it — "
+           "unlike most warm parks where humidity offsets temperature, here both factors "
+           "boost carry simultaneously. The Delta Breeze, a consistent southwesterly evening "
+           "wind, reliably pushes toward right-center and adds carry on pull-side fly balls "
+           "for LHB."),
+    2392: ("Daikin Park's retractable roof is closed for roughly 90% of summer games due to "
+           "extreme Houston heat. When closed, conditions are fully controlled and all weather "
+           "factors are neutralised. When open (April or occasional September), outdoor temps "
+           "are manageable but Houston averages 70%+ relative humidity — the combination of "
+           "heat boosting carry while humidity adds density creates a complex interaction that "
+           "moderates the net fly ball effect. The roof decision is the primary variable "
+           "determining whether weather applies at all."),
+    # ── NL East ──
+    2681: ("Citizens Bank Park sits two stories below street level, creating wind shadows and "
+           "swirling patterns that make it one of the most wind-volatile parks in MLB — "
+           "it logged the 4th highest day-to-day variance in the league and lost 48 HRs to "
+           "in-blowing wind over two seasons, more than almost any park. Hot Philadelphia "
+           "summers amplify fly ball carry, with the swing from cold April games to 90°F+ "
+           "July games creating 3-5% variance in HR rates across the season. Mid-Atlantic "
+           "humidity adds moderate density and combined with cold spring temperatures makes "
+           "early-season games meaningfully more suppressed than mid-summer."),
+    3309: ("Nationals Park benefits from DC's hot humid summers (90°F+ regularly), providing "
+           "significant carry boost on fly balls with a large seasonal swing from cold April to "
+           "peak summer. In-blowing wind from center is common at this park's orientation, "
+           "suppressing otherwise favorable summer fly ball conditions. The Potomac River basin "
+           "creates high summer humidity that adds notable air density, placing a ceiling on "
+           "how much the temperature carry boost can amplify fly ball distance."),
+    4169: ("loanDepot Park closes its roof for nearly every game due to extreme Miami heat and "
+           "thunderstorm risk — when closed, conditions are fully controlled with zero weather "
+           "effect on fly balls. On the rare open-roof occasions in early season, outdoor temps "
+           "are mild enough to provide moderate carry boost, but Miami's extreme summer humidity "
+           "(80%+ RH) would add significant air density partially offsetting the heat carry "
+           "advantage if the roof were opened in peak summer."),
+    4705: ("Truist Park's warm Atlanta summers (avg 85°F+ in July/August) provide consistent "
+           "carry boost on fly balls. High Southern humidity adds air density that partially "
+           "offsets the temperature advantage, making the net effect slightly less than raw "
+           "temperature numbers suggest. Wind provides a secondary adjustment but temperature "
+           "and humidity dominate the fly ball outcome here. The park's third-highest altitude "
+           "in the NL compounds the temperature effect slightly as a structural background boost."),
+    3289: ("Citi Field acts Wrigley-esque despite its pitcher-park reputation — it led MLB in "
+           "wind-created HRs (28) in one study season, more than Wrigley itself. Ocean and bay "
+           "proximity create highly variable and powerful wind patterns that are the primary "
+           "daily variable. New York's seasonal range from cold springs to hot summers creates "
+           "meaningful carry variance that amplifies or dampens the wind effect. Coastal humidity "
+           "adds moderate density and creates a suppressive ceiling on the hottest summer days "
+           "that limits carry on high-trajectory fly balls."),
+    # ── NL Central ──
+    17:   ("Wrigley Field is the most wind-volatile park in MLB — the open grandstand and "
+           "low-profile bleachers let gusts flow freely in any direction, with a documented "
+           "150 OPS-point swing between wind blowing out versus in on fly balls. Direction "
+           "can change mid-game and cold fronts reverse the effect entirely. Chicago's wide "
+           "seasonal range (45°F in April to 85°F in July) creates large game-to-game carry "
+           "variance, with cold spring games suppressing fly ball distance by up to 16 feet. "
+           "Lake Michigan proximity raises humidity above league average, adding slight density "
+           "that compounds cold-weather suppression on carry distance."),
+    2889: ("Busch Stadium sees mid-American wind patterns with significant direction variance — "
+           "wind blowing to LF dramatically increases carry for pull-side fly balls from RHB "
+           "and bidirectional patterns make daily wind prediction critical. St. Louis summer "
+           "heat (90°F+) provides meaningful carry boost amplified by a mid-continent location "
+           "with less maritime moderation than coastal parks, meaning temperature extremes are "
+           "larger. Mississippi River basin humidity adds notable density in summer, moderating "
+           "the temperature carry boost and creating meaningful day-to-day humidity variance."),
+    2602: ("Great American Ball Park combines Cincinnati heat, wind, and Ohio River humidity in "
+           "a compact environment where temperature effects are amplified — balls that would be "
+           "deep fly outs in cold weather clear the fence in summer heat. Bidirectional wind "
+           "patterns blow in/out roughly equally, making direction the critical variable, and "
+           "strong out-blowing wind on already short dimensions creates extreme HR conditions. "
+           "Ohio River humidity adds density that partially offsets heat carry, and on the most "
+           "humid days the suppression is noticeable enough to shift HR probability meaningfully."),
+    31:   ("PNC Park's Pittsburgh location along the Allegheny River creates meaningful seasonal "
+           "carry variance — cold spring games are noticeably suppressed versus peak summer "
+           "conditions. The river valley creates moderate wind sensitivity where direction "
+           "matters more than speed, with out-blowing wind toward the river pushing fly balls "
+           "further in already moderate dimensions. Allegheny River proximity adds above-average "
+           "humidity that compounds cold-weather suppression in spring, making early-season "
+           "games the most pitcher-friendly conditions at this park."),
+    32:   ("American Family Field uses a retractable roof with roughly 45 open versus 36 closed "
+           "games per season — whether the roof is open is the single most important variable "
+           "determining whether weather adjustments apply at all. When open, Milwaukee's cold "
+           "springs (40s°F in April) significantly suppress fly ball carry while summer heat "
+           "games provide meaningful boost. Wisconsin plains winds can gust significantly on "
+           "open-roof days, with direction becoming a secondary factor affecting fly ball outcomes."),
+    # ── NL West ──
+    22:   ("Dodger Stadium's mild stable Southern California climate (avg 79°F) provides "
+           "consistent moderate carry boost with minimal day-to-day variance — the least "
+           "weather-volatile of the hitter-friendly parks. The protected hillside architecture "
+           "blocks most wind effects, and wind speed/direction rarely shift outcomes meaningfully. "
+           "Day/night humidity swings are more impactful than seasonal changes, with night games "
+           "noticeably cooler and slightly more suppressive than afternoon games."),
+    19:   ("Coors Field's 5,280 ft altitude creates 82% air density versus sea level — "
+           "the single largest permanent environmental advantage for hitters in MLB, adding "
+           "roughly 30 feet to every well-struck fly ball independent of any other weather "
+           "factor. Cold games (40s°F) in April reduce the altitude advantage slightly, "
+           "while day games with dry heat push carry to extremes and night games see rapid "
+           "cooling above the Mile High baseline. Rocky Mountain west-to-east prevailing "
+           "winds add tertiary variance but even a 15+ mph headwind only partially overcomes "
+           "the structural thin-air carry advantage."),
+    2395: ("Oracle Park is the coldest MLB venue by average game temperature (avg 56°F) due "
+           "to the Pacific marine layer dropping temperatures sharply at night — the largest "
+           "day/night carry differential in baseball. A summer afternoon game at 68°F versus "
+           "a night game at 52°F represents 5+ feet of carry difference that fundamentally "
+           "changes which fly balls become HRs. The park's architecture is specifically "
+           "designed to neutralize wind's effect on play, so the marine layer temperature "
+           "is the dominant and near-exclusive weather variable at Oracle."),
+    2680: ("Petco Park's San Diego ocean proximity and marine layer create consistent cool "
+           "damp conditions — similar mechanism to Oracle Park but less extreme at an average "
+           "67°F. Day/night temperature swings are the most important daily variable: "
+           "afternoon summer games can push 75-80°F for meaningful carry while night games "
+           "drop to 60°F with marine air, dramatically suppressing the same fly ball. "
+           "High coastal humidity (avg 68%) adds density that compounds the marine layer "
+           "suppression, making Petco persistently pitcher-friendly even on warmer afternoons."),
+    15:   ("Chase Field closes its retractable roof for roughly 90% of summer games due to "
+           "extreme Phoenix heat (100°F+ in July/August). When closed, conditions are fully "
+           "controlled with zero weather impact. When open (April, September), Phoenix's "
+           "1,100 ft altitude combines with dry desert air to create significant carry boost — "
+           "the altitude boost is permanent and applies even when the roof is closed, slightly "
+           "elevating the baseline conditions inside compared to sea-level indoor parks. The "
+           "roof decision is the primary variable, but altitude provides a constant structural "
+           "background advantage at all times."),
+    # ── Altitude extremes ──
+    5340: ("Estadio Alfredo Harp Helú sits at 7,349 ft — the most extreme altitude in "
+           "professional baseball, significantly beyond Coors Field. Thin air is the "
+           "overwhelming structural carry driver here regardless of temperature or wind. "
+           "Day games with the dry Mexico City plateau heat push carry to extreme levels; "
+           "night games see rapid cooling at this elevation that moderates the effect, "
+           "but the baseline altitude advantage never disappears."),
+}
+
 # ── Per-venue sky (overcast) sensitivity multiplier ──
 # Applied to base sky modifiers in _venue_adjust_weather.
 # Overcast = fewer errors (0.73 vs 0.80 visitor), BA rises ~.259→.266.
@@ -699,6 +1003,7 @@ _VENUE_SKY_MULT: dict[int, float] = {
     5:    1.00,   # Progressive — mitigates tricky wind-visual for hitters
     3289: 1.00,   # Citi — reduces outfield errors that spike on clear days
     # ── Low: minimal overcast impact ──
+    5340: 0.35,   # Estadio Harp Helú — altitude dominates even more than Coors; sky nearly irrelevant
     19:   0.40,   # Coors — altitude dominates regardless of light conditions
     1:    0.40,   # Angel — typically clear; overcast rare but helps visibility
     22:   0.50,   # Dodger — shadows consistent; clouds mainly affect OF glare
@@ -748,6 +1053,7 @@ _VENUE_RAIN_MULT: dict[int, float] = {
     2681: 1.00,   # Citizens Bank — modern drainage more efficient than NY/BAL
     2395: 1.00,   # Oracle — fog/marine layer behaves like light mist; makes ball heavy
     # ── Low: dry climate or good drainage ──
+    5340: 0.80,   # Estadio Harp Helú — April is dry season; moderate risk in rainy season (Jun-Oct)
     19:   0.60,   # Coors — rain often accompanies high humidity that aids HR carry
     4705: 0.60,   # Truist — 2.5-acre underground drainage liner; rapid resume
     # ── Minimal: very rare rain ──
@@ -995,6 +1301,7 @@ VENUE_WALL_HEIGHTS: dict[int, tuple[float, float]] = {
     4169: (10.0,  10.0),   # LoanDepot Park — LF 12'/7' → 10', RF 12'/9'/7' → 10'
     4705: ( 6.0,  16.0),   # Truist Park — LF 6', RF 16'
     5325: ( 7.5,   9.0),   # Globe Life Field — LF 8'/7' → 7.5', RF 7'/10'/8' → 9'
+    5340: ( 9.0,   9.0),   # Estadio Harp Helú — uniform 9' walls (ref image)
 }
 
 _REF_WALL_FT = 8.0           # League-average baseline wall height
@@ -1045,6 +1352,7 @@ VENUE_DIMENSIONS: dict[int, dict] = {
     4169: {"lf": 344, "lcf": 386, "cf": 407, "rcf": 392, "rf": 335, "lf_h": 13, "cf_h": 12, "rf_h": 13, "elev":   15, "foul_terr": 3, "batters_eye": 4, "turf": False},  # LoanDepot Park
     4705: {"lf": 335, "lcf": 375, "cf": 400, "rcf": 375, "rf": 325, "lf_h":  6, "cf_h":  8, "rf_h":  8, "elev": 1050, "foul_terr": 2, "batters_eye": 5, "turf": False},  # Truist Park
     5325: {"lf": 329, "lcf": 372, "cf": 407, "rcf": 374, "rf": 326, "lf_h": 14, "cf_h":  8, "rf_h":  8, "elev":  551, "foul_terr": 2, "batters_eye": 5, "turf": False},  # Globe Life Field
+    5340: {"lf": 325, "lcf": 375, "cf": 400, "rcf": 375, "rf": 325, "lf_h":  9, "cf_h":  9, "rf_h":  9, "elev": 7349, "foul_terr": 2, "batters_eye": 4, "turf": True},   # Estadio Alfredo Harp Helú — circular arc wall; 325 ft foul poles (CBS Sports), 400 CF; 9 ft uniform wall; altitude 7349 ft
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1448,9 +1756,34 @@ def _base_weather(data: dict) -> dict:
 
     # Sky condition modifiers
     condition = data.get("condition", "")
-    sky_hr = _sky_modifier(condition, _SKY_HR_MODIFIER)
+    sky_hr  = _sky_modifier(condition, _SKY_HR_MODIFIER)
     sky_xbh = _sky_modifier(condition, _SKY_HITS_XBH_MOD)
-    sky_1b = _sky_modifier(condition, _SKY_HITS_1B_MOD)
+    sky_1b  = _sky_modifier(condition, _SKY_HITS_1B_MOD)
+
+    # Precip probability scaling: condition string alone is binary; a 75%
+    # "Likely Thunderstorms" game is far more suppressive than 10% "Slight
+    # Chance Showers".  Scale rain/shower/drizzle/thunder sky modifiers by
+    # how probable the precipitation actually is.  Normalised at 50% = 1.0×;
+    # clamped to [0.3×, 2.0×] so a near-zero-chance condition still carries
+    # a small signal and an extreme-chance game gets ~2× the base penalty.
+    precip_pct = float(data.get("precip_pct", 0) or 0)
+    _cond_lc = (condition or "").lower()
+    _is_explicit_rain = any(k in _cond_lc for k in ("rain", "drizzle", "shower", "thunder"))
+    if _is_explicit_rain:
+        _ps = max(0.3, min(2.0, precip_pct / 50.0))
+        sky_hr  *= _ps
+        sky_xbh *= _ps
+        sky_1b  *= _ps
+    elif precip_pct >= 50:
+        # Fallback: forecast said "Overcast" / "Cloudy" but precip probability
+        # is high — weather APIs often return sky condition independently of
+        # precipitation probability (e.g. WMO code 3 = Overcast at 82% rain).
+        # Override the sky modifier to Rain values, scaled by precip probability.
+        # At 50% → 1.0× Rain, at 75% → 1.5×, capped at 2.0× (100%+).
+        _ps = max(1.0, min(2.0, precip_pct / 50.0))
+        sky_hr  = _sky_modifier("Rain", _SKY_HR_MODIFIER) * _ps
+        sky_xbh = _sky_modifier("Rain", _SKY_HITS_XBH_MOD) * _ps
+        sky_1b  = _sky_modifier("Rain", _SKY_HITS_1B_MOD) * _ps
 
     # Day vs night modifier
     day_night = _day_night_modifier(data)
@@ -1527,10 +1860,13 @@ def _sky_modifier(condition: str, table: dict) -> float:
     if not condition:
         return 0.0
     cl = condition.strip().lower()
-    # Map to canonical key
+    # Map to canonical key — order matters: check specific phrases first
     if "overcast" in cl:
         return table.get("Overcast", 0.0)
-    if "partly" in cl or "mostly clear" in cl:
+    if "mostly clear" in cl:
+        # Near-clear sky = high K-rate, minimal cloud cover; treat same as Clear
+        return table.get("Clear", 0.0)
+    if "partly" in cl:
         return table.get("Partly Cloudy", 0.0)
     if "cloud" in cl or "mist" in cl or "fog" in cl or "haze" in cl:
         return table.get("Cloudy", 0.0)
@@ -1538,36 +1874,77 @@ def _sky_modifier(condition: str, table: dict) -> float:
         return table.get("Drizzle", 0.0)
     if "rain" in cl or "shower" in cl:
         return table.get("Rain", 0.0)
-    if cl in ("clear", "sunny", ""):
+    if "clear" in cl or "sunny" in cl:
         return table.get("Clear", 0.0)
     # Snow/other → no sky modifier
     return 0.0
 
 
 def _day_night_modifier(data: dict) -> float:
-    """Return additive pct-pt modifier for day vs night game."""
-    # Determine if night: prefer explicit flag, then hourly slot 0, fall back to game time
-    if "night" in data:
-        is_night = bool(data["night"])
-    else:
-        hourly = data.get("hourly_conditions", [])
-        if hourly:
-            is_night = hourly[0].get("night", False)
-        else:
-            time_str = str(data.get("time", ""))
-            is_night = False
-            if "PM" in time_str.upper():
-                try:
-                    hour = int(time_str.split(":")[0])
-                    is_night = hour >= 6 or hour == 12
-                except (ValueError, IndexError):
-                    pass
+    """Return additive pct-pt modifier for day / evening / night game.
 
+    Three phases using actual sunset time when available:
+      day:     > 30 min before sunset   → day modifier
+      evening: −30 min to +60 min of sunset → blended (day×0.4 + night×0.6)
+      night:   > 60 min after sunset    → night modifier
+
+    Falls back to hourly_conditions[0]["night"] or time-string parse when
+    sunset_hour is not in the data dict (pre-fix cache entries, dome games).
+    """
     venue_id = data.get("venue_id")
     mods = _VENUE_DAY_NIGHT.get(venue_id)
-    if mods:
-        return mods[1] if is_night else mods[0]
-    return _DEFAULT_NIGHT_MOD if is_night else _DEFAULT_DAY_MOD
+    day_m   = mods[0] if mods else _DEFAULT_DAY_MOD
+    night_m = mods[1] if mods else _DEFAULT_NIGHT_MOD
+
+    sunset_hr = data.get("sunset_hour")
+    phase = None
+    if sunset_hr is not None:
+        time_str = str(data.get("time", ""))
+        try:
+            ts = time_str.strip().upper()
+            ampm = "PM" if "PM" in ts else "AM"
+            ts_clean = ts.replace("PM", "").replace("AM", "").strip()
+            hh, *ms = ts_clean.split(":")
+            mm = int(ms[0]) if ms else 0
+            hh = int(hh)
+            if ampm == "PM" and hh != 12:
+                hh += 12
+            elif ampm == "AM" and hh == 12:
+                hh = 0
+            diff = hh + mm / 60.0 - sunset_hr
+            if diff < -0.5:
+                phase = "day"
+            elif diff <= 1.0:
+                phase = "evening"
+            else:
+                phase = "night"
+        except Exception:
+            pass
+
+    if phase is None:
+        # Fall back to boolean night flag from hourly slot or time parse
+        if "night" in data:
+            is_night = bool(data["night"])
+        else:
+            hourly = data.get("hourly_conditions", [])
+            if hourly:
+                is_night = hourly[0].get("night", False)
+            else:
+                time_str = str(data.get("time", ""))
+                is_night = False
+                if "PM" in time_str.upper():
+                    try:
+                        hour = int(time_str.split(":")[0])
+                        is_night = hour >= 6 or hour == 12
+                    except (ValueError, IndexError):
+                        pass
+        phase = "night" if is_night else "day"
+
+    if phase == "day":
+        return day_m
+    if phase == "evening":
+        return day_m * 0.4 + night_m * 0.6
+    return night_m
 
 
 def _compute_hr_rating(data: dict, *, _roof_override=None) -> dict:
@@ -1756,6 +2133,334 @@ def _compute_wind_insight(data: dict, *, _roof_override=None) -> dict:
     }
 
 
+def _compute_weather_insight(data: dict, *, _roof_override=None) -> dict:
+    """Enriched weather insight: wind, venue profile, and today's active conditions.
+
+    Builds on ``_compute_wind_insight`` and adds two additional lines:
+      - park_line:  the venue's structural primary/secondary weather drivers
+      - today_line: which factors are actually doing meaningful work today
+
+    Returns dict with keys: wind_line, park_line, today_line.
+    """
+    venue_id = data.get("venue_id")
+    profile  = VENUE_WX_PROFILE.get(venue_id, {})
+    dims     = VENUE_DIMENSIONS.get(venue_id, {})
+    elev     = float(dims.get("elev", data.get("elevation", 0) or 0))
+
+    if _roof_override:
+        roof_status, roof_confirmed = _roof_override
+    else:
+        roof_status, roof_confirmed = _predict_roof_status(data)
+    enclosed = roof_status in ("dome", "closed")
+
+    # ── Wind line (existing logic) ──
+    wi = _compute_wind_insight(data, _roof_override=_roof_override)
+    wind_line = wi["description"]
+
+    # ── Venue multiplier helpers ──
+    def _max_m(k: str) -> float:
+        t = profile.get(k, (1.0, 1.0))
+        return max(t) if isinstance(t, tuple) else float(t)
+
+    w_m = _max_m("w")
+    t_m = _max_m("t")
+    h_m = _max_m("h")
+    p_m = _max_m("p")
+
+    # ── Park profile line ──
+    if enclosed:
+        if venue_id in _FIXED_DOMES:
+            park_line = "Fully climate-controlled dome — outdoor weather has no effect on ball flight."
+        else:
+            lbl = "confirmed" if roof_confirmed else "likely"
+            park_line = f"Roof {lbl} closed — indoor conditions override all external weather factors."
+    elif elev >= 5000:
+        park_line = (
+            f"Altitude ({elev:,.0f} ft) is the structural carry baseline here — "
+            f"air density drives ball flight regardless of wind conditions."
+        )
+    elif elev >= 2500:
+        sec = max([("temperature", t_m), ("humidity", h_m), ("pressure", p_m)], key=lambda x: x[1])[0]
+        park_line = (
+            f"Moderate altitude ({elev:,.0f} ft) provides a structural carry boost; "
+            f"{sec} is the primary variable driver. Wind sensitivity is reduced."
+        )
+    elif w_m <= 0.15:
+        prim = max([("temperature", t_m), ("humidity", h_m), ("pressure", p_m)], key=lambda x: x[1])[0]
+        park_line = (
+            f"Park architecture heavily shelters the field — wind carry is near-negligible here. "
+            f"{prim.capitalize()} is the most impactful variable factor."
+        )
+    elif w_m <= 0.45:
+        prim = max([("temperature", t_m), ("humidity", h_m), ("pressure", p_m)], key=lambda x: x[1])[0]
+        park_line = (
+            f"Wind receptivity is below average — {prim} carries more influence "
+            f"on ball carry than wind direction at this venue."
+        )
+    elif w_m >= 1.50:
+        sec = max([("temperature", t_m), ("humidity", h_m), ("pressure", p_m)], key=lambda x: x[1])[0]
+        park_line = (
+            f"Wind is the dominant driver here — the park's open design amplifies gusts significantly. "
+            f"{sec.capitalize()} is the secondary factor when wind is light."
+        )
+    else:
+        all_f = sorted(
+            [("wind", w_m), ("temperature", t_m), ("humidity", h_m), ("pressure", p_m)],
+            key=lambda x: -x[1],
+        )
+        prim = all_f[0][0]
+        sec  = all_f[1][0]
+        park_line = (
+            f"{prim.capitalize()} is the primary carry driver at this venue; "
+            f"{sec} is the secondary influence."
+        )
+
+    # ── Augment park_line: Stage 0 structural bias + endemic prevailing wind + venue narrative ──
+    if not enclosed:
+        _park0    = _neutral_park(venue_id) if venue_id else {"hr_pct": 0.0}
+        _end_wind = _VENUE_ENDEMIC_WIND_CARRY.get(venue_id, 0.0)
+        _pl_notes: list[str] = []
+        if _park0["hr_pct"] >= 8:
+            _pl_notes.append(
+                "The park's physical dimensions are structurally hitter-friendly for home runs.")
+        elif _park0["hr_pct"] <= -8:
+            _pl_notes.append(
+                "The park's physical dimensions are structurally pitcher-friendly for home runs.")
+        elif _park0["hr_pct"] >= 4:
+            _pl_notes.append(
+                "The park's dimensions lean hitter-friendly for home runs at neutral weather.")
+        elif _park0["hr_pct"] <= -4:
+            _pl_notes.append(
+                "The park's dimensions lean pitcher-friendly for home runs at neutral weather.")
+        if elev < 5000:  # skip at altitude parks — elevation already captures carry baseline
+            if _end_wind <= -8:
+                _pl_notes.append(
+                    "A strong persistent prevailing headwind acts as a structural carry suppressor here.")
+            elif _end_wind <= -4:
+                _pl_notes.append(
+                    "A persistent prevailing headwind moderately suppresses HR carry as a baseline.")
+            elif _end_wind >= 8:
+                _pl_notes.append(
+                    "A strong persistent prevailing tailwind provides a structural carry boost here.")
+            elif _end_wind >= 4:
+                _pl_notes.append(
+                    "A persistent prevailing tailwind provides a moderate structural carry boost.")
+        # Venue-specific narrative (marine layer, iconic walls, wind identity, etc.)
+        _narrative = _VENUE_PARK_NARRATIVE.get(venue_id)
+        if _narrative:
+            _pl_notes.append(_narrative)
+        if _pl_notes:
+            park_line = park_line + " " + " ".join(_pl_notes)
+
+    # ── Today's conditions line ──
+    if enclosed:
+        _closed_hm = _CLOSED_ROOF_HUMID_MULT.get(venue_id, 0.0)
+        if _closed_hm > 0 and data.get("humidity_pct") is not None:
+            humid = float(data["humidity_pct"])
+            if humid > 65:
+                today_line = (
+                    f"Today's {humid:.0f}% outdoor humidity may slightly deaden ball pop "
+                    f"even in the controlled environment."
+                )
+            else:
+                today_line = "Indoor conditions are stable — no meaningful weather impact on play today."
+        else:
+            today_line = "Fully controlled environment — no weather variables affect play today."
+    else:
+        base = _base_weather(data)
+        adj  = _venue_adjust_weather(base, venue_id) if venue_id else base
+
+        temp_val       = adj["temp"]
+        humid_carry    = adj["humid_carry"]
+        humid_absorb   = adj["humid_absorb"]
+        humid_val      = humid_carry + humid_absorb
+        press_val      = adj["pressure"]
+        wind_val       = adj["wind_avg"]
+        sky_val        = adj["sky_hr"]
+        night_val      = adj["day_night"]
+
+        actual_temp_f  = float(data.get("temp", 70) or 70)
+        actual_humid   = float(data.get("humidity_pct") or 57)
+        condition_str  = (data.get("condition") or "").lower()
+        actual_precip  = float(data.get("precip_pct", 0) or 0)
+        _rain_kws = ("rain", "drizzle", "shower", "thunder", "storm")
+
+        # Weather deviations: threshold 0.9; sky/night included at lower threshold 0.5
+        wx_factors = [
+            ("wind",        wind_val),
+            ("temperature", temp_val),
+            ("humidity",    humid_val),
+            ("pressure",    press_val),
+        ]
+        wx_factors.sort(key=lambda x: abs(x[1]), reverse=True)
+        active: list[tuple[str, float]] = [(n, v) for n, v in wx_factors if abs(v) >= 0.9]
+
+        # Determine if game is at night for insight text decisions.
+        # At night, artificial lighting provides uniform illumination —
+        # equivalent to overcast for batter's eye. Sky-clarity phrases
+        # (clear/cloudy) are therefore suppressed; only precipitation sky
+        # effects (rain/drizzle/thunder) remain relevant at night.
+        _ins_sunset_hr = data.get("sunset_hour")
+        _insight_is_night = False
+        if _ins_sunset_hr is not None:
+            try:
+                _ins_ts = str(data.get("time", "")).strip().upper()
+                _ins_ampm = "PM" if "PM" in _ins_ts else "AM"
+                _ins_clean = _ins_ts.replace("PM", "").replace("AM", "").strip()
+                _ins_hh, *_ins_ms = _ins_clean.split(":")
+                _ins_hh = int(_ins_hh)
+                _ins_mm = int(_ins_ms[0]) if _ins_ms else 0
+                if _ins_ampm == "PM" and _ins_hh != 12:
+                    _ins_hh += 12
+                elif _ins_ampm == "AM" and _ins_hh == 12:
+                    _ins_hh = 0
+                _insight_is_night = (_ins_hh + _ins_mm / 60.0) > _ins_sunset_hr + 0.75
+            except Exception:
+                pass
+        if not _insight_is_night:
+            _ins_hourly = data.get("hourly_conditions", [])
+            _insight_is_night = (_ins_hourly[0].get("night", False)
+                                  if _ins_hourly else False)
+
+        _rain_sky = (any(k in condition_str for k in _rain_kws)
+                     or actual_precip >= 50)
+        for _sn, _sv in [("sky", sky_val), ("night", night_val)]:
+            # At night, sky-clarity effects are irrelevant — artificial stadium
+            # lighting provides uniform illumination (overcast-equivalent for
+            # batter's eye). Only precipitation sky effects remain valid.
+            if _sn == "sky" and _insight_is_night and not _rain_sky:
+                continue
+            if abs(_sv) >= 0.5:
+                _ins = False
+                for _si, (_snn, _svv) in enumerate(active):
+                    if abs(_sv) >= abs(_svv):
+                        active.insert(_si, (_sn, _sv))
+                        _ins = True
+                        break
+                if not _ins:
+                    active.append((_sn, _sv))
+
+        def _adverb(val: float) -> str:
+            a = abs(val)
+            if a >= 10: return "significantly"
+            if a >= 5:  return "notably"
+            if a >= 2:  return "moderately"
+            return "slightly"
+
+        def _humid_phrase() -> str:
+            carry_pos  = humid_carry > 0
+            absorb_neg = humid_absorb < 0
+            net_adv    = _adverb(humid_val)
+            if actual_temp_f >= 68:
+                if carry_pos:
+                    return (f"{actual_humid:.0f}% humidity is {net_adv} adding carry — "
+                            f"lighter air reinforces the temperature boost")
+                else:
+                    return (f"{actual_humid:.0f}% humidity — dry air is {net_adv} suppressing carry "
+                            f"though a drier ball adds some pop in the warm conditions")
+            else:
+                if carry_pos and absorb_neg:
+                    if abs(humid_absorb) >= abs(humid_carry) * 0.8:
+                        return (f"{actual_humid:.0f}% humidity in cold conditions — "
+                                f"wet ball absorption largely cancels the lighter-air carry benefit")
+                    else:
+                        return (f"{actual_humid:.0f}% humidity — carry benefit from lighter air "
+                                f"is partially offset by wet ball absorption in the cold")
+                elif carry_pos:
+                    return (f"{actual_humid:.0f}% humidity is {net_adv} boosting carry "
+                            f"via lighter air, with minimal absorption effect at this humidity level")
+                else:
+                    return (f"{actual_humid:.0f}% humidity — dense dry air is {net_adv} "
+                            f"suppressing carry in the cold conditions")
+
+        def _sky_phrase(val: float) -> str:
+            adv = _adverb(val)
+            _is_precip_cond = any(k in condition_str for k in _rain_kws)
+            # Also treat high precip % with neutral condition string as rain
+            _is_precip = _is_precip_cond or actual_precip >= 50
+            _precip_str = f" ({actual_precip:.0f}% chance)" if actual_precip >= 10 else ""
+            if "thunder" in condition_str or "storm" in condition_str:
+                return (f"storm/thunder conditions{_precip_str} are {adv} dampening carry "
+                        f"and reducing ball pop — wet ball suppresses HR distance")
+            if _is_precip_cond and ("rain" in condition_str or "shower" in condition_str):
+                return (f"rain/shower conditions{_precip_str} are {adv} suppressing carry "
+                        f"and reducing ball pop — wet ball and damp air limit HR distance")
+            if "drizzle" in condition_str:
+                return (f"drizzle{_precip_str} is slightly reducing carry and ball pop")
+            if _is_precip:
+                # High precip % but condition string is sky-only (Overcast, Cloudy, etc.)
+                return (f"{actual_precip:.0f}% precipitation probability is {adv} suppressing "
+                        f"carry — likely rain despite the forecast sky description")
+            if "overcast" in condition_str:
+                return (f"overcast skies improve batter's eye — a uniform grey background "
+                        f"makes pitch movement and spin easier to read, boosting contact quality")
+            if "cloud" in condition_str:
+                return (f"cloudy skies improve batter's eye — reduced glare and contrast "
+                        f"helps batters pick up spin and pitch breaks more easily")
+            if "clear" in condition_str or "sunny" in condition_str:
+                return (f"clear/sunny skies create tracking difficulty — sun glare and harsh "
+                        f"contrast make pitch reads harder, giving pitchers a slight edge")
+            return f"sky conditions are affecting batter visibility"
+
+        def _carry_phrase(name: str, val: float) -> str:
+            adv = _adverb(val)
+            direction = "boosting" if val > 0 else "suppressing"
+            if name == "wind":
+                ws = data.get("wind_speed", 0) or 0
+                if w_m <= 0.45:
+                    return f"wind has limited carry impact despite {ws} mph forecast (sheltered park)"
+                return f"wind is {adv} {direction} ball carry"
+            elif name == "temperature":
+                return f"{actual_temp_f:.0f}°F is {adv} {direction} ball carry"
+            elif name == "humidity":
+                return _humid_phrase()
+            elif name == "pressure":
+                return f"air pressure is {adv} {direction} carry"
+            elif name == "sky":
+                return _sky_phrase(val)
+            elif name == "night":
+                if _insight_is_night:
+                    if val > 0:
+                        return (f"night game lighting creates a more uniform visual background "
+                                f"at this venue, helping batters track pitches and boosting contact")
+                    return (f"night conditions at this venue slightly suppress offensive "
+                            f"output — cooler, denser air is the primary driver")
+                else:
+                    # Day / evening game — modifier reflects afternoon conditions
+                    if val > 0:
+                        return (f"daytime conditions at this venue favor offense — "
+                                f"warm afternoon air and open sightlines aid ball carry")
+                    return (f"afternoon conditions at this venue slightly suppress offense — "
+                            f"shadows and prevailing glare patterns favor pitchers")
+            return ""
+
+        if not active:
+            today_line = "All weather factors near neutral today — minimal carry impact across the board."
+        elif elev >= 5000:
+            press_phrase = f"air pressure is {_adverb(press_val)} {'boosting' if press_val > 0 else 'suppressing'} carry"
+            temp_phrase  = f"{actual_temp_f:.0f}°F is {_adverb(temp_val)} {'boosting' if temp_val > 0 else 'suppressing'} carry"
+            others = [_carry_phrase(n, v) for n, v in active
+                      if n not in ("pressure", "temperature") and abs(v) >= 0.5]
+            base_line = f"{press_phrase.capitalize()} at altitude, with {temp_phrase}"
+            today_line = (base_line + " while " + " and ".join(others) + ".") if others else base_line + "."
+        elif len(active) == 1:
+            today_line = f"{_carry_phrase(*active[0]).capitalize()}."
+        else:
+            clauses = [_carry_phrase(n, v) for n, v in active[:3]]
+            today_line = (
+                clauses[0].capitalize()
+                + " while "
+                + " and ".join(clauses[1:])
+                + "."
+            )
+
+    return {
+        "wind_line":  wind_line,
+        "park_line":  park_line,
+        "today_line": today_line,
+    }
+
+
 def _compute_hits_rating(data: dict, *, _roof_override=None) -> dict:
     """Three-stage hits rating: neutral park → base weather → venue adjust.
 
@@ -1898,7 +2603,11 @@ class StadiumWidget(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         home = data.get("home", "")
-        self._segments, _ = _get_stadium_segments(home)
+        venue_id = data.get("venue_id")
+        if venue_id in _VENUE_SYNTHETIC_SEGMENTS:
+            self._segments = _VENUE_SYNTHETIC_SEGMENTS[venue_id]
+        else:
+            self._segments, _ = _get_stadium_segments(home)
         self._logo_pm = self._load_logo(home, 40)
 
     @staticmethod
@@ -2378,7 +3087,7 @@ class WeatherDetailWidget(QFrame):
       - Team header with logos and matchup
       - Stadium outline with wind arrows and orange wall outline
       - HR rating with LHB / RHB splits
-      - Wind insight panel
+      - Weather insight panel (wind, venue profile, today's active conditions)
       - Conditions table
       - 4-hour time-slot switcher
     """
@@ -2513,7 +3222,8 @@ class WeatherDetailWidget(QFrame):
             left.addWidget(self._wx_overlay, alignment=Qt.AlignmentFlag.AlignCenter)
         else:
             cond = self.d.get("condition", "")
-            self._wx_overlay = WeatherOverlay([{"hour": "", "condition": cond}])
+            _fb_night = self.d.get("night", False)
+            self._wx_overlay = WeatherOverlay([{"hour": "", "condition": cond, "night": _fb_night}])
             left.addWidget(self._wx_overlay, alignment=Qt.AlignmentFlag.AlignCenter)
 
         # Hourly toggle slider
@@ -2699,19 +3409,26 @@ class WeatherDetailWidget(QFrame):
 
         hits_frame.addLayout(hits_body)
 
-        # Wind Insight section
-        wi = _compute_wind_insight(self.d)
-        wi_frame = self._build_section("WIND INSIGHT", right)
+        # Weather Insight section — fixed height keeps all widgets uniform
+        wxr = _compute_weather_insight(self.d)
+        wi_frame = self._build_section("WEATHER INSIGHT", right, fixed_height=200)
         wi_inner = QVBoxLayout()
         wi_inner.setContentsMargins(0, 0, 0, 0)
-        wi_inner.setSpacing(4)
+        wi_inner.setSpacing(6)
 
-        self._wi_desc = _mk(wi["description"], color=C["t2"], size=10)
-        self._wi_desc.setWordWrap(True)
-        # Fixed 2-line height so the card doesn't resize when toggling hours
-        _fm = self._wi_desc.fontMetrics()
-        self._wi_desc.setFixedHeight(_fm.lineSpacing() * 2 + 4)
-        wi_inner.addWidget(self._wi_desc)
+        self._wi_wind = _mk(wxr["wind_line"], color=C["t2"], size=10)
+        self._wi_wind.setWordWrap(True)
+        wi_inner.addWidget(self._wi_wind)
+
+        self._wi_park = _mk(wxr["park_line"], color=C["t2"], size=10)
+        self._wi_park.setWordWrap(True)
+        wi_inner.addWidget(self._wi_park)
+
+        self._wi_today = _mk(wxr["today_line"], color=C["t2"], size=10)
+        self._wi_today.setWordWrap(True)
+        wi_inner.addWidget(self._wi_today)
+        wi_inner.addStretch()
+
         wi_frame.addLayout(wi_inner)
 
         # Conditions table
@@ -2730,7 +3447,7 @@ class WeatherDetailWidget(QFrame):
         pressure = self.d.get("pressure_hpa")
 
         self._cond_vals["temp"] = _cond_row(grid, 0, "Temperature",
-                                            f"{round(float(temp))}°F" if temp != "--" else "--°F")
+                                            f"{round(float(temp))}°F" if temp is not None and temp != "--" else "--°F")
         self._cond_vals["wind"] = _cond_row(grid, 1, "Wind Speed",
                                             f"{ws} mph {wd}" if ws else "Calm")
         self._cond_vals["precip"] = _cond_row(grid, 2, "Precipitation",
@@ -2750,12 +3467,15 @@ class WeatherDetailWidget(QFrame):
         body.addLayout(right, stretch=1)
         root.addLayout(body)
 
-    def _build_section(self, title: str, parent_layout: QVBoxLayout) -> QVBoxLayout:
+    def _build_section(self, title: str, parent_layout: QVBoxLayout,
+                        fixed_height: int | None = None) -> QVBoxLayout:
         """Create a bordered titled section and add it to *parent_layout*. Returns inner VBox."""
         frame = QFrame()
         frame.setStyleSheet(
             f"QFrame {{ background:{C['bg2']}; "
             f"border:1px solid {C['bdr']}; border-radius:6px; }}")
+        if fixed_height is not None:
+            frame.setFixedHeight(fixed_height)
         fl = QVBoxLayout(frame)
         fl.setContentsMargins(10, 8, 10, 10)
         fl.setSpacing(4)
@@ -2827,9 +3547,11 @@ class WeatherDetailWidget(QFrame):
         hits = _compute_hits_rating(self.d, _roof_override=(roof_status, roof_confirmed))
         self._update_hits_labels(hits)
 
-        # Recompute wind insight
-        wi = _compute_wind_insight(self.d, _roof_override=(roof_status, roof_confirmed))
-        self._wi_desc.setText(wi["description"])
+        # Recompute weather insight
+        wxr = _compute_weather_insight(self.d, _roof_override=(roof_status, roof_confirmed))
+        self._wi_wind.setText(wxr["wind_line"])
+        self._wi_park.setText(wxr["park_line"])
+        self._wi_today.setText(wxr["today_line"])
 
         # Update conditions
         temp = self.d.get("temp", "--")

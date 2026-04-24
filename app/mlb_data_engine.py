@@ -1,5 +1,6 @@
 import csv
 from datetime import datetime
+import gzip
 import logging
 import os
 import pickle
@@ -21,6 +22,9 @@ _log = logging.getLogger("seam.engine")
 
 _session = create_http_session()
 
+# Shared pool for parallel handedness fetches — avoids create/destroy overhead per lineup
+_handedness_pool = ThreadPoolExecutor(max_workers=10, thread_name_prefix="seam-hand")
+
 
 class MLBDataEngine:
     """Simplified API-only interface for MLB data."""
@@ -40,6 +44,15 @@ class MLBDataEngine:
             self._indent = indent
 
         def load(self):
+            gz_path = self._json_path + '.gz'
+            # Try gzip first, then fall back to plain JSON for migration
+            if os.path.exists(gz_path):
+                try:
+                    with gzip.open(gz_path, 'rt', encoding='utf-8') as f:
+                        data = json.load(f)
+                    return set(data) if self._as_set else data
+                except Exception:
+                    return self._default_factory()
             if os.path.exists(self._json_path):
                 try:
                     with open(self._json_path, 'r', encoding='utf-8') as f:
@@ -61,7 +74,8 @@ class MLBDataEngine:
         def save(self, data):
             try:
                 payload = list(data) if self._as_set else data
-                with open(self._json_path, 'w', encoding='utf-8') as f:
+                gz_path = self._json_path + '.gz'
+                with gzip.open(gz_path, 'wt', encoding='utf-8') as f:
                     json.dump(payload, f, indent=self._indent)
             except Exception:
                 _log.debug("Failed to save cache %s", self._json_path)
@@ -841,37 +855,33 @@ class MLBDataEngine:
         
         if players_data:
             try:
-                # Use ThreadPoolExecutor to fetch handedness in parallel (max 10 concurrent requests)
-                with ThreadPoolExecutor(max_workers=min(10, len(players_data))) as executor:
-                    future_to_player_id = {}
-                    
-                    try:
-                        # Submit all tasks - may fail if interpreter is shutting down
+                future_to_player_id = {}
+                try:
+                    # Submit all tasks - may fail if interpreter is shutting down
+                    for _, _, _, player_id in players_data:
+                        future_to_player_id[_handedness_pool.submit(self._fetch_player_handedness, player_id)] = player_id
+                except RuntimeError as e:
+                    # "cannot schedule new futures after interpreter shutdown"
+                    # Gracefully handle by just marking all as unknown
+                    if "interpreter shutdown" in str(e):
+                        if not self.suppress_output:
+                            _log.debug(f"  Note: Handedness fetch interrupted by shutdown, using defaults")
                         for _, _, _, player_id in players_data:
-                            future_to_player_id[executor.submit(self._fetch_player_handedness, player_id)] = player_id
-                    except RuntimeError as e:
-                        # "cannot schedule new futures after interpreter shutdown"
-                        # Gracefully handle by just marking all as unknown
-                        if "interpreter shutdown" in str(e):
-                            if not self.suppress_output:
-                                _log.debug(f"  Note: Handedness fetch interrupted by shutdown, using defaults")
-                            for _, _, _, player_id in players_data:
-                                handedness_map[player_id] = 'Unknown'
-                            return []  # Return empty to trigger fallback to all roster
-                        raise
-                    
-                    for future in as_completed(future_to_player_id):
-                        player_id = future_to_player_id[future]
-                        try:
-                            handedness = future.result()
-                            handedness_map[player_id] = handedness
-                        except Exception as e:
                             handedness_map[player_id] = 'Unknown'
+                        return []  # Return empty to trigger fallback to all roster
+                    raise
+                
+                for future in as_completed(future_to_player_id, timeout=15):
+                    player_id = future_to_player_id[future]
+                    try:
+                        handedness = future.result()
+                        handedness_map[player_id] = handedness
+                    except Exception as e:
+                        handedness_map[player_id] = 'Unknown'
             except RuntimeError as e:
-                # If ThreadPoolExecutor creation itself fails during shutdown, gracefully return empty
                 if "interpreter shutdown" in str(e):
                     if not self.suppress_output:
-                        _log.debug(f"  Note: Thread pool creation interrupted by shutdown")
+                        _log.debug(f"  Note: Thread pool interrupted by shutdown")
                     return []  # Return empty to trigger fallback to all roster
                 raise
         
@@ -1352,16 +1362,21 @@ class MLBDataEngine:
                 return {"df": pd.DataFrame(), "handedness": "Unknown"}
             
             # Build query based on whether we're looking for pitcher or batter
+            _PA_COLS = (
+                "game_datetime, game_date, season, batter_id, pitcher_id, "
+                "events, stand, p_throws, launch_speed, launch_angle, bb_type, "
+                "hc_x, hc_y, barrel, description, outs_when_up, is_hit"
+            )
             if is_pitcher:
-                query = """
-                    SELECT * FROM plate_appearances 
+                query = f"""
+                    SELECT {_PA_COLS} FROM plate_appearances 
                     WHERE pitcher_id = ? AND season = ?
                     ORDER BY game_datetime
                 """
                 handedness_col = 'p_throws'
             else:
-                query = """
-                    SELECT * FROM plate_appearances 
+                query = f"""
+                    SELECT {_PA_COLS} FROM plate_appearances 
                     WHERE batter_id = ? AND season = ?
                     ORDER BY game_datetime
                 """
@@ -1674,7 +1689,7 @@ class MLBDataEngine:
             if is_pitcher:
                 return {stat: "---" for stat in ['PA', 'K', 'K%', 'H', 'HR', '1B', '2B', '3B', 'BB%', 'ERA']}
             else:
-                return {stat: "---" for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'Pull%', 'EV']}
+                return {stat: "---" for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'PullAir%', 'EV50']}
         
         filtered_df = df
         if time_period != "Season":
@@ -1710,7 +1725,7 @@ class MLBDataEngine:
         """
         import pandas as pd
         if df is None or df.empty:
-            return {stat: "---" for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'Pull%', 'EV']}
+            return {stat: "---" for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'PullAir%', 'EV50']}
 
         pa = len(df[df['events'].notnull()])
         at_bats = df[df['events'].notnull() & ~df['events'].isin(['walk', 'hit_by_pitch', 'sacrifice_fly', 'sacrifice_bunt'])]
@@ -1739,16 +1754,26 @@ class MLBDataEngine:
         batted_balls = df[df['launch_speed'].notnull()]
         barrel_pct = (barrels / len(batted_balls) * 100) if len(batted_balls) > 0 else 0
 
-        pulls = 0
-        pull_pct = 0
-        if len(batted_balls) > 0 and 'hc_x' in df.columns and 'stand' in df.columns:
-            valid = batted_balls.dropna(subset=['hc_x', 'stand'])
-            if len(valid) > 0:
-                is_right = valid['stand'] == 'R'
-                pulls = int(((is_right & (valid['hc_x'] < 100)) | (~is_right & (valid['hc_x'] > 150))).sum())
-            pull_pct = (pulls / len(batted_balls) * 100) if len(batted_balls) > 0 else 0
-        
-        ev = df['launch_speed'].mean() if not df['launch_speed'].dropna().empty else 0
+        pulled_air_pct = 0
+        if len(batted_balls) > 0 and 'hc_x' in df.columns and 'hc_y' in df.columns and 'stand' in df.columns and 'bb_type' in df.columns:
+            import numpy as _np
+            bbe_air = batted_balls[batted_balls['bb_type'] != 'ground_ball'].dropna(subset=['hc_x', 'hc_y', 'stand'])
+            if len(bbe_air) > 0:
+                dy = 198.27 - bbe_air['hc_y'].to_numpy(dtype=float)
+                dx = bbe_air['hc_x'].to_numpy(dtype=float) - 125.42
+                valid = dy != 0
+                raw_ang = _np.where(valid, _np.arctan(dx / _np.where(valid, dy, 1)) * (180 / _np.pi) * 0.75, 0)
+                is_right = bbe_air['stand'].to_numpy() == 'R'
+                adj_ang = _np.where(is_right, raw_ang, -raw_ang)
+                pulled_air_count = int(_np.sum((adj_ang < -17) & valid))
+                pulled_air_pct = (pulled_air_count / len(batted_balls) * 100) if len(batted_balls) > 0 else 0
+
+        # EV50: average of top 50% exit velocities
+        ev50 = 0
+        ev_sorted = batted_balls['launch_speed'].dropna().sort_values(ascending=False)
+        if len(ev_sorted) > 0:
+            top_n = max(1, len(ev_sorted) // 2)
+            ev50 = float(ev_sorted.iloc[:top_n].mean())
 
         # Try to use MLB API season aggregates for batters when available
         try:
@@ -1833,8 +1858,8 @@ class MLBDataEngine:
             'RBI': rbi,
             'OBP': obp,
             'Barrel%': barrel_pct,
-            'Pull%': pull_pct,
-            'EV': ev
+            'PullAir%': pulled_air_pct,
+            'EV50': ev50
         }
     
     def mark_date_processed(self, date_str):
@@ -1876,7 +1901,7 @@ class MLBDataEngine:
             df = player_data.get('df')
             
             if df is None or df.empty:
-                return {stat: '--' for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'Pull%', 'EV']}
+                return {stat: '--' for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'PullAir%', 'EV50']}
             
             # Convert matchup format from UI values to get_stats_breakdown format
             # UI: 'Both', 'RHP', 'LHP' → breakdown: 'Overall', 'vs RHP/RHB', 'vs LHP/LHB'
@@ -1897,9 +1922,9 @@ class MLBDataEngine:
                         formatted_stats[key] = f"{val:.3f}"
                     elif key == 'ISO':
                         formatted_stats[key] = f"{val:.3f}"
-                    elif key in ['K%', 'BB%', 'Barrel%', 'Pull%']:
+                    elif key in ['K%', 'BB%', 'Barrel%', 'PullAir%']:
                         formatted_stats[key] = f"{val:.1f}%"
-                    elif key == 'EV':
+                    elif key == 'EV50':
                         formatted_stats[key] = f"{val:.1f}"
                     else:
                         formatted_stats[key] = val
@@ -1909,7 +1934,7 @@ class MLBDataEngine:
             return formatted_stats
         except Exception as e:
             _log.warning(f"Error getting batter stats for player {player_id}: {e}")
-            return {stat: '--' for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'Pull%', 'EV']}
+            return {stat: '--' for stat in ['PA', 'BA', 'ISO', 'K%', 'BB%', '1B', '2B', '3B', 'HR', 'Barrel%', 'PullAir%', 'EV50']}
     
     def get_bvp_stats(self, batter_id, pitcher_id):
         """Get batter vs specific pitcher stats across all seasons.
@@ -1927,7 +1952,10 @@ class MLBDataEngine:
             if conn is None:
                 return {stat: '-' for stat in ['PA', 'BA', 'BABIP', 'ISO', 'WOBA', 'K%', 'BB%', '1B', '2B', '3B', 'HR']}
             query = """
-                SELECT * FROM plate_appearances 
+                SELECT events, stand, p_throws, launch_speed, launch_angle,
+                       bb_type, hc_x, hc_y, batter_id, pitcher_id, season,
+                       barrel, description, outs_when_up, is_hit, game_date
+                FROM plate_appearances 
                 WHERE batter_id = ? AND pitcher_id = ?
                 ORDER BY game_datetime
             """
@@ -2005,7 +2033,10 @@ class MLBDataEngine:
                 return empty
             placeholders = ','.join('?' for _ in batter_ids)
             query = f"""
-                SELECT * FROM plate_appearances 
+                SELECT events, stand, p_throws, launch_speed, launch_angle,
+                       bb_type, hc_x, hc_y, batter_id, pitcher_id, season,
+                       barrel, description, outs_when_up, is_hit, game_date
+                FROM plate_appearances 
                 WHERE pitcher_id = ? AND batter_id IN ({placeholders})
                 ORDER BY game_datetime
             """

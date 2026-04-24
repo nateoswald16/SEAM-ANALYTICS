@@ -280,10 +280,10 @@ def _create_calc_tables(cur):
         k_pct REAL,
         bb_pct REAL,
         barrel_pct REAL,
-        pull_pct REAL,
+        pulled_air_pct REAL,
         iso REAL,
-        avg_launch_angle REAL,
-        avg_ev REAL,
+        fb_pct REAL,
+        ev50 REAL,
         max_ev REAL,
         avg_bat_speed REAL,
         squared_up_rate REAL,
@@ -554,7 +554,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
     # -- Statcast-only metrics (barrel, pull, EV, LA) from pickle --
     # All counting stats (PA, AB, H, R, RBI, etc.) come from the MLB API
     # via the raw DB.  Statcast only enriches with detailed tracking data.
-    barrel_pct = pull_pct = avg_launch_angle = avg_ev = max_ev = None
+    barrel_pct = pulled_air_pct = fb_pct = ev50 = max_ev = None
     avg_bat_speed = squared_up_rate = blast_rate = hard_hit_pct = chase_rate = None
 
     # --- Raw DB batted-ball stats (always available, covers all games) ---
@@ -562,10 +562,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         SELECT
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed_angle = 6 THEN 1 ELSE 0 END) AS barrels,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull IS NOT NULL THEN 1 ELSE 0 END) AS pull_eligible,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND pull = 1 THEN 1 ELSE 0 END) AS pulls,
-            AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_angle IS NOT NULL THEN launch_angle END) AS avg_la,
-            AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
+            SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) AS fly_balls,
             MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard
         FROM plate_appearances{matchup_join}
@@ -576,16 +573,45 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         raw_bbe = raw_bb[0] or 0
         if raw_bbe > 0:
             barrel_pct = round((raw_bb[1] or 0) / raw_bbe, 3)
-            pull_elig = raw_bb[2] or 0
-            if pull_elig > 0:
-                pull_pct = round((raw_bb[3] or 0) / pull_elig, 3)
-            hard_hit_pct = round((raw_bb[7] or 0) / raw_bbe, 3)
-        if raw_bb[4] is not None:
-            avg_launch_angle = round(raw_bb[4], 1)
-        if raw_bb[5] is not None:
-            avg_ev = round(raw_bb[5], 1)
-        if raw_bb[6] is not None:
-            max_ev = round(raw_bb[6], 1)
+            fb_pct = round((raw_bb[2] or 0) / raw_bbe, 3)
+            hard_hit_pct = round((raw_bb[4] or 0) / raw_bbe, 3)
+        if raw_bb[3] is not None:
+            max_ev = round(raw_bb[3], 1)
+
+    # --- Raw DB EV50 and Pulled Air% — require per-row fetch ---
+    raw_detail_sql = f"""
+        SELECT launch_speed, hc_x, hc_y, stand, bb_type
+        FROM plate_appearances{matchup_join}
+        WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
+          AND bb_type IS NOT NULL AND bb_type != ''
+    """
+    raw_detail_rows = cur_raw.execute(raw_detail_sql, params).fetchall()
+    if raw_detail_rows:
+        import math as _math
+        ev_vals_raw = sorted(
+            [r[0] for r in raw_detail_rows if r[0] is not None],
+            reverse=True
+        )
+        if ev_vals_raw:
+            top_n = max(1, len(ev_vals_raw) // 2)
+            ev50 = round(sum(ev_vals_raw[:top_n]) / top_n, 1)
+        total_bbe_raw = len(raw_detail_rows)
+        pulled_air_count = 0
+        for r in raw_detail_rows:
+            _ls, hc_x, hc_y, stand, bb_type = r
+            if bb_type == 'ground_ball':
+                continue
+            if hc_x is None or hc_y is None or stand is None:
+                continue
+            denom = 198.27 - hc_y
+            if denom == 0:
+                continue
+            raw_angle = _math.atan((hc_x - 125.42) / denom) * (180 / _math.pi) * 0.75
+            adj_angle = raw_angle if stand == 'R' else -raw_angle
+            if adj_angle < -17:
+                pulled_air_count += 1
+        if total_bbe_raw > 0:
+            pulled_air_pct = round(pulled_air_count / total_bbe_raw, 3)
 
     # --- Raw DB bat speed, squared-up rate, blast rate, and chase rate ---
     # Blast: approximate theoretical_max_EV using avg plate_speed (91 mph fastball * 0.92 decay = 83.7 mph)
@@ -645,34 +671,30 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             # Statcast covers all BBE — use its richer data
             barrel_count = int((bbe['launch_speed_angle'] == 6).sum())
             barrel_pct = round(barrel_count / len(bbe), 3)
-            # pull_pct: hit_location field zones (best available match to Statcast pull%)
-            # RHH pull zones: GB→[5,6,7] (3B/SS/LF), FB→[7] (LF), LD→[7] (LF)
-            # LHH pull zones: GB→[3,4]   (1B/2B),    FB→[9] (RF), LD→[9] (RF)
-            # Popups excluded from numerator; denominator = all BBE
-            if 'hit_location' in bbe.columns and 'stand' in bbe.columns:
-                _stand_vals = bbe['stand'].mode()
-                if len(_stand_vals) > 0:
-                    _stand = _stand_vals.iloc[0]
-                    _bbe_loc = bbe[bbe['hit_location'].notna()]
-                    if _stand == 'R':
-                        _gb_locs, _fb_locs, _ld_locs = [5,6,7], [7], [7]
-                    else:
-                        _gb_locs, _fb_locs, _ld_locs = [3,4], [9], [9]
-                    _gb = _bbe_loc[_bbe_loc['bb_type']=='ground_ball']
-                    _fb = _bbe_loc[_bbe_loc['bb_type']=='fly_ball']
-                    _ld = _bbe_loc[_bbe_loc['bb_type']=='line_drive']
-                    _pull_n = (int(_gb['hit_location'].isin(_gb_locs).sum()) +
-                               int(_fb['hit_location'].isin(_fb_locs).sum()) +
-                               int(_ld['hit_location'].isin(_ld_locs).sum()))
-                    if len(bbe) > 0:
-                        pull_pct = round(_pull_n / len(bbe), 3)
-            la_vals = bbe['launch_angle'].dropna()
-            if len(la_vals) > 0:
-                avg_launch_angle = round(float(la_vals.mean()), 1)
-            ev_vals = bbe['launch_speed'].dropna()
+            # fb_pct: fly balls (bb_type='fly_ball') / total BBE
+            fb_pct = round(int((bbe['bb_type'] == 'fly_ball').sum()) / len(bbe), 3)
+            # ev50: average of top 50% exit velocities by BBE
+            ev_vals = bbe['launch_speed'].dropna().sort_values(ascending=False)
             if len(ev_vals) > 0:
-                avg_ev = round(float(ev_vals.mean()), 1)
-                max_ev = round(float(ev_vals.max()), 1)
+                top_n = max(1, len(ev_vals) // 2)
+                ev50 = round(float(ev_vals.iloc[:top_n].mean()), 1)
+                max_ev = round(float(ev_vals.iloc[0]), 1)
+            # pulled_air_pct: airballs (not ground_ball) with spray angle < -17° / all BBE
+            # Uses per-row stand field to handle switch hitters correctly
+            if all(c in bbe.columns for c in ['hc_x', 'hc_y', 'stand']):
+                import math as _math
+                bbe_air = bbe[bbe['bb_type'] != 'ground_ball'].copy()
+                bbe_air = bbe_air.dropna(subset=['hc_x', 'hc_y', 'stand'])
+                if len(bbe_air) > 0:
+                    dy = 198.27 - bbe_air['hc_y']
+                    valid_dy = dy != 0
+                    raw_angle = bbe_air.loc[valid_dy, 'hc_x'].copy()
+                    raw_angle = (bbe_air.loc[valid_dy, 'hc_x'] - 125.42) / dy[valid_dy]
+                    raw_angle = raw_angle.apply(_math.atan) * (180 / _math.pi) * 0.75
+                    adj_angle = raw_angle.copy()
+                    lhb_mask = bbe_air.loc[valid_dy, 'stand'] == 'L'
+                    adj_angle[lhb_mask] = -raw_angle[lhb_mask]
+                    pulled_air_pct = round(int((adj_angle < -17).sum()) / len(bbe), 3)
             # Hard Hit% from pkl
             ev_all = bbe['launch_speed'].dropna()
             if len(ev_all) > 0:
@@ -790,14 +812,14 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             season, player_id, player_name, matchup, window,
             plate_appearances, at_bats, hits, singles, doubles, triples, home_runs,
             runs, rbis, total_bases, walks, strikeouts, avg, slg, obp, k_pct, bb_pct,
-            barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev,
+            barrel_pct, pulled_air_pct, iso, fb_pct, ev50, max_ev,
             avg_bat_speed, squared_up_rate, blast_rate, hard_hit_pct, chase_rate
         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         season, player_id, player_name or '', matchup, window,
         pa or 0, ab or 0, hits or 0, singles or 0, doubles or 0, triples or 0, hrs or 0,
         runs or 0, rbis or 0, total_bases or 0, walks or 0, so or 0, avg, slg, obp, k_pct, bb_pct,
-        barrel_pct, pull_pct, iso, avg_launch_angle, avg_ev, max_ev,
+        barrel_pct, pulled_air_pct, iso, fb_pct, ev50, max_ev,
         avg_bat_speed, squared_up_rate, blast_rate, hard_hit_pct, chase_rate
     ))
 

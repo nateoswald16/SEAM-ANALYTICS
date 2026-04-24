@@ -31,10 +31,11 @@ MLB_BENCHMARKS = {
     "K%":     {"avg": 23.0,  "threshold": 3.0,   "higher_is_better": False},
     "BB%":    {"avg": 8.5,   "threshold": 1.5,   "higher_is_better": True},
     "Brl%":   {"avg": 6.5,   "threshold": 2.0,   "higher_is_better": True},
-    "EV":     {"avg": 88.5,  "threshold": 2.0,   "higher_is_better": True},
+    "EV50":   {"avg": 99.5,  "threshold": 1.4,   "higher_is_better": True},
     "MaxEV":  {"avg": 108.0, "threshold": 3.0,   "higher_is_better": True},
-    "AVG LA": {"avg": 12.0,  "threshold": 4.0,   "higher_is_better": None},
-    "LA":     {"avg": 12.0,  "threshold": 4.0,   "higher_is_better": None},
+    "FB%":    {"avg": 29.5,  "threshold": 2.5,   "higher_is_better": True},
+    "PullAir%": {"avg": 17.0,  "threshold": 2.9,   "higher_is_better": True},
+    "LA":     {"avg": 12.0,  "threshold": 4.0,   "higher_is_better": None},  # generic alias
     "Hard%":  {"avg": 38.5,  "threshold": 4.0,   "higher_is_better": True},   # batter default; pitcher overridden below
     "BatSpd": {"avg": 70.6,  "threshold": 2.0,   "higher_is_better": True},
     "SqUp%":  {"avg": 26.0,  "threshold": 2.0,   "higher_is_better": True},   # avg band 24–28%; above avg ≥28%; below avg ≤24%
@@ -78,7 +79,7 @@ _PITCHING_BENCHMARKS = {
 
 # Columns that are never graded (info / counting stats)
 _SKIP = {"#", "POS", "PLAYER", "PITCHER", "CATCHER", "PA", "H", "1B", "2B", "3B", "HR", "R",
-         "RBI", "TB", "Pull%", "IP", "K", "BB", "HAND", "TEAM", "OPP",
+         "RBI", "TB", "IP", "K", "BB", "HAND", "TEAM", "OPP",
          "SB Att", "SB", "SB Allowed", "Stole 2nd", "Stole 3rd", "Bolts",
          "Comp Runs", "CS", "Pickoffs", "BF", "Pitches"}
 

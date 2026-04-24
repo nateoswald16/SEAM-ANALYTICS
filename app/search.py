@@ -40,6 +40,9 @@ class _ThumbSignal(QObject):
 
 _thumb_signal = _ThumbSignal()
 
+# Track in-flight headshot download player IDs to avoid duplicate fetches
+_thumb_inflight: set[int] = set()
+
 # Pre-load the roster once for fast searching
 _roster_list: list[dict] | None = None
 
@@ -63,6 +66,9 @@ def _thumb_pixmap(player_id: int) -> QPixmap:
             return _clip_thumb(src)
 
     # Async fetch — return placeholder now, emit signal when ready
+    if player_id in _thumb_inflight:
+        return _placeholder_thumb()
+
     def _download():
         try:
             url = HEADSHOT_URL.format(pid=player_id)
@@ -77,7 +83,10 @@ def _thumb_pixmap(player_id: int) -> QPixmap:
                     _thumb_signal.ready.emit(player_id, _clip_thumb(pm))
         except Exception:
             log.debug("thumb fetch failed for %s", player_id)
+        finally:
+            _thumb_inflight.discard(player_id)
 
+    _thumb_inflight.add(player_id)
     _pool.submit(_download)
     return _placeholder_thumb()
 
