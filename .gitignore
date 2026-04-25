@@ -69,5 +69,6 @@ app/assets/headshots/
 app/player_ids_cache.json
 app/player_ids_cache.json.gz
 app/processed_dates_cache.json
+app/temp_lineups_cache.json
 app/temp_lineups_cache.json.gz
 app/schedule_*.json.gz
