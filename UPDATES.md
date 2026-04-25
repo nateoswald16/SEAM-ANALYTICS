@@ -4,6 +4,19 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.2.2 — 2026-04-24
+
+### Bug Fixes
+
+**Probable Pitcher Names Showing TBD**
+- Fixed a cache poisoning bug introduced in v1.2.1 where pitcher names appeared as "TBD" in the sidebar, all pitching stat tables, and probable pitcher displays on repeat launches
+- Root cause: the disk schedule cache fast-path (added in v1.2.1 to skip a 300–800ms network call on repeat same-day launches) saved the game list but did not restore `probable_pitchers` in memory; the subsequent 800ms background refresh ran in poll mode which intentionally skips `probablePitcher` API hydration, reading an empty cache and writing TBD back to disk — poisoning every future launch
+- Fixed by making the initial post-disk-cache background refresh use a full API fetch (`force_full=True`) so `probablePitcher` hydration always runs on the first poll
+- Added a `_merge_game` guard that prevents any poll result with TBD pitcher names from overwriting real names already held in `self._games`
+- Self-healing: users with a poisoned cache from v1.2.1 will see TBD for ~800ms on first launch after updating, then pitcher names populate automatically and the disk cache is repaired
+
+---
+
 ## v1.2.1 — 2026-04-24
 
 > [!WARNING]

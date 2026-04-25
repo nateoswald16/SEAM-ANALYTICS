@@ -9,7 +9,7 @@ Frozen    – read-only assets come from the PyInstaller bundle;
 import os
 import sys
 
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 # Database schema versions — bump these when tables/columns change.
 # The app checks these on startup and runs migrations or forces a recalc.

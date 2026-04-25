@@ -2867,6 +2867,25 @@ try:
     if _disk_games:
         GAMES = _disk_games
         _SCHEDULE_NEEDS_REFRESH = True   # window will trigger immediate poll
+        # Re-populate probable_pitchers from disk cache so the initial poll refresh
+        # (poll_mode=True, skips probablePitcher hydration) still resolves pitcher
+        # names instead of returning 'TBD' and overwriting the disk cache.
+        if hasattr(_DM, 'api') and _DM.api and hasattr(_DM.api, 'probable_pitchers'):
+            for _g in _disk_games:
+                _gid = str(_g.get('game_id') or _g.get('id') or '')
+                if not _gid:
+                    continue
+                _pp: dict = {}
+                for _side, _pfx in (('away', 'away_p'), ('home', 'home_p')):
+                    _name = _g.get(_pfx, '')
+                    _pid  = _g.get(f'{_pfx}_id')
+                    _full = _g.get(f'{_pfx}_full', '')
+                    _thr  = _g.get(f'{_pfx}_throws', '')
+                    if _name and _name != 'TBD':
+                        _pp[_side] = {'name': _name, 'fullName': _full,
+                                      'id': _pid, 'throws': _thr}
+                if _pp:
+                    _DM.api.probable_pitchers[_gid] = _pp
     else:
         live_today = _DM.fetch_live_games(today)
         if live_today:
@@ -7198,9 +7217,11 @@ class SeamStatsApp(QMainWindow):
         self._score_timer.start()
 
         # If we loaded GAMES from disk cache, kick off a live refresh right away
-        # (fires after the event loop starts so the window is already visible)
+        # (fires after the event loop starts so the window is already visible).
+        # Must use force_full=True so probablePitcher hydration runs and pitcher
+        # names are populated before the subsequent 5s poll-mode cycles take over.
         if _SCHEDULE_NEEDS_REFRESH:
-            QTimer.singleShot(800, self._poll_scores)
+            QTimer.singleShot(800, lambda: self._poll_scores(force_full=True))
 
         # Play-by-play notifier
         self._plays_notifier = _PlaysNotifier()
@@ -8586,7 +8607,7 @@ class SeamStatsApp(QMainWindow):
                         pass
         notifier.plays_ready.emit(result)
 
-    def _poll_scores(self):
+    def _poll_scores(self, force_full=False):
         """Spawn a single background thread to fetch scores + plays together."""
         if self._score_fetching:
             return
@@ -8618,7 +8639,7 @@ class SeamStatsApp(QMainWindow):
                 # Fetch scores and emit immediately so sidebar updates without
                 # waiting for the slower per-game play-by-play fetches.
                 try:
-                    games = _DM.fetch_live_games(dt.date.today().isoformat(), poll_mode=True)
+                    games = _DM.fetch_live_games(dt.date.today().isoformat(), poll_mode=(not force_full))
                 except Exception:
                     games = []
                 score_notifier.scores_ready.emit(games)
@@ -8710,6 +8731,14 @@ class SeamStatsApp(QMainWindow):
             # Preserve innings_detail when new is empty but old had data
             if not new.get('innings_detail') and old.get('innings_detail'):
                 merged['innings_detail'] = old['innings_detail']
+        # Never let a poll with TBD overwrite real pitcher names already known
+        for _fld in ('away_p', 'home_p', 'away_p_full', 'home_p_full',
+                     'away_p_throws', 'home_p_throws'):
+            if (new.get(_fld) or 'TBD') == 'TBD' and (old.get(_fld) or 'TBD') != 'TBD':
+                merged[_fld] = old[_fld]
+        for _fld in ('away_p_id', 'home_p_id'):
+            if not new.get(_fld) and old.get(_fld):
+                merged[_fld] = old[_fld]
         return merged
 
     def _on_scores_fetched(self, games):
