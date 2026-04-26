@@ -4,9 +4,104 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
-## v1.2.2 — 2026-04-24
+## v1.2.3 — 2026-04-26
+
+> [!WARNING]
+> **Database Rebuild Required for Existing Users**
+> This update includes schema changes to `mlb_raw.db` (new `runner_lead` table; `secondary_lead_allowed` column added to `pitcher_tempo`; raw DB schema bumped to v6). Users updating from a previous version **must** fully rebuild the raw database before use. After the rebuild completes, immediately run **Daily Update** inside the app to populate all new columns with current-season data. Fresh installs are unaffected.
+
+### Data
+
+**Pitch Tempo — Runners On Value Now Correct**
+- Fixed a Baseball Savant CSV bug where `Pace/Runners On` showed identical values to `Pace/Empty` for every pitcher
+- Root cause: the Savant CSV export for `/leaderboard/pitch-tempo` emits `median_seconds_empty` twice in the header row — the `median_seconds_onbase` column is silently renamed, making all 384+ pitcher rows read the same value for both fields
+- Fix: switched from the CSV endpoint to the full HTML page request; parses the `[{"entity_choice"...}]` JSON array embedded in the page which correctly exposes `median_seconds_onbase` with distinct per-pitcher values
+- All seasons (2021–2026) rebuilt; `Pace/Empty` and `Pace/Runners On` now show meaningfully different values in the baserunning tab
+
+**Catcher CSAA/Throw — New Column Replacing MaxEff**
+- Replaced the `MaxEff` (max arm efficiency) column in catcher baserunning tables with `CSAA/Throw` (Caught Stealing Above Average Per Throw)
+- `CSAA/Throw` is sourced from the Baseball Savant catcher-throwing leaderboard (`cs_aa_per_throw`) and controls for runner speed and throw distance, making it a more stable and meaningful arm metric than raw efficiency
+- Values are signed and displayed to 3 decimal places (e.g. `+0.087`, `-0.032`); green = above average (> +0.02), red = below average (< −0.02)
+- Raw DB column renamed `maxeff_arm_2b_3b_sba` → `csaa_per_throw` (schema migration added; existing databases auto-migrated on first run)
+- Raw DB schema bumped to v4; all seasons (2021–2026) rebuilt
+
+**Column Renames**
+- `Pace/Men On` renamed to `Pace/Runners On` in pitcher and catcher baserunning tables, BvP panels, tooltips, and MLB benchmark definitions
+- `MaxEff` renamed to `CSAA/Throw` in all catcher tables, BvP panels, tooltips, and MLB benchmark definitions
+
+**Baserunning Tab — Full Data Coverage**
+
+All three table roles in the Base Running tab now have a defined set of per-season stats sourced from Baseball Savant leaderboard endpoints and the local raw DB.
+
+*Runner table* — one row per lineup position:
+| Column | Source | Description |
+|---|---|---|
+| `OBP` | calc DB | On-base percentage |
+| `SB Att` | `stolen_bases` | Total steal attempts |
+| `SB` | `stolen_bases` | Successful steals |
+| `Stole 2nd` | `stolen_bases` | Successful steals of 2nd |
+| `Stole 3rd` | `stolen_bases` | Successful steals of 3rd |
+| `1° Lead` | Savant `basestealing-run-value` (`r_primary_lead`) | Average primary lead distance (ft) |
+| `2° Lead` | Savant `basestealing-run-value` (`r_secondary_lead − r_primary_lead`) | Lead gained during delivery — secondary minus primary (ft) |
+| `Sprint` | Savant `sprint_speed` | Sprint speed (ft/sec) |
+| `Bolts` | Savant `sprint_speed` | Sprint bolt attempts (≥30 ft/sec) |
+| `Bolt%` | Savant `sprint_speed` | Bolt attempts / sprint attempts |
+| `Comp Runs` | Savant `sprint_speed` | Competitive runs used for sprint speed sample |
+
+*Pitcher table* — one row per pitcher:
+| Column | Source | Description |
+|---|---|---|
+| `SB Att` | `stolen_bases` | Steal attempts while pitching |
+| `Pickoffs` | `stolen_bases` | Pickoff outs recorded |
+| `SB Allowed` | `stolen_bases` | Successful steals allowed |
+| `SB%` | `stolen_bases` | SB allowed / SB attempts |
+| `Pace/Runners On` | Savant `pitch-tempo` (`median_seconds_onbase`) | Median seconds between pitches with runner(s) on |
+| `2° Lead Allowed` | Savant `pitcher-running-game` (`r_sec_minus_prim_lead`) | Average secondary-minus-primary lead the pitcher surrenders (ft) |
+
+*Catcher table* — one row per catcher:
+| Column | Source | Description |
+|---|---|---|
+| `SB Att` | `stolen_bases` | Steal attempts against this catcher |
+| `CS` | `stolen_bases` | Runners caught stealing |
+| `SB Allowed` | `stolen_bases` | Successful steals allowed |
+| `SB%` | `stolen_bases` | SB allowed / attempts |
+| `Pop 2B` | Savant `catcher_poptime` | Pop time to 2nd base (seconds) |
+| `Pop 3B` | Savant `catcher_poptime` | Pop time to 3rd base (seconds) |
+| `CSAA/Throw` | Savant `catcher_throwing` (`cs_aa_per_throw`) | Caught stealing above average per throw |
+| `Exchange` | Savant `catcher_poptime` | Exchange time (catch-to-release, seconds) |
+
+**Column Changes**
+- `Delivery` renamed to `2° Lead Allowed` — value is now the secondary-minus-primary lead gap (ft) the pitcher surrenders, sourced from the Savant `pitcher-running-game` leaderboard; previously showed a raw delivery metric
+- `2° Lead` for runners now shows the *gain* (secondary − primary) rather than raw secondary lead distance, making it directly comparable to `2° Lead Allowed` on the pitcher side
+
+**Per-Season Savant Sourcing**
+- All Savant leaderboard endpoints now called with `season_start`/`season_end` params (the `year=` param is silently ignored by the Savant CSV endpoint)
+- Runner lead and pitcher secondary lead data is genuinely per-season; all seasons 2021–present populated; daily update re-fetches the current season on every run
+
+### UI
+
+**Context-Aware Column Tooltips**
+- Stats that appear in both batter and pitcher tables now show context-specific tooltip text when hovering the column header, rather than a single generic description
+- The table context (batter, pitcher, or catcher) is inferred from the column list — if `PITCHER` is present the pitcher variant is shown, if `CATCHER` is present the catcher variant is shown, otherwise the batter variant is used
+- Stats upgraded to context-aware tooltips: `K%`, `BB%`, `H`, `1B`, `2B`, `3B`, `HR`, `OBP`, `SLG`, `Hard%`, `FB%`
+- Also fixed a latent bug where the pitcher `FB%` tooltip was silently overwriting the batter `FB%` tooltip in the dictionary (duplicate key); both variants are now stored correctly
+
+---
 
 ### Bug Fixes
+
+**Doubleheader Game 2 Showing Incorrect Start Time**
+- Fixed an issue where a rescheduled doubleheader game 2 with no announced start time (e.g. COL @ NYM game 2) would display a fabricated time instead of "TBD"
+- Root cause: the MLB API sets `status.startTimeTBD: true` on game 2 when the time is unannounced, but still populates `gameDate` with a placeholder UTC timestamp; the schedule parser was blindly converting that placeholder into a displayable time string
+- Fixed by reading `startTimeTBD` from the API response — when `true`, `time` is set to `"TBD"` and the placeholder timestamp is stored separately as `sort_time_str` for ordering only
+- Sort key updated to fall back to `sort_time_str` for "TBD" games so doubleheader game 2 appears directly after game 1 in the sidebar rather than at the end of the list
+- Added a `_merge_game` guard that prevents a poll response with a "TBD" time from overwriting a confirmed game time already held in `self._games`
+
+---
+
+## v1.2.2 — 2026-04-24
+
+### Bug Hotfix
 
 **Probable Pitcher Names Showing TBD**
 - Fixed a cache poisoning bug introduced in v1.2.1 where pitcher names appeared as "TBD" in the sidebar, all pitching stat tables, and probable pitcher displays on repeat launches

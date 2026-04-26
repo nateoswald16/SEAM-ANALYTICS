@@ -173,23 +173,67 @@ def main(argv: list[str] | None = None, gui_cb=None):
 
     DB_PATH = _app_paths.RAW_DB
 
-    def _get_last_game_date(db_path: str):
-        """Return the latest game_date with actual play data (plate_appearances), or None."""
+    def _get_first_incomplete_date(db_path: str, lookback_days: int = 7):
+        """Return the earliest date that needs ingestion.
+
+        Scans from Opening Day of the current season (not just a rolling window)
+        so internal gaps — where data exists before AND after a missing stretch —
+        are caught even if the most recent PA date is today.
+
+        Falls back to MAX(PA date) + 1 if the games table has no schedule rows
+        for the gap (long gap / fresh install where schedule was never fetched)."""
         if not os.path.exists(db_path):
             return None
         try:
             conn = sqlite3.connect(db_path)
             cur = conn.cursor()
-            cur.execute("SELECT MAX(game_date) FROM plate_appearances")
+            current_year = date.today().year
+            # Use Opening Day from the games table for the current season
+            cur.execute("""
+                SELECT MIN(game_date) FROM games
+                WHERE season = ? AND game_type = 'R'
+            """, (current_year,))
+            r_od = cur.fetchone()
+            if r_od and r_od[0]:
+                season_start = r_od[0]
+            else:
+                # No games table entries yet — fall back to rolling lookback
+                season_start = (date.today() - timedelta(days=max(lookback_days, 7))).isoformat()
+
+            # Find earliest date where games table shows more scheduled than ingested
+            cur.execute("""
+                SELECT g.game_date
+                FROM (
+                    SELECT game_date, COUNT(*) AS scheduled
+                    FROM games
+                    WHERE game_date >= ? AND game_date <= ?
+                    GROUP BY game_date
+                ) g
+                LEFT JOIN (
+                    SELECT game_date, COUNT(DISTINCT game_id) AS ingested
+                    FROM plate_appearances
+                    WHERE game_date >= ?
+                    GROUP BY game_date
+                ) p ON g.game_date = p.game_date
+                WHERE COALESCE(p.ingested, 0) < g.scheduled
+                ORDER BY g.game_date ASC
+                LIMIT 1
+            """, (season_start, date.today().isoformat(), season_start))
             r = cur.fetchone()
+            if r:
+                conn.close()
+                return date.fromisoformat(r[0])
+            # Games table complete or sparse — fall back to MAX(PA date) + 1
+            cur.execute("SELECT MAX(game_date) FROM plate_appearances")
+            r2 = cur.fetchone()
             conn.close()
-            if r and r[0]:
+            if r2 and r2[0]:
                 try:
-                    return date.fromisoformat(r[0])
+                    return date.fromisoformat(r2[0]) + timedelta(days=1)
                 except Exception:
                     return None
         except Exception as e:
-            print('Warning checking last game date in DB:', e)
+            print('Warning checking for incomplete game dates:', e)
         return None
 
     def _find_dates_missing_statcast(db_path: str, max_age_days: int = 7):
@@ -235,22 +279,20 @@ def main(argv: list[str] | None = None, gui_cb=None):
     # Use today (not yesterday) so completed games are ingested immediately;
     # statcast enrichment will backfill once data becomes available (24-48 h).
     today = date.today()
-    last_game = _get_last_game_date(DB_PATH)
+    start_dt = _get_first_incomplete_date(DB_PATH, lookback_days=7)
 
     ingested_new = False
     ingested_start = None
     ingested_end = None
 
-    if last_game is None:
+    if start_dt is None:
         # DB empty or missing → fall back to days_back window (preserve previous default)
         start_dt = (today - timedelta(days=args.days_back))
-    else:
-        start_dt = last_game + timedelta(days=1)
 
     end_dt = today
 
     if start_dt > end_dt:
-        print(f"No missing games to ingest (last game in DB: {last_game.isoformat() if last_game else 'none'}).")
+        print(f"No missing games to ingest (DB is up to date through {end_dt.isoformat()}).")
     else:
         ingested_new = True
         ingested_start = start_dt

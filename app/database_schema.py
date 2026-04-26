@@ -217,12 +217,51 @@ CREATE TABLE IF NOT EXISTS sprint_speeds (
   PRIMARY KEY (player_id, season)
 );
 
+-- Pitcher delivery time to plate (Baseball Savant pitch-tempo leaderboard)
+CREATE TABLE IF NOT EXISTS pitcher_tempo (
+  player_id INTEGER NOT NULL,
+  season INTEGER NOT NULL,
+  total_pitches INTEGER,
+  median_seconds_empty REAL,
+  median_seconds_on_base REAL,
+  time_to_home_avg REAL,
+  secondary_lead_allowed REAL,
+  PRIMARY KEY (player_id, season)
+);
+
+-- Catcher pop time (Baseball Savant poptime leaderboard)
+CREATE TABLE IF NOT EXISTS catcher_poptime (
+  player_id INTEGER NOT NULL,
+  season INTEGER NOT NULL,
+  pop_2b_sba_count INTEGER,
+  pop_2b_sba REAL,
+  pop_2b_cs REAL,
+  pop_2b_sb REAL,
+  pop_3b_sba_count INTEGER,
+  pop_3b_sba REAL,
+  csaa_per_throw REAL,
+  exchange_2b_3b_sba REAL,
+  PRIMARY KEY (player_id, season)
+);
+
+-- Runner primary/secondary lead distance (Baseball Savant running-game leaderboard)
+CREATE TABLE IF NOT EXISTS runner_lead (
+  player_id INTEGER NOT NULL,
+  season INTEGER NOT NULL,
+  primary_lead_avg REAL,
+  secondary_lead_avg REAL,
+  PRIMARY KEY (player_id, season)
+);
+
 -- Indexes
+CREATE INDEX IF NOT EXISTS idx_runner_lead_player_season ON runner_lead(player_id, season);
 CREATE INDEX IF NOT EXISTS idx_stolen_runner ON stolen_bases(runner_id);
 CREATE INDEX IF NOT EXISTS idx_stolen_pitcher ON stolen_bases(pitcher_id);
 CREATE INDEX IF NOT EXISTS idx_stolen_catcher ON stolen_bases(catcher_id);
 CREATE INDEX IF NOT EXISTS idx_stolen_season ON stolen_bases(season);
 CREATE INDEX IF NOT EXISTS idx_sprint_player_season ON sprint_speeds(player_id, season);
+CREATE INDEX IF NOT EXISTS idx_pitcher_tempo_player_season ON pitcher_tempo(player_id, season);
+CREATE INDEX IF NOT EXISTS idx_catcher_poptime_player_season ON catcher_poptime(player_id, season);
 
 CREATE INDEX IF NOT EXISTS idx_games_game_date ON games(game_date);
 CREATE INDEX IF NOT EXISTS idx_games_season ON games(season);

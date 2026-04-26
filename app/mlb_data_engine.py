@@ -291,10 +291,18 @@ class MLBDataEngine:
                                         "throws": ph.get('code', '') if ph else '',
                                     }
                             self.probable_pitchers[game_id_str] = pp_data
-                        
+
+                        # MLB API sets startTimeTBD=True for doubleheader game 2 with
+                        # no announced time; gameDate still carries a placeholder timestamp
+                        # which we preserve only for sort ordering.
+                        start_time_tbd = bool(game_info.get('status', {}).get('startTimeTBD', False))
+                        game_number = game_info.get('gameNumber', 1)
+                        double_header = game_info.get('doubleHeader', 'N')
+
                         # Parse time
+                        sort_time_str = game_time_str  # raw UTC — used for sort even when TBD
                         time_str = "TBD"
-                        if game_time_str:
+                        if game_time_str and not start_time_tbd:
                             try:
                                 # Parse as UTC datetime
                                 dt_utc = datetime.fromisoformat(game_time_str.replace('Z', '+00:00'))
@@ -332,6 +340,9 @@ class MLBDataEngine:
                             "away": self._get_team_abbreviation(away_team),
                             "home": self._get_team_abbreviation(home_team),
                             "time": time_str,
+                            "sort_time_str": sort_time_str,
+                            "game_number": game_number,
+                            "double_header": double_header,
                             "status": status,
                             "abstract_state": abstract_state,
                             "away_score": away_score if away_score is not None else 0,
@@ -1762,7 +1773,7 @@ class MLBDataEngine:
                 dy = 198.27 - bbe_air['hc_y'].to_numpy(dtype=float)
                 dx = bbe_air['hc_x'].to_numpy(dtype=float) - 125.42
                 valid = dy != 0
-                raw_ang = _np.where(valid, _np.arctan(dx / _np.where(valid, dy, 1)) * (180 / _np.pi) * 0.75, 0)
+                raw_ang = _np.where(valid, _np.arctan(dx / _np.where(valid, dy, 1)) * (180 / _np.pi), 0)
                 is_right = bbe_air['stand'].to_numpy() == 'R'
                 adj_ang = _np.where(is_right, raw_ang, -raw_ang)
                 pulled_air_count = int(_np.sum((adj_ang < -17) & valid))

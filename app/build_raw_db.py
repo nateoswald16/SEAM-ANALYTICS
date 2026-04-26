@@ -123,6 +123,46 @@ def create_db(db_path: str = DB_PATH):
     except Exception as e:
         print('Warning during stolen_bases migration:', e)
 
+    # Migration: rename maxeff_arm_2b_3b_sba -> csaa_per_throw in catcher_poptime
+    try:
+        cur.execute("PRAGMA table_info(catcher_poptime)")
+        cp_cols = [r[1] for r in cur.fetchall()]
+        if 'maxeff_arm_2b_3b_sba' in cp_cols and 'csaa_per_throw' not in cp_cols:
+            try:
+                cur.execute("ALTER TABLE catcher_poptime RENAME COLUMN maxeff_arm_2b_3b_sba TO csaa_per_throw")
+                print('Renamed maxeff_arm_2b_3b_sba to csaa_per_throw in catcher_poptime')
+            except Exception as e:
+                print('Warning renaming maxeff column:', e)
+        elif 'csaa_per_throw' not in cp_cols:
+            try:
+                cur.execute("ALTER TABLE catcher_poptime ADD COLUMN csaa_per_throw REAL")
+                print('Added csaa_per_throw column to catcher_poptime')
+            except Exception as e:
+                print('Warning adding csaa_per_throw column:', e)
+        conn.commit()
+    except Exception as e:
+        print('Warning during catcher_poptime migration:', e)
+
+    # Migration: add time_to_home_avg to pitcher_tempo if missing
+    try:
+        cur.execute("PRAGMA table_info(pitcher_tempo)")
+        pt_cols = [r[1] for r in cur.fetchall()]
+        if 'time_to_home_avg' not in pt_cols:
+            try:
+                cur.execute("ALTER TABLE pitcher_tempo ADD COLUMN time_to_home_avg REAL")
+                print('Added time_to_home_avg column to pitcher_tempo')
+            except Exception as e:
+                print('Warning adding time_to_home_avg column:', e)
+        if 'secondary_lead_allowed' not in pt_cols:
+            try:
+                cur.execute("ALTER TABLE pitcher_tempo ADD COLUMN secondary_lead_allowed REAL")
+                print('Added secondary_lead_allowed column to pitcher_tempo')
+            except Exception as e:
+                print('Warning adding secondary_lead_allowed column:', e)
+        conn.commit()
+    except Exception as e:
+        print('Warning during pitcher_tempo migration:', e)
+
     # ── Schema version tracking ──────────────────────────────────────
     cur.execute("CREATE TABLE IF NOT EXISTS schema_version (key TEXT PRIMARY KEY, value INTEGER)")
     cur.execute("INSERT OR REPLACE INTO schema_version (key, value) VALUES ('version', ?)",
@@ -1111,6 +1151,292 @@ def fetch_sprint_speeds(season: int, conn: sqlite3.Connection):
         return 0
 
 
+def fetch_runner_lead(season: int, conn: sqlite3.Connection):
+    """Fetch runner primary/secondary lead distance from Baseball Savant basestealing-run-value leaderboard.
+    Uses season_start/season_end params for genuine per-season data.
+    """
+    try:
+        import io
+        url = 'https://baseballsavant.mlb.com/leaderboard/basestealing-run-value'
+        params = {'csv': 'true', 'season_start': season, 'season_end': season,
+                  'target_base': 'All', 'game_type': 'Regular', 'split': 'no', 'n': 'q'}
+        res = _http.get(url, params=params, timeout=30)
+        if res.status_code != 200 or not res.content:
+            print(f'  No runner lead data for {season} (status {res.status_code})')
+            return 0
+        df = pd.read_csv(io.StringIO(res.text))
+        if df.empty:
+            print(f'  No runner lead data for {season}')
+            return 0
+        df.columns = [c.lower().strip() for c in df.columns]
+        # Filter to overall rows only (key_target_base == 'All')
+        if 'key_target_base' in df.columns:
+            df = df[df['key_target_base'].str.lower() == 'all']
+        pid_col = next((c for c in df.columns if c in ('player_id', 'entity_id')), None)
+        pri_col = 'r_primary_lead' if 'r_primary_lead' in df.columns else None
+        sec_col = 'r_secondary_lead' if 'r_secondary_lead' in df.columns else None
+        if pid_col is None:
+            print(f'  runner_lead: no player_id column for {season} (cols: {list(df.columns)[:10]})')
+            return 0
+        cur = conn.cursor()
+        count = 0
+        for _, row in df.iterrows():
+            pid = row.get(pid_col)
+            if pid is None or pd.isna(pid):
+                continue
+            pri = row.get(pri_col) if pri_col else None
+            sec = row.get(sec_col) if sec_col else None
+            pri = float(pri) if pri is not None and not pd.isna(pri) else None
+            sec = float(sec) if sec is not None and not pd.isna(sec) else None
+            cur.execute(
+                'INSERT OR REPLACE INTO runner_lead (player_id, season, primary_lead_avg, secondary_lead_avg) '
+                'VALUES (?, ?, ?, ?)',
+                (int(pid), season, pri, sec)
+            )
+            count += 1
+        conn.commit()
+        print(f'  Runner lead: {count} players for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch runner lead data for {season}: {e}')
+        return 0
+        if res.status_code != 200 or not res.content:
+            print(f'  No runner lead data for {season} (status {res.status_code})')
+            return 0
+        df = pd.read_csv(io.StringIO(res.text))
+        if df.empty:
+            print(f'  No runner lead data for {season}')
+            return 0
+        df.columns = [c.lower().strip() for c in df.columns]
+        # Filter to overall rows only (key_target_base == 'All')
+        if 'key_target_base' in df.columns:
+            df = df[df['key_target_base'].str.lower() == 'all']
+        pid_col = next((c for c in df.columns if c == 'player_id'), None)
+        pri_col = 'r_primary_lead' if 'r_primary_lead' in df.columns else None
+        sec_col = 'r_secondary_lead' if 'r_secondary_lead' in df.columns else None
+        if pid_col is None:
+            print(f'  runner_lead: no player_id column for {season} (cols: {list(df.columns)[:10]})')
+            return 0
+        cur = conn.cursor()
+        count = 0
+        for _, row in df.iterrows():
+            pid = row.get(pid_col)
+            if pid is None or pd.isna(pid):
+                continue
+            pri = row.get(pri_col) if pri_col else None
+            sec = row.get(sec_col) if sec_col else None
+            pri = float(pri) if pri is not None and not pd.isna(pri) else None
+            sec = float(sec) if sec is not None and not pd.isna(sec) else None
+            cur.execute(
+                'INSERT OR REPLACE INTO runner_lead (player_id, season, primary_lead_avg, secondary_lead_avg) '
+                'VALUES (?, ?, ?, ?)',
+                (int(pid), season, pri, sec)
+            )
+            count += 1
+        conn.commit()
+        print(f'  Runner lead: {count} players for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch runner lead data for {season}: {e}')
+        return 0
+
+
+def fetch_pitcher_delivery(season: int, conn: sqlite3.Connection):
+    """Fetch average secondary lead gained (secondary - primary) allowed by pitcher from Baseball Savant
+    pitcher-running-game leaderboard and upsert into pitcher_tempo.secondary_lead_allowed.
+    Uses r_sec_minus_prim_lead if available, otherwise computes r_secondary_lead - r_primary_lead."""
+    try:
+        import io
+        url = 'https://baseballsavant.mlb.com/leaderboard/pitcher-running-game'
+        params = {'csv': 'true', 'season_start': season, 'season_end': season,
+                  'target_base': 'All', 'game_type': 'Regular', 'type': 'Pit', 'split': 'no', 'n': 'q'}
+        res = _http.get(url, params=params, timeout=30)
+        if res.status_code != 200 or not res.content:
+            print(f'  No pitcher running-game data for {season} (status {res.status_code})')
+            return 0
+        df = pd.read_csv(io.StringIO(res.text))
+        if df.empty:
+            print(f'  No pitcher running-game data for {season}')
+            return 0
+        df.columns = [c.lower().strip() for c in df.columns]
+        # Filter to overall rows only (key_target_base == 'All')
+        if 'key_target_base' in df.columns:
+            df = df[df['key_target_base'].str.lower() == 'all']
+        pid_col = next((c for c in df.columns if c in ('player_id', 'entity_id')), None)
+        if pid_col is None:
+            print(f'  pitcher_delivery: no player_id column for {season} (cols: {list(df.columns)[:15]})')
+            return 0
+        # Prefer precomputed difference; fall back to manual subtraction
+        if 'r_sec_minus_prim_lead' in df.columns:
+            diff_col = 'r_sec_minus_prim_lead'
+            compute_diff = False
+        elif 'r_secondary_lead' in df.columns and 'r_primary_lead' in df.columns:
+            diff_col = None
+            compute_diff = True
+        else:
+            print(f'  pitcher_delivery: missing lead columns for {season} (cols: {list(df.columns)[:15]})')
+            return 0
+        cur = conn.cursor()
+        count = 0
+        for _, row in df.iterrows():
+            pid = row.get(pid_col)
+            if pid is None or pd.isna(pid):
+                continue
+            if compute_diff:
+                sec = row.get('r_secondary_lead')
+                pri = row.get('r_primary_lead')
+                if sec is not None and pri is not None and not pd.isna(sec) and not pd.isna(pri):
+                    val = float(sec) - float(pri)
+                else:
+                    val = None
+            else:
+                raw = row.get(diff_col)
+                val = float(raw) if raw is not None and not pd.isna(raw) else None
+            cur.execute(
+                'INSERT INTO pitcher_tempo (player_id, season, secondary_lead_allowed) VALUES (?, ?, ?) '
+                'ON CONFLICT(player_id, season) DO UPDATE SET secondary_lead_allowed=excluded.secondary_lead_allowed',
+                (int(pid), season, val)
+            )
+            count += 1
+        conn.commit()
+        print(f'  Pitcher secondary lead allowed: {count} pitchers for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch pitcher running-game data for {season}: {e}')
+        return 0
+
+
+def fetch_pitcher_tempo(season: int, conn: sqlite3.Connection):
+    """Fetch pitcher delivery time to plate from Baseball Savant and upsert into pitcher_tempo table.
+
+    NOTE: The Baseball Savant CSV export for pitch-tempo has a bug where it outputs
+    median_seconds_empty twice (the on-base column is mislabeled). We parse the JSON
+    data embedded in the HTML page instead to get correct distinct values for both splits.
+    """
+    try:
+        import requests, re, json
+        url = 'https://baseballsavant.mlb.com/leaderboard/pitch-tempo'
+        params = {
+            'game_type': 'Regular', 'n': 'q',
+            'season_end': season, 'season_start': season,
+            'split': 'no', 'team': '', 'type': 'Pit',
+            'with_team_only': 1,
+        }
+        res = requests.get(url, params=params, timeout=30)
+        if res.status_code != 200 or not res.content:
+            print(f'  No pitcher tempo data for {season} (status {res.status_code})')
+            return 0
+        html = res.text
+        m = re.search(r'(\[\{\"entity_choice\".*?\}\])', html, re.DOTALL)
+        if not m:
+            print(f'  No pitcher tempo data embedded in page for {season}')
+            return 0
+        rows = json.loads(m.group(1))
+        cur = conn.cursor()
+        count = 0
+        for row in rows:
+            pid = row.get('entity_id')
+            if pid is None:
+                continue
+            total_pitches = row.get('tot_n')
+            med_empty = row.get('median_seconds_empty')
+            med_on_base = row.get('median_seconds_onbase')
+            total_pitches = int(total_pitches) if total_pitches is not None else None
+            med_empty = float(med_empty) if med_empty is not None else None
+            med_on_base = float(med_on_base) if med_on_base is not None else None
+            cur.execute('''INSERT OR REPLACE INTO pitcher_tempo
+                           (player_id, season, total_pitches, median_seconds_empty, median_seconds_on_base)
+                           VALUES (?, ?, ?, ?, ?)''',
+                        (int(pid), season, total_pitches, med_empty, med_on_base))
+            count += 1
+        conn.commit()
+        print(f'  Pitcher tempo: {count} pitchers for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch pitcher tempo for {season}: {e}')
+        return 0
+
+
+def fetch_catcher_poptime(season: int, conn: sqlite3.Connection):
+    """Fetch catcher pop time from Baseball Savant via pybaseball and upsert into catcher_poptime table."""
+    try:
+        from pybaseball import statcast_catcher_poptime
+        df = statcast_catcher_poptime(season, min_2b_att=1, min_3b_att=0)
+        if df is None or df.empty:
+            print(f'  No catcher pop time data for {season}')
+            return 0
+        cur = conn.cursor()
+        count = 0
+        for _, row in df.iterrows():
+            pid = row.get('entity_id')
+            if pid is None or pd.isna(pid):
+                continue
+
+            def _f(col):
+                v = row.get(col)
+                return float(v) if v is not None and not pd.isna(v) else None
+
+            def _i(col):
+                v = row.get(col)
+                return int(v) if v is not None and not pd.isna(v) else None
+
+            cur.execute('''INSERT OR REPLACE INTO catcher_poptime
+                           (player_id, season, pop_2b_sba_count, pop_2b_sba, pop_2b_cs, pop_2b_sb,
+                            pop_3b_sba_count, pop_3b_sba, exchange_2b_3b_sba)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                        (int(pid), season,
+                         _i('pop_2b_sba_count'), _f('pop_2b_sba'), _f('pop_2b_cs'), _f('pop_2b_sb'),
+                         _i('pop_3b_sba_count'), _f('pop_3b_sba'), _f('exchange_2b_3b_sba')))
+            count += 1
+        conn.commit()
+        print(f'  Catcher pop time: {count} catchers for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch catcher pop time for {season}: {e}')
+        return 0
+
+
+def fetch_catcher_throwing(season: int, conn: sqlite3.Connection):
+    """Fetch catcher CSAA-per-throw from Baseball Savant catcher-throwing leaderboard."""
+    try:
+        import requests, io
+        url = 'https://baseballsavant.mlb.com/leaderboard/catcher-throwing'
+        params = {
+            'game_type': 'Regular', 'n': 'q',
+            'season_end': season, 'season_start': season,
+            'split': 'no', 'team': '', 'type': 'Cat',
+            'with_team_only': 1, 'target_base': 'All',
+            'csv': 'true',
+        }
+        res = requests.get(url, params=params, timeout=30)
+        if res.status_code != 200 or not res.content:
+            print(f'  No catcher throwing data for {season} (status {res.status_code})')
+            return 0
+        df = pd.read_csv(io.StringIO(res.content.decode('utf-8-sig')))
+        if df is None or df.empty:
+            print(f'  No catcher throwing data for {season}')
+            return 0
+        cur = conn.cursor()
+        count = 0
+        for _, row in df.iterrows():
+            pid = row.get('player_id')
+            if pid is None or pd.isna(pid):
+                continue
+            csaa_per_throw = row.get('cs_aa_per_throw')
+            csaa_per_throw = float(csaa_per_throw) if csaa_per_throw is not None and not pd.isna(csaa_per_throw) else None
+            cur.execute('''INSERT INTO catcher_poptime (player_id, season, csaa_per_throw)
+                           VALUES (?, ?, ?)
+                           ON CONFLICT(player_id, season) DO UPDATE SET csaa_per_throw=excluded.csaa_per_throw''',
+                        (int(pid), season, csaa_per_throw))
+            count += 1
+        conn.commit()
+        print(f'  Catcher throwing (CSAA/throw): {count} catchers for {season}')
+        return count
+    except Exception as e:
+        print(f'  Warning: failed to fetch catcher throwing for {season}: {e}')
+        return 0
+
+
 def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bool = False, progress_cb=None, games=None):
     """Ingest game feeds and enrich with statcast.
 
@@ -1211,6 +1537,11 @@ def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bo
         progress_cb('statcast', 0, 1, None)
     enrich_with_statcast(conn, start_date, end_date)
     fetch_sprint_speeds(season, conn)
+    fetch_runner_lead(season, conn)
+    fetch_pitcher_tempo(season, conn)
+    fetch_pitcher_delivery(season, conn)
+    fetch_catcher_poptime(season, conn)
+    fetch_catcher_throwing(season, conn)
     if progress_cb:
         progress_cb('statcast', 1, 1, None)
     conn.close()

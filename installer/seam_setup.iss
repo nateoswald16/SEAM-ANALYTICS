@@ -6,12 +6,12 @@
 ;         (run from repo root, or adjust SourceDir below)
 
 #define MyAppName      "Seam Analytics"
-#define MyAppVersion   "1.2.2"
+#define MyAppVersion   "1.2.3"
 #define MyAppPublisher "Seam Analytics"
 #define MyAppExeName   "SeamAnalytics.exe"
 #define MyUpdaterExe   "SeamUpdater.exe"
-#define RawDBSchemaVersion   "2"
-#define CalcDBSchemaVersion "11"
+#define RawDBSchemaVersion   "6"
+#define CalcDBSchemaVersion "12"
 
 [Setup]
 AppId={{B8A3D6F1-7C2E-4A91-9D0B-3E5F8C1A2B4D}

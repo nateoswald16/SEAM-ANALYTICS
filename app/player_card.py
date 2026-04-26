@@ -49,9 +49,252 @@ os.makedirs(HEADSHOT_DIR, exist_ok=True)
 # ── Player roster CSV ───────────────────────────────────────────────
 PLAYERS_CSV = _app_paths.PLAYERS_CSV
 _roster_cache: dict | None = None
+_enrichment_inflight: set[int] = set()
+
+
+def _supplement_roster_from_db(cache: dict) -> None:
+    """Add stub entries for players in the raw DB but missing from players.csv."""
+    if not os.path.exists(_app_paths.RAW_DB):
+        return
+    try:
+        conn = sqlite3.connect(_app_paths.RAW_DB, timeout=10)
+
+        # ── Batters ──────────────────────────────────────────────────
+        batter_rows = conn.execute("""
+            WITH latest AS (
+                SELECT batter_id, MAX(game_date) AS max_date
+                FROM plate_appearances
+                GROUP BY batter_id
+            )
+            SELECT pa.batter_id, pa.batter_name,
+                   CASE WHEN pa.batter_is_home = 1
+                        THEN g.home_team ELSE g.away_team END AS team,
+                   pa.stand AS bats
+            FROM plate_appearances pa
+            JOIN latest l ON pa.batter_id = l.batter_id
+                         AND pa.game_date = l.max_date
+            JOIN games g ON pa.game_id = g.game_id
+            GROUP BY pa.batter_id
+        """).fetchall()
+
+        for batter_id, batter_name, team, bats in batter_rows:
+            if not batter_id or batter_id in cache:
+                continue
+            name = batter_name or ""
+            parts = name.split()
+            cache[batter_id] = {
+                "player_id": str(batter_id),
+                "name_full": name,
+                "name_last": parts[-1] if parts else "",
+                "name_first": parts[0] if parts else "",
+                "team": team or "",
+                "team_id": "",
+                "jersey_number": "",
+                "position": "",
+                "position_type": "",
+                "bats": bats or "",
+                "throws": "",
+                "age": "",
+                "height": "",
+                "weight": "",
+                "mlb_debut": "",
+                "birth_country": "",
+                "headshot_url": HEADSHOT_URL.format(pid=batter_id),
+                "_db_stub": True,
+            }
+
+        # ── Pitchers ─────────────────────────────────────────────────
+        pitcher_rows = conn.execute("""
+            WITH latest AS (
+                SELECT pitcher_id, MAX(game_date) AS max_date
+                FROM plate_appearances
+                GROUP BY pitcher_id
+            )
+            SELECT pa.pitcher_id, pa.pitcher_name,
+                   CASE WHEN pa.batter_is_home = 1
+                        THEN g.away_team ELSE g.home_team END AS team,
+                   pa.p_throws AS throws
+            FROM plate_appearances pa
+            JOIN latest l ON pa.pitcher_id = l.pitcher_id
+                         AND pa.game_date = l.max_date
+            JOIN games g ON pa.game_id = g.game_id
+            GROUP BY pa.pitcher_id
+        """).fetchall()
+
+        for pitcher_id, pitcher_name, team, throws in pitcher_rows:
+            if not pitcher_id or pitcher_id in cache:
+                continue
+            name = pitcher_name or ""
+            parts = name.split()
+            cache[pitcher_id] = {
+                "player_id": str(pitcher_id),
+                "name_full": name,
+                "name_last": parts[-1] if parts else "",
+                "name_first": parts[0] if parts else "",
+                "team": team or "",
+                "team_id": "",
+                "jersey_number": "",
+                "position": "P",
+                "position_type": "Pitcher",
+                "bats": "",
+                "throws": throws or "",
+                "age": "",
+                "height": "",
+                "weight": "",
+                "mlb_debut": "",
+                "birth_country": "",
+                "headshot_url": HEADSHOT_URL.format(pid=pitcher_id),
+                "_db_stub": True,
+            }
+
+        conn.close()
+        csv_count = sum(1 for v in cache.values() if not v.get("_db_stub"))
+        stub_count = len(cache) - csv_count
+        if stub_count:
+            log.debug("roster: %d from CSV, %d supplemented from DB", csv_count, stub_count)
+    except Exception:
+        log.exception("_supplement_roster_from_db")
+
+
+# ── Today's lineup-derived team map (ground truth, overrides CSV/API) ─
+_today_player_teams: dict[int, str] = {}
+
+
+def set_today_player_teams(pt: dict[int, str]) -> None:
+    """Store today's {player_id: team} map and immediately fix roster cache + CSV.
+
+    Called once from the leaderboard fetch thread after lineups are loaded.
+    The lineup cache is the ground truth for current team — it overrides any
+    stale values in players.csv or the MLB Stats API.
+    """
+    global _today_player_teams
+    _today_player_teams = pt
+    cache = _load_roster()
+    changed: list[int] = []
+    for pid, team in pt.items():
+        entry = cache.get(pid)
+        if entry and entry.get("team") != team:
+            log.debug("team correction: player %s %s → %s", pid,
+                      entry.get("team"), team)
+            entry["team"] = team
+            changed.append(pid)
+    if changed:
+        log.debug("persisting %d team corrections from lineup cache", len(changed))
+        for pid in changed:
+            _persist_roster_entry(pid, cache[pid])
+
+
+_CSV_FIELDS = [
+    "player_id", "name_full", "name_last", "name_first",
+    "team", "team_id", "jersey_number",
+    "position", "position_type",
+    "bats", "throws",
+    "age", "height", "weight",
+    "mlb_debut", "birth_country",
+    "headshot_url",
+]
+
+_csv_write_lock = __import__("threading").Lock()
+
+
+def _persist_roster_entry(player_id: int, entry: dict) -> None:
+    """Rewrite players.csv with the updated entry for player_id.
+
+    Thread-safe; silently skips if the CSV doesn't exist yet.
+    """
+    if not os.path.exists(PLAYERS_CSV):
+        return
+    try:
+        import csv as _csv2
+        with _csv_write_lock:
+            with open(PLAYERS_CSV, encoding="utf-8", newline="") as f:
+                rows = list(_csv2.DictReader(f))
+            updated = False
+            for row in rows:
+                try:
+                    if int(row.get("player_id", -1)) == player_id:
+                        for field in _CSV_FIELDS:
+                            if field in entry and entry[field] not in (None, ""):
+                                row[field] = entry[field]
+                        updated = True
+                        break
+                except ValueError:
+                    continue
+            if not updated:
+                # New player (DB stub) — append
+                new_row = {f: entry.get(f, "") for f in _CSV_FIELDS}
+                rows.append(new_row)
+            with open(PLAYERS_CSV, "w", encoding="utf-8", newline="") as f:
+                writer = _csv2.DictWriter(f, fieldnames=_CSV_FIELDS, extrasaction="ignore")
+                writer.writeheader()
+                writer.writerows(rows)
+            log.debug("persisted player %s to %s", player_id, PLAYERS_CSV)
+    except Exception:
+        log.debug("_persist_roster_entry failed for %s", player_id)
+
+
+def _enrich_player(player_id: int) -> None:
+    """Async: fetch bio from MLB API and update the roster cache entry.
+
+    Called for DB stubs (missing from CSV) and for any CSV player whose
+    team may be stale (e.g. traded players).
+    """
+    if player_id in _enrichment_inflight:
+        return
+    _enrichment_inflight.add(player_id)
+
+    def _do_fetch():
+        try:
+            resp = _http.get(
+                f"https://statsapi.mlb.com/api/v1/people/{player_id}?hydrate=currentTeam",
+                timeout=8,
+            )
+            if resp.status_code != 200:
+                return
+            people = resp.json().get("people", [])
+            if not people:
+                return
+            data = people[0]
+            cache = _load_roster()
+            entry = cache.get(player_id)
+            if entry is None:
+                return
+            entry["name_full"] = data.get("fullName", entry["name_full"])
+            entry["name_first"] = data.get("firstName", entry["name_first"])
+            entry["name_last"] = data.get("lastName", entry["name_last"])
+            entry["bats"] = data.get("batSide", {}).get("code", entry["bats"])
+            entry["throws"] = data.get("pitchHand", {}).get("code", entry["throws"])
+            entry["age"] = str(data.get("currentAge", ""))
+            entry["height"] = data.get("height", "")
+            entry["weight"] = str(data.get("weight", ""))
+            entry["mlb_debut"] = data.get("mlbDebutDate", "")
+            entry["birth_country"] = data.get("birthCountry", "")
+            ct = data.get("currentTeam", {})
+            if ct.get("abbreviation"):
+                entry["team"] = ct["abbreviation"]
+                entry["team_id"] = str(ct.get("id", ""))
+            pos = data.get("primaryPosition", {})
+            if pos.get("abbreviation") and not entry.get("position"):
+                entry["position"] = pos["abbreviation"]
+                entry["position_type"] = pos.get("type", "")
+            entry["_db_stub"] = False
+            log.debug("enriched player %s (%s) from MLB API", player_id, entry["name_full"])
+            _persist_roster_entry(player_id, entry)
+        except Exception:
+            log.debug("MLB API enrichment failed for %s", player_id)
+        finally:
+            _enrichment_inflight.discard(player_id)
+
+    _pool.submit(_do_fetch)
+
 
 def _load_roster() -> dict:
-    """Load players.csv into a dict keyed by player_id (int)."""
+    """Load players.csv into a dict keyed by player_id (int).
+
+    Also supplements with any batters/pitchers found in the raw DB that are
+    not present in the CSV (rookies, returning players, call-ups missed by
+    the last build_player_roster.py run).
+    """
     global _roster_cache
     if _roster_cache is not None:
         return _roster_cache
@@ -65,11 +308,21 @@ def _load_roster() -> dict:
                 except (ValueError, KeyError):
                     continue
                 _roster_cache[pid] = row
+    _supplement_roster_from_db(_roster_cache)
     return _roster_cache
 
+
 def get_player_roster_info(player_id: int) -> dict | None:
-    """Return CSV row dict for a player, or None."""
-    return _load_roster().get(player_id)
+    """Return CSV row dict for a player, or None.
+
+    Always fires an async MLB API fetch to keep team/bio current.
+    For DB stubs the fetch also fills in bio fields; for CSV players
+    it updates stale team info (e.g. traded players).
+    """
+    entry = _load_roster().get(player_id)
+    if entry is not None:
+        _enrich_player(player_id)
+    return entry
 
 
 def resolve_venue_team(player_team: str, games: list | None = None) -> str:

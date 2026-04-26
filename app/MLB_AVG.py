@@ -56,6 +56,17 @@ MLB_BENCHMARKS = {
     "SwStr%":   {"avg": 10.5,  "threshold": 1.5,   "higher_is_better": True},
     "GB%":      {"avg": 44.0,  "threshold": 5.0,   "higher_is_better": True},
     "F-Strike%":{"avg": 60.0,  "threshold": 5.0,   "higher_is_better": True},
+    # ── New pitcher stats ──
+    "Z-Con%":   {"avg": 85.0,  "threshold": 2.0,   "higher_is_better": False},  # avg 83-87%; lower = better
+    # ── Tempo / pace (seconds — lower = faster = better) ──
+    "Pace/Runners On":{"avg": 19.5, "threshold": 1.5,   "higher_is_better": False},  # avg 18-21s
+    # ── Secondary lead allowed by pitcher (ft gained: secondary - primary; lower = better for pitcher) ──
+    "2\u00b0 Lead Allowed":{"avg": 3.0, "threshold": 0.5, "higher_is_better": False},  # avg 2.5-3.5 ft; above avg (good) ≤2.5 ft; below avg (bad) ≥3.5 ft
+    # ── Catcher pop times (seconds — lower = better) ──
+    "Pop 2B":   {"avg": 2.00,  "threshold": 0.05,  "higher_is_better": False},  # avg 1.95-2.05s
+    "Pop 3B":   {"avg": 1.86,  "threshold": 0.04,  "higher_is_better": False},  # avg 1.82-1.90s
+    "Exchange": {"avg": 0.73,  "threshold": 0.03,  "higher_is_better": False},  # avg 0.70-0.76s
+    "CSAA/Throw":{"avg": 0.0,   "threshold": 0.06,  "higher_is_better": True},   # avg band -0.06 to +0.06; above avg ≥+0.07; below avg ≤-0.07
     # ── HR-Allowed table (pitching) ──
     "HR:BF%":     {"avg": 2.75,  "threshold": 0.75,  "higher_is_better": False},
     "Pull Air%":  {"avg": 17.0,  "threshold": 3.0,   "higher_is_better": False},
@@ -67,6 +78,9 @@ MLB_BENCHMARKS = {
     "Sprint": {"avg": 27.0,  "threshold": 1.0,   "higher_is_better": True},
     "Bolt%":  {"avg": 10.0,  "threshold": 4.0,   "higher_is_better": True},
     "SB%":    {"avg": 75.0,  "threshold": 8.0,   "higher_is_better": True},
+    # ── Runner leads (ft) ──
+    "1\u00b0 Lead": {"avg": 11.0, "threshold": 1.0, "higher_is_better": True},   # avg 10-12 ft; aggressive ≥12 ft; passive ≤10 ft
+    "2\u00b0 Lead": {"avg": 2.75, "threshold": 0.75, "higher_is_better": True},  # gain 2.0-3.5 ft = avg; ≥3.5 = aggressive; ≤2.0 = passive
 }
 
 # Pitching-specific overrides (polarity flipped vs batting)
@@ -75,6 +89,8 @@ _PITCHING_BENCHMARKS = {
     "BB%":    {"avg": 8.5,   "threshold": 1.5,   "higher_is_better": False},
     "Hard%":  {"avg": 40.0,  "threshold": 4.0,   "higher_is_better": False},  # pitcher Hard% allowed
     "SB%":    {"avg": 75.0,  "threshold": 8.0,   "higher_is_better": False},
+    "FB%":    {"avg": 26.5,  "threshold": 2.5,   "higher_is_better": False},  # pitcher FB% allowed; avg 24-29%
+    "OBP":    {"avg": 0.3175,"threshold": 0.0125,"higher_is_better": False},  # OBP against; avg .305-.330
 }
 
 # Columns that are never graded (info / counting stats)

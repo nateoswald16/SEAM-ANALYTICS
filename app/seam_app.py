@@ -40,6 +40,7 @@ from mlb_data_engine import MLBDataEngine
 from MLB_AVG import grade_stat
 from park_factors import ParkFactorsPage, prefetch_weather
 from search import PlayerSearchWidget
+from player_card import set_today_player_teams
 import _app_paths
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame,
@@ -184,10 +185,10 @@ def _fmt_ip(outs):
 
 # ── Column definitions (module-level — avoid redefinition per call) ──────────
 _PIT_COLS = ["PITCHER", "IP", "OUTS", "K%", "BB%",
-             "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "Zone%", "F-Strike%",
-             "Barrel%", "LD%", "Hard%", "GB%", "Contact%", "Velo", "Top", "Whiff%", "SwStr%"]
-_PIT_HI = frozenset({3, 21})  # K%, Whiff%
-_BAT_COLS = ["#", "POS", "PLAYER", "PA", "AVG", "ISO", "K%", "BB%",
+             "H", "1B", "2B", "3B", "HR", "ERA", "SLG", "OBP", "Zone%", "F-Strike%",
+             "Barrel%", "LD%", "Hard%", "GB%", "FB%", "Contact%", "Z-Con%", "Velo", "Top", "Whiff%", "SwStr%"]
+_PIT_HI = frozenset({3, 24})  # K%, Whiff%
+_BAT_COLS = ["#", "POS", "PLAYER", "PA", "AVG", "OBP", "ISO", "K%", "BB%",
              "H", "1B", "2B", "3B", "HR", "R", "RBI", "TB",
              "Brl%", "PullAir%", "EV50", "MaxEV", "FB%",
              "Hard%", "BatSpd", "SqUp%", "Blast%", "Chase%"]
@@ -878,6 +879,124 @@ class DataManager:
             "hits": (h_cols,  h_data,  h_hi,  {}),
         }
 
+    def get_team_sb_rates(self, season: int = 2026) -> dict:
+        """Return top-10 team stolen-base rate data for 3 metrics.
+
+        Returns a dict with keys 'success', 'attempt', 'opportunity'.
+        Each value is a list of (abbr, full_name, pct_float, detail_str) tuples.
+        """
+        conn = self.connect()
+        if not conn:
+            return {"success": [], "attempt": [], "opportunity": []}
+
+        # DB → canonical abbreviation corrections (DB may differ from CSV)
+        _ABBR_FIX = {"AZ": "ARI"}
+
+        # Build abbr → full_name map from CSV
+        name_map: dict[str, str] = {}
+        try:
+            csv_path = _app_paths.TEAM_ABBREV_CSV
+            if os.path.exists(csv_path):
+                with open(csv_path, newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        abbr = row.get("abbreviation", "").strip()
+                        name = row.get("team_name", "").strip()
+                        if abbr and name:
+                            name_map[abbr] = name
+        except Exception:
+            pass
+
+        try:
+            # ── 1. Per-team SB / CS via pitcher-inversion ──
+            # pitcher_home CTE: for each (game, pitcher), determine if pitcher is home side.
+            # Runner team = OPPOSITE side from pitcher.  Achieves 100% coverage.
+            sb_rows = conn.execute("""
+                WITH pitcher_home AS (
+                    SELECT game_id, pitcher_id,
+                           MAX(CASE WHEN batter_is_home=1 THEN 0 ELSE 1 END) AS is_home_pitcher
+                    FROM plate_appearances
+                    WHERE season = ?
+                    GROUP BY game_id, pitcher_id
+                )
+                SELECT
+                    CASE WHEN ph.is_home_pitcher=1 THEN g.away_team ELSE g.home_team END AS team,
+                    SUM(CASE WHEN sb.event_type='stolen_base' AND sb.is_successful=1 THEN 1 ELSE 0 END) AS sb,
+                    SUM(CASE WHEN sb.event_type IN ('stolen_base','caught_stealing') THEN 1 ELSE 0 END) AS att
+                FROM stolen_bases sb
+                JOIN games g ON sb.game_id = g.game_id
+                JOIN pitcher_home ph ON sb.game_id = ph.game_id AND sb.pitcher_id = ph.pitcher_id
+                WHERE sb.season = ?
+                GROUP BY team
+                HAVING att > 0
+            """, (season, season)).fetchall()
+
+            # ── 2. Games played per team ──
+            games_rows = conn.execute("""
+                SELECT team, COUNT(DISTINCT game_id) AS gms FROM (
+                    SELECT home_team AS team, game_id FROM games WHERE season = ?
+                    UNION ALL
+                    SELECT away_team, game_id FROM games WHERE season = ?
+                ) GROUP BY team
+            """, (season, season)).fetchall()
+            games_map = {_ABBR_FIX.get(r[0], r[0]): r[1] for r in games_rows}
+
+            # ── 3. Stealable-base opportunities per batting team ──
+            opp_rows = conn.execute("""
+                SELECT
+                    CASE WHEN batter_is_home=1 THEN home_team ELSE away_team END AS team,
+                    COUNT(*) AS opp
+                FROM plate_appearances
+                WHERE season = ?
+                  AND (
+                    (on_1b IS NOT NULL AND on_2b IS NULL)
+                    OR (on_2b IS NOT NULL AND on_3b IS NULL)
+                  )
+                GROUP BY team
+            """, (season,)).fetchall()
+            opp_map = {_ABBR_FIX.get(r[0], r[0]): r[1] for r in opp_rows}
+
+            # ── Build result lists ──
+            success_list, attempt_list, opp_list = [], [], []
+            for r in sb_rows:
+                abbr = _ABBR_FIX.get(r[0] or '', r[0] or '')
+                if not abbr:
+                    continue
+                sb_n, att = int(r[1] or 0), int(r[2] or 0)
+                full = name_map.get(abbr, abbr)
+
+                # Success Rate
+                if att > 0:
+                    pct = sb_n / att
+                    detail = f"{sb_n} SB | {att - sb_n} CS | {att} att"
+                    success_list.append((abbr, full, pct, detail))
+
+                # Attempt Rate (% of stealable opportunities where a steal was attempted)
+                opps = opp_map.get(abbr, 0)
+                if opps > 0:
+                    arate = att / opps
+                    detail_a = f"{att} att | {opps} opp"
+                    attempt_list.append((abbr, full, arate, detail_a))
+
+                # Opportunity Rate (stealable-base situations per game)
+                gms = games_map.get(abbr, 0)
+                if gms > 0:
+                    opp_r = opps / gms if opps else 0.0
+                    detail_o = f"{opps} opp | {gms} gm"
+                    opp_list.append((abbr, full, opp_r, detail_o))
+
+            success_list.sort(key=lambda x: x[2], reverse=True)
+            attempt_list.sort(key=lambda x: x[2], reverse=True)
+            opp_list.sort(key=lambda x: x[2], reverse=True)
+
+            return {
+                "success":     success_list[:10],
+                "attempt":     attempt_list[:10],
+                "opportunity": opp_list[:10],
+            }
+        except Exception:
+            log.exception("get_team_sb_rates")
+            return {"success": [], "attempt": [], "opportunity": []}
+
     def get_most_recent_game_date(self):
         conn = self.connect()
         if not conn:
@@ -941,6 +1060,9 @@ class DataManager:
                     'id': gid,
                     'status': status,
                     'abstract_state': game.get('abstract_state', ''),
+                    'sort_time_str': game.get('sort_time_str', ''),
+                    'game_number': game.get('game_number', 1),
+                    'double_header': game.get('double_header', 'N'),
                     'inning': game.get('inning'),
                     'inning_half': game.get('inning_half'),
                     'inning_state': game.get('inning_state'),
@@ -1334,12 +1456,12 @@ class DataManager:
 
         def _build_row_for_player_info(pid, pos, name, hand, cur, eff_season, eff_matchup, eff_window):
             pa = 0
-            avg = iso = k_pct = bb_pct = None
+            avg = obp = iso = k_pct = bb_pct = None
             hits = singles = doubles = triples = hrs = runs = rbi = total_bases = 0
             barrel_pct = pulled_air_pct = ev50 = max_ev = fb_pct = None
             hard_hit_pct = avg_bat_speed = squared_up_rate = blast_rate = chase_rate = None
             display_name = f"{name} {hand}".strip() if hand else name
-            empty = [pos, display_name, "0", "", "", "", "", "0", "0", "0", "0", "0", "0", "0", "0", "", "", "", "", "", "", "", "", "", ""]
+            empty = [pos, display_name, "0", "", "", "", "", "", "0", "0", "0", "0", "0", "0", "0", "0", "", "", "", "", "", "", "", "", "", ""]
             if not pid:
                 return empty
 
@@ -1521,7 +1643,7 @@ class DataManager:
                     barrel_pct = pulled_air_pct = ev50 = max_ev = fb_pct = None
 
             display_name = f"{name} {hand}".strip() if hand else name
-            return [pos, display_name, str(pa), _fmt3(avg), _fmt3(iso), _fmt_pct(k_pct), _fmt_pct(bb_pct),
+            return [pos, display_name, str(pa), _fmt3(avg), _fmt3(obp), _fmt3(iso), _fmt_pct(k_pct), _fmt_pct(bb_pct),
                     str(hits), str(singles), str(doubles), str(triples), str(hrs), str(runs), str(rbi), str(total_bases),
                     _fmt_pct(barrel_pct), _fmt_pct(pulled_air_pct), _fmt1(ev50), _fmt1(max_ev), _fmt_pct(fb_pct),
                     _fmt_pct(hard_hit_pct), _fmt1(avg_bat_speed), _fmt_pct(squared_up_rate), _fmt_pct(blast_rate), _fmt_pct(chase_rate)]
@@ -1672,8 +1794,8 @@ class DataManager:
 
         display_name = f"{pname} {p_throws}".strip() if p_throws else pname
         empty = [display_name, "0.0", "0", "", "",
-                 "0", "0", "0", "0", "0", "", "", "", "",
-                 "", "", "", "", "", "", "", "", ""]
+                 "0", "0", "0", "0", "0", "", "", "", "", "",
+                 "", "", "", "", "", "", "", "", "", "", ""]
 
         if not pid:
             return empty
@@ -1692,7 +1814,8 @@ class DataManager:
                            k_pct, bb_pct, era, whiff_pct,
                            slg_against, hard_pct, xoba_against, babip_against,
                            whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-                           avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct
+                           avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct,
+                           obp_against, fb_pct, z_contact_pct
                     FROM calculated_pitching_stats
                     WHERE season = ? AND player_id = ? AND matchup = ? AND window = ?
                 """, (season, pid, matchup, window))
@@ -1725,12 +1848,16 @@ class DataManager:
                     swstr_p = _sf(crow["swstr_pct"])
                     gb_p = _sf(crow["gb_pct"])
                     fp_strike_p = _sf(crow["fp_strike_pct"])
+                    obp_ag = _sf(crow["obp_against"])
+                    fb_p = _sf(crow["fb_pct"])
+                    z_contact_p = _sf(crow["z_contact_pct"])
                     fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
                     return [display_name, _fmt_ip(outs), str(outs),
                             _fmt_pct(k_pct), _fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                            _fmt2(era), _fmt3(slg_ag), _fmt_pct(zone_p), _fmt_pct(fp_strike_p),
-                            _fmt_pct(barrel_p), _fmt_pct(ld_p), _fmt_pct(hard_p), _fmt_pct(gb_p), _fmt_pct(contact_p),
+                            _fmt2(era), _fmt3(slg_ag), _fmt3(obp_ag), _fmt_pct(zone_p), _fmt_pct(fp_strike_p),
+                            _fmt_pct(barrel_p), _fmt_pct(ld_p), _fmt_pct(hard_p), _fmt_pct(gb_p), _fmt_pct(fb_p),
+                            _fmt_pct(contact_p), _fmt_pct(z_contact_p),
                             fmt_velo(avg_velo_v), fmt_velo(top_velo_v), _fmt_pct(whiff_pct), _fmt_pct(swstr_p)]
             except Exception:
                 log.exception("_build_pitcher_row")
@@ -1806,8 +1933,8 @@ class DataManager:
                 return [display_name, _fmt_ip(outs), str(outs),
                         _fmt_pct(k_pct), _fmt_pct(bb_pct),
                         str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                        _fmt2(era), _fmt3(_slg), "", "",
-                        "", "", "", "", "", "", "", "", ""]
+                        _fmt2(era), _fmt3(_slg), "", "", "",
+                        "", "", "", "", "", "", "", "", "", "", ""]
         except Exception:
             log.exception("_build_pitcher_row")
 
@@ -1824,7 +1951,7 @@ class DataManager:
             except Exception:
                 pass
         display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-        empty = [display_name, "0", "0", "0", ""]
+        empty = {"PITCHER": display_name, "SB Att": "0", "Pickoffs": "0", "SB Allowed": "0", "SB%": "", "Pace/Runners On": "", "2° Lead Allowed": ""}
         if not pid:
             return empty
         if conn_calc is None:
@@ -1843,14 +1970,25 @@ class DataManager:
                     pk = _si(crow["pickoffs"])
                     sb = _si(crow["sb_allowed"])
                     sb_avg = _sf(crow["sb_allowed_avg"])
-                    return [display_name, str(att), str(pk), str(sb), _fmt_pct(sb_avg)]
+                    tempo_on = sec_lead = ""
+                    try:
+                        t = cur.execute(
+                            "SELECT median_seconds_on_base, secondary_lead_allowed "
+                            "FROM pitcher_tempo WHERE player_id=? AND season=?", (pid, season)
+                        ).fetchone()
+                        if t:
+                            if t[0] is not None: tempo_on = f"{t[0]:.1f}"
+                            if t[1] is not None: sec_lead = f"{t[1]:.1f}"
+                    except Exception:
+                        log.exception("_build_pitcher_br_row tempo")
+                    return {"PITCHER": display_name, "SB Att": str(att), "Pickoffs": str(pk), "SB Allowed": str(sb), "SB%": _fmt_pct(sb_avg), "Pace/Runners On": tempo_on, "2° Lead Allowed": sec_lead}
             except Exception:
                 log.exception("_build_pitcher_br_row")
         return empty
 
     def _build_catcher_br_row(self, pid, pname, season, matchup, window, conn_calc=None):
         """Build a catcher baserunning row."""
-        empty = [pname or '', "0", "0", "0", ""]
+        empty = {"CATCHER": pname or '', "SB Att": "0", "CS": "0", "SB Allowed": "0", "SB%": "", "Pop 2B": "", "Pop 3B": "", "CSAA/Throw": "", "Exchange": ""}
         if not pid:
             return empty
         if conn_calc is None:
@@ -1869,7 +2007,22 @@ class DataManager:
                     cs = _si(crow["caught_stealing"])
                     sb = _si(crow["sb_allowed"])
                     sb_avg = _sf(crow["sb_allowed_avg"])
-                    return [pname or '', str(att), str(cs), str(sb), _fmt_pct(sb_avg)]
+                    pop_2b = pop_3b = csaa = exchange = ""
+                    try:
+                        raw_c = self.connect()
+                        if raw_c:
+                            rp = raw_c.execute(
+                                "SELECT pop_2b_sba, pop_3b_sba, csaa_per_throw, exchange_2b_3b_sba "
+                                "FROM catcher_poptime WHERE player_id=? AND season=?", (pid, season)
+                            ).fetchone()
+                            if rp:
+                                if rp[0] is not None: pop_2b = f"{rp[0]:.2f}"
+                                if rp[1] is not None: pop_3b = f"{rp[1]:.2f}"
+                                if rp[2] is not None: csaa = f"{rp[2]:+.3f}"
+                                if rp[3] is not None: exchange = f"{rp[3]:.2f}"
+                    except Exception:
+                        log.exception("_build_catcher_br_row poptime")
+                    return {"CATCHER": pname or '', "SB Att": str(att), "CS": str(cs), "SB Allowed": str(sb), "SB%": _fmt_pct(sb_avg), "Pop 2B": pop_2b, "Pop 3B": pop_3b, "CSAA/Throw": csaa, "Exchange": exchange}
             except Exception:
                 log.exception("_build_catcher_br_row")
         return empty
@@ -1877,7 +2030,7 @@ class DataManager:
     def _build_runner_br_row(self, pid, pos, name, hand, season, matchup, window, conn_calc=None):
         """Build a runner baserunning row."""
         display_name = f"{name} {hand}".strip() if hand else name
-        empty = [pos, display_name, "", "0", "0", "0", "0", "", "0", "0", ""]
+        empty = {"POS": pos, "PLAYER": display_name, "OBP": "", "SB Att": "0", "SB": "0", "Stole 2nd": "0", "Stole 3rd": "0", "1\u00b0 Lead": "", "2\u00b0 Lead": "", "Sprint": "", "Bolts": "0", "Comp Runs": "0", "Bolt%": ""}
         if not pid:
             return empty
         if conn_calc is None:
@@ -1904,9 +2057,27 @@ class DataManager:
                     comp_runs = _si(crow["competitive_runs"])
                     bolt_pct = _sf(crow["bolt_pct"])
                     sprint_str = f"{sprint:.1f}" if sprint is not None else ""
-                    return [pos, display_name, _fmt3(obp), str(att), str(sb),
-                            str(s2b), str(s3b), sprint_str, str(bolts),
-                            str(comp_runs), _fmt_pct(bolt_pct)]
+                    pri_lead = sec_lead = ""
+                    try:
+                        raw_c = self.connect()
+                        if raw_c:
+                            rl = raw_c.execute(
+                                "SELECT primary_lead_avg, secondary_lead_avg "
+                                "FROM runner_lead WHERE player_id=? AND season=?", (pid, season)
+                            ).fetchone()
+                            # Fall back to any available season if current season not found
+                            if not rl:
+                                rl = raw_c.execute(
+                                    "SELECT primary_lead_avg, secondary_lead_avg "
+                                    "FROM runner_lead WHERE player_id=? ORDER BY season DESC LIMIT 1", (pid,)
+                                ).fetchone()
+                            if rl:
+                                if rl[0] is not None: pri_lead = f"{rl[0]:.1f}"
+                                if rl[0] is not None and rl[1] is not None:
+                                    sec_lead = f"{rl[1] - rl[0]:.1f}"
+                    except Exception:
+                        log.exception("_build_runner_br_row runner_lead")
+                    return {"POS": pos, "PLAYER": display_name, "OBP": _fmt3(obp), "SB Att": str(att), "SB": str(sb), "Stole 2nd": str(s2b), "Stole 3rd": str(s3b), "1° Lead": pri_lead, "2° Lead": sec_lead, "Sprint": sprint_str, "Bolts": str(bolts), "Comp Runs": str(comp_runs), "Bolt%": _fmt_pct(bolt_pct)}
             except Exception:
                 log.exception("_build_runner_br_row")
 
@@ -1924,7 +2095,7 @@ class DataManager:
                     obp_str = _fmt3(float(brow["obp"]))
             except Exception:
                 log.exception("_build_runner_br_row")
-        return [pos, display_name, obp_str, "0", "0", "0", "0", "", "0", "0", ""]
+        return {"POS": pos, "PLAYER": display_name, "OBP": obp_str, "SB Att": "0", "SB": "0", "Stole 2nd": "0", "Stole 3rd": "0", "1° Lead": "", "2° Lead": "", "Sprint": "", "Bolts": "0", "Comp Runs": "0", "Bolt%": ""}
 
     def get_game_pitching(self, game_id, season=None, matchup=None, window=None,
                           away_starter=None, home_starter=None,
@@ -2183,16 +2354,16 @@ class DataManager:
         eff_window = window or 'season'
 
         # ── Pitcher baserunning ──────────────────────────────────────────
-        PIT_BR_COLS = ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%"]
+        PIT_BR_COLS = ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%", "Pace/Runners On", "2° Lead Allowed"]
         PIT_BR_HI = set()
 
         # ── Catcher baserunning ──────────────────────────────────────────
-        CAT_BR_COLS = ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%"]
+        CAT_BR_COLS = ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%", "Pop 2B", "Pop 3B", "CSAA/Throw", "Exchange"]
         CAT_BR_HI = set()
 
         # ── Runner baserunning (lineup) ──────────────────────────────────
         BR_COLS = ["POS", "PLAYER", "OBP", "SB Att", "SB", "Stole 2nd",
-                   "Stole 3rd", "Sprint", "Bolts", "Comp Runs", "Bolt%"]
+                   "Stole 3rd", "1° Lead", "2° Lead", "Sprint", "Bolts", "Comp Runs", "Bolt%"]
         BR_HI = {2}  # OBP
 
         # ── Identify starters and lineup for each side ───────────────────
@@ -2326,6 +2497,7 @@ class DataManager:
         cur = conn.cursor()
 
         fmt3 = _fmt3; fmt1 = _fmt1; fmt_pct = _fmt_pct; fmt_deg = _fmt_deg
+        bvp_season = self._detect_season(cur, game_id) or __import__('datetime').date.today().year
 
         # Load lineup to get player IDs
         cache_file = os.path.join(self.cache_dir, f"{game_id}.json")
@@ -2382,8 +2554,8 @@ class DataManager:
                     pass
             display_name = f"{pname} {p_throws}".strip() if p_throws else pname
             empty = [display_name, "0.0", "0", "", "",
-                     "0", "0", "0", "0", "0", "", "", "", "",
-                     "", "", "", "", "", "", "", "", ""]
+                     "0", "0", "0", "0", "0", "", "", "", "", "",
+                     "", "", "", "", "", "", "", "", "", "", ""]
             if not pid or not batter_ids:
                 return empty
             placeholders = ','.join('?' for _ in batter_ids)
@@ -2418,7 +2590,11 @@ class DataManager:
                   COUNT(zone) as total_pitches_z,
                   AVG(CASE WHEN release_speed IS NOT NULL THEN release_speed END) as avg_velo,
                   MAX(release_speed) as top_velo,
-                  SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) as gb_ct
+                  SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) as gb_ct,
+                  SUM(COALESCE(is_hbp,0)) as hbp,
+                  SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) as fb_ct,
+                  SUM(CASE WHEN swing=1 AND zone BETWEEN 1 AND 9 THEN 1 ELSE 0 END) as iz_swings,
+                  SUM(CASE WHEN swing=1 AND contact=1 AND zone BETWEEN 1 AND 9 THEN 1 ELSE 0 END) as iz_contacts
                 FROM plate_appearances pa
                 WHERE pa.pitcher_id = ? AND pa.batter_id IN ({placeholders}) {date_sql}
                 """
@@ -2452,6 +2628,10 @@ class DataManager:
                     avg_velo = _sf(r[23])
                     top_velo = _sf(r[24])
                     gb_ct = _si(r[25])
+                    hbp = _si(r[26])
+                    fb_ct = _si(r[27])
+                    iz_swings = _si(r[28])
+                    iz_contacts = _si(r[29])
                     innings = outs / 3.0
                     k_pct = round(k / pa, 2) if pa > 0 else None
                     bb_pct = round(bb / pa, 2) if pa > 0 else None
@@ -2468,6 +2648,9 @@ class DataManager:
                     zone_pct = round(in_zone / total_pitches_z, 3) if total_pitches_z > 0 else None
                     contact_pct = round((swings - whiffs) / swings, 3) if swings > 0 else None
                     gb_pct = round(gb_ct / bip, 3) if bip > 0 else None
+                    obp_against = round((hits + bb + hbp) / (ab + bb + hbp + sf), 3) if (ab + bb + hbp + sf) > 0 else None
+                    fb_pct_pit = round(fb_ct / bip, 3) if bip > 0 else None
+                    z_contact_pct = round(iz_contacts / iz_swings, 3) if iz_swings > 0 else None
                     fmt_velo = lambda v: f"{v:.1f}" if v is not None else ""
                     # SwStr%: whiffs / total pitches (pitch-level count from pitching_appearances)
                     swstr_pct = None
@@ -2491,23 +2674,23 @@ class DataManager:
                     return [display_name, _fmt_ip(outs), str(outs),
                             fmt_pct(k_pct), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
-                            _fmt2(era), fmt3(slg), fmt_pct(zone_pct), fmt_pct(fp_strike_pct),
-                            fmt_pct(barrel_pct), fmt_pct(ld_pct), fmt_pct(hard_pct), fmt_pct(gb_pct),
-                            fmt_pct(contact_pct),
+                            _fmt2(era), fmt3(slg), fmt3(obp_against), fmt_pct(zone_pct), fmt_pct(fp_strike_pct),
+                            fmt_pct(barrel_pct), fmt_pct(ld_pct), fmt_pct(hard_pct), fmt_pct(gb_pct), fmt_pct(fb_pct_pit),
+                            fmt_pct(contact_pct), fmt_pct(z_contact_pct),
                             fmt_velo(avg_velo), fmt_velo(top_velo), fmt_pct(whiff_pct), fmt_pct(swstr_pct)]
             except Exception:
                 log.exception("_build_bvp_pitcher_row")
             return empty
 
         # ── BvP Batting: each batter's stats vs the pitcher ──
-        BVP_BAT_COLS = ["POS", "PLAYER", "PA", "AVG", "ISO", "K%", "BB%",
+        BVP_BAT_COLS = ["POS", "PLAYER", "PA", "AVG", "OBP", "ISO", "K%", "BB%",
                         "H", "1B", "2B", "3B", "HR", "R", "RBI", "TB",
                         "Brl%", "PullAir%", "EV50", "MaxEV", "FB%"]
         BVP_BAT_HI = {3, 4}
 
         def _build_bvp_batter_row(pid, pos, name, hand, pitcher_id, window):
             display_name = f"{name} {hand}".strip() if hand else name
-            empty = [pos, display_name, "0", "", "", "", "", "0", "0", "0", "0", "0",
+            empty = [pos, display_name, "0", "", "", "", "", "", "0", "0", "0", "0", "0",
                      "0", "0", "0", "", "", "", "", ""]
             if not pid or not pitcher_id:
                 return empty
@@ -2530,7 +2713,9 @@ class DataManager:
                   SUM(CASE WHEN bb_type IS NOT NULL AND launch_speed_angle = 6 THEN 1 ELSE 0 END) as barrels,
                   SUM(CASE WHEN bb_type IS NOT NULL THEN 1 ELSE 0 END) as barrel_denom,
                   SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) as fly_balls,
-                  MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw
+                  MAX(CASE WHEN bb_type IS NOT NULL THEN launch_speed END) as max_ev_raw,
+                  SUM(COALESCE(is_hbp,0)) as hbp,
+                  SUM(COALESCE(is_sac_fly,0)) as sf
                 FROM plate_appearances pa
                 WHERE pa.batter_id = ? AND pa.pitcher_id = ? {date_sql}
                 """
@@ -2554,10 +2739,13 @@ class DataManager:
                     barrel_denom = _si(r[13])
                     fly_balls = _si(r[14])
                     max_ev = round(float(r[15]), 1) if r[15] is not None else None
+                    hbp = _si(r[16])
+                    sf_bvp = _si(r[17])
 
                     avg = round(float(hits) / float(ab), 3) if ab > 0 else None
                     slg = round(float(total_bases) / float(ab), 3) if ab > 0 else None
                     iso = round((slg or 0) - (avg or 0), 3) if avg is not None else None
+                    obp_bvp = round((hits + walks + hbp) / (ab + walks + hbp + sf_bvp), 3) if (ab + walks + hbp + sf_bvp) > 0 else None
                     k_pct = round(float(so) / float(pa), 2) if pa > 0 else None
                     bb_pct = round(float(walks) / float(pa), 2) if pa > 0 else None
                     barrel_pct = round(float(barrels) / float(barrel_denom), 3) if barrel_denom > 0 else None
@@ -2597,7 +2785,7 @@ class DataManager:
                         if total_bbe > 0:
                             pulled_air_pct = round(pulled_air_count / total_bbe, 3)
 
-                    return [pos, display_name, str(pa), fmt3(avg), fmt3(iso),
+                    return [pos, display_name, str(pa), fmt3(avg), fmt3(obp_bvp), fmt3(iso),
                             fmt_pct(k_pct), fmt_pct(bb_pct),
                             str(hits), str(singles), str(doubles), str(triples), str(hrs),
                             str(runs), str(rbi), str(total_bases),
@@ -2608,12 +2796,12 @@ class DataManager:
             return empty
 
         # ── BvP Baserunning: pitcher, catcher, lineup ──
-        BVP_PIT_BR_COLS = ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%"]
+        BVP_PIT_BR_COLS = ["PITCHER", "SB Att", "Pickoffs", "SB Allowed", "SB%", "Pace/Runners On", "2° Lead Allowed"]
         BVP_PIT_BR_HI = set()
-        BVP_CAT_BR_COLS = ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%"]
+        BVP_CAT_BR_COLS = ["CATCHER", "SB Att", "CS", "SB Allowed", "SB%", "Pop 2B", "Pop 3B", "CSAA/Throw", "Exchange"]
         BVP_CAT_BR_HI = set()
         BVP_BR_COLS = ["POS", "PLAYER", "SB Att", "SB", "CS",
-                       "Stole 2nd", "Stole 3rd", "Sprint", "Bolts"]
+                       "Stole 2nd", "Stole 3rd", "1° Lead", "2° Lead", "Sprint", "Bolts"]
         BVP_BR_HI = set()
 
         def _build_bvp_pitcher_br(pid, pname, p_throws, batter_ids, window):
@@ -2627,7 +2815,7 @@ class DataManager:
                 except Exception:
                     pass
             display_name = f"{pname} {p_throws}".strip() if p_throws else pname
-            empty = [display_name, "0", "0", "0", ""]
+            empty = {"PITCHER": display_name, "SB Att": "0", "Pickoffs": "0", "SB Allowed": "0", "SB%": "", "Pace/Runners On": "", "2° Lead Allowed": ""}
             if not pid or not batter_ids:
                 return empty
             placeholders = ','.join('?' for _ in batter_ids)
@@ -2652,13 +2840,24 @@ class DataManager:
                     pk = _si(r[1])
                     sb = _si(r[2])
                     sb_pct = round(sb / att, 2) if att > 0 else None
-                    return [display_name, str(att), str(pk), str(sb), fmt_pct(sb_pct)]
+                    tempo_on = sec_lead = ""
+                    try:
+                        t = cur.execute(
+                            "SELECT median_seconds_on_base, secondary_lead_allowed "
+                            "FROM pitcher_tempo WHERE player_id=? AND season=?", (pid, bvp_season)
+                        ).fetchone()
+                        if t:
+                            if t[0] is not None: tempo_on = f"{t[0]:.1f}"
+                            if t[1] is not None: sec_lead = f"{t[1]:.1f}"
+                    except Exception:
+                        pass
+                    return {"PITCHER": display_name, "SB Att": str(att), "Pickoffs": str(pk), "SB Allowed": str(sb), "SB%": fmt_pct(sb_pct), "Pace/Runners On": tempo_on, "2° Lead Allowed": sec_lead}
             except Exception:
                 log.exception("_build_bvp_pitcher_br")
             return empty
 
         def _build_bvp_catcher_br(cid, cname, batter_ids, window, pitcher_id=None):
-            empty = [cname or '', "0", "0", "0", ""]
+            empty = {"CATCHER": cname or '', "SB Att": "0", "CS": "0", "SB Allowed": "0", "SB%": "", "Pop 2B": "", "Pop 3B": "", "CSAA/Throw": "", "Exchange": ""}
             if not cid or not batter_ids:
                 return empty
             placeholders = ','.join('?' for _ in batter_ids)
@@ -2683,14 +2882,27 @@ class DataManager:
                     cs = _si(r[1])
                     sb = _si(r[2])
                     sb_pct = round(sb / att, 2) if att > 0 else None
-                    return [cname or '', str(att), str(cs), str(sb), fmt_pct(sb_pct)]
+                    pop_2b = pop_3b = csaa = exchange = ""
+                    try:
+                        rp = cur.execute(
+                            "SELECT pop_2b_sba, pop_3b_sba, csaa_per_throw, exchange_2b_3b_sba "
+                            "FROM catcher_poptime WHERE player_id=? AND season=?", (cid, bvp_season)
+                        ).fetchone()
+                        if rp:
+                            if rp[0] is not None: pop_2b = f"{rp[0]:.2f}"
+                            if rp[1] is not None: pop_3b = f"{rp[1]:.2f}"
+                            if rp[2] is not None: csaa = f"{rp[2]:+.3f}"
+                            if rp[3] is not None: exchange = f"{rp[3]:.2f}"
+                    except Exception:
+                        pass
+                    return {"CATCHER": cname or '', "SB Att": str(att), "CS": str(cs), "SB Allowed": str(sb), "SB%": fmt_pct(sb_pct), "Pop 2B": pop_2b, "Pop 3B": pop_3b, "CSAA/Throw": csaa, "Exchange": exchange}
             except Exception:
                 log.exception("_build_bvp_catcher_br")
             return empty
 
         def _build_bvp_runner_br(pid, pos, name, hand, pitcher_id, catcher_id, window):
             display_name = f"{name} {hand}".strip() if hand else name
-            empty = [pos, display_name, "0", "0", "0", "0", "0", "", "0"]
+            empty = {"POS": pos, "PLAYER": display_name, "SB Att": "0", "SB": "0", "CS": "0", "Stole 2nd": "0", "Stole 3rd": "0", "1° Lead": "", "2° Lead": "", "Sprint": "", "Bolts": "0"}
             if not pid:
                 return empty
             date_sql, date_params = _get_pitcher_date_filter(pitcher_id, window) if pitcher_id else ('', [])
@@ -2730,8 +2942,25 @@ class DataManager:
                     sprint = round(float(r[5]), 1) if r[5] is not None else None
                     bolts = _si(r[6])
                     sprint_str = f"{sprint:.1f}" if sprint is not None else ""
-                    return [pos, display_name, str(att), str(sb), str(cs),
-                            str(s2b), str(s3b), sprint_str, str(bolts)]
+                    pri_lead = sec_lead = ""
+                    try:
+                        rl = cur.execute(
+                            "SELECT primary_lead_avg, secondary_lead_avg "
+                            "FROM runner_lead WHERE player_id=? AND season=?", (pid, bvp_season)
+                        ).fetchone()
+                        # Fall back to any available season if current season not found
+                        if not rl:
+                            rl = cur.execute(
+                                "SELECT primary_lead_avg, secondary_lead_avg "
+                                "FROM runner_lead WHERE player_id=? ORDER BY season DESC LIMIT 1", (pid,)
+                            ).fetchone()
+                        if rl:
+                            if rl[0] is not None: pri_lead = f"{rl[0]:.1f}"
+                            if rl[0] is not None and rl[1] is not None:
+                                sec_lead = f"{rl[1] - rl[0]:.1f}"
+                    except Exception:
+                        log.exception("_build_bvp_runner_br runner_lead")
+                    return {"POS": pos, "PLAYER": display_name, "SB Att": str(att), "SB": str(sb), "CS": str(cs), "Stole 2nd": str(s2b), "Stole 3rd": str(s3b), "1° Lead": pri_lead, "2° Lead": sec_lead, "Sprint": sprint_str, "Bolts": str(bolts)}
             except Exception:
                 log.exception("_build_bvp_runner_br")
             return empty
@@ -3088,13 +3317,34 @@ STAT_TOOLTIPS = {
     "PA":         ("Plate Appearances\nTotal times a batter completed a turn at the plate, including walks, HBP, and sac flies.",),
     "AVG":        ("Batting Average\nHits ÷ At-Bats. League average is roughly .250.",),
     "ISO":        ("Isolated Power\nSlugging Percentage − Batting Average. Measures raw extra-base power. .150 is average; .200+ is elite.",),
-    "K%":         ("Strikeout Rate\nStrikeouts ÷ Plate Appearances. League avg ~22%. Lower is better for batters, higher is better for pitchers.",),
-    "BB%":        ("Walk Rate\nWalks ÷ Plate Appearances. League avg ~8.5%. Higher is better for batters.",),
-    "H":          ("Hits\nTotal hits (singles + doubles + triples + home runs).",),
-    "1B":         ("Singles\nTotal one-base hits.",),
-    "2B":         ("Doubles\nTotal two-base hits.",),
-    "3B":         ("Triples\nTotal three-base hits.",),
-    "HR":         ("Home Runs\nTotal home runs hit (batters) or allowed (pitchers).",),
+    "K%":         {
+        "batter":  "Strikeout Rate\n% of plate appearances ending in a strikeout. League avg ~22%. Lower is better for hitters.\nAbove avg (disciplined): 10–16% • Avg: 16–24% • Below avg: 24%+",
+        "pitcher": "Strikeout Rate\n% of batters faced struck out. League avg ~22%. Higher is better for pitchers.\nElite: 28%+ • Above avg: 24–28% • Avg: 20–24% • Below avg: <20%",
+    },
+    "BB%":        {
+        "batter":  "Walk Rate\n% of plate appearances ending in a walk. League avg ~8.5%. Higher is better for hitters.\nAbove avg (disciplined): 10–14% • Avg: 7–10% • Below avg: <7%",
+        "pitcher": "Walk Rate\n% of batters faced walked. League avg ~8.5%. Lower is better for pitchers.\nAbove avg (control): 5–7% • Avg: 7–10% • Below avg (wild): 10%+",
+    },
+    "H":          {
+        "batter":  "Hits\nTotal hits accumulated (singles + doubles + triples + home runs).",
+        "pitcher": "Hits Allowed\nTotal hits allowed. Lower is better.",
+    },
+    "1B":         {
+        "batter":  "Singles\nTotal one-base hits.",
+        "pitcher": "Singles Allowed\nTotal singles allowed.",
+    },
+    "2B":         {
+        "batter":  "Doubles\nTotal two-base hits.",
+        "pitcher": "Doubles Allowed\nTotal doubles allowed.",
+    },
+    "3B":         {
+        "batter":  "Triples\nTotal three-base hits.",
+        "pitcher": "Triples Allowed\nTotal triples allowed.",
+    },
+    "HR":         {
+        "batter":  "Home Runs\nTotal home runs hit.",
+        "pitcher": "Home Runs Allowed\nTotal home runs allowed. Lower is better.",
+    },
     "R":          ("Runs Scored\nTotal runs the batter scored.",),
     "RBI":        ("Runs Batted In\nTotal runs driven in by the batter.",),
     "TB":         ("Total Bases\n1B×1 + 2B×2 + 3B×3 + HR×4. Raw measure of offensive production.",),
@@ -3102,14 +3352,26 @@ STAT_TOOLTIPS = {
     "PullAir%":  ("Pulled Air Rate\n% of all batted balls that are airballs (non-grounders) hit to the pull side (spray angle < −17°).",),
     "EV50":        ("EV50\nAverage exit velocity of the top 50% hardest-hit balls (mph). A power/contact quality metric less sensitive to weak contact.",),
     "MaxEV":      ("Max Exit Velocity\nHardest single ball hit (mph). Proxy for raw power.",),
-    "FB%":        ("Fly Ball Rate\n% of batted ball events classified as fly balls.",),
-    "Hard%":      ("Hard Hit Rate\n% of batted balls at 95+ mph exit velocity. League avg ~38%. 45%+ is elite.",),
+    "FB%":        {
+        "batter":  "Fly Ball Rate\n% of batted ball events classified as fly balls.",
+        "pitcher": "Fly Ball Rate Allowed\n% of batted balls that are fly balls. Elevated fly-ball rate increases HR risk.\nAbove avg (suppressed risk): 17–24% • Avg (neutral): 24–29% • Below avg (elevated HR risk): 29–35%",
+    },
+    "Hard%":      {
+        "batter":  "Hard Hit Rate\n% of batted balls at 95+ mph exit velocity. League avg ~38%. Higher is better.\nElite: 45%+ • Above avg: 40–45% • Avg: 35–40% • Below avg: <35%",
+        "pitcher": "Hard Hit Rate Against\n% of batted balls allowed at 95+ mph. League avg ~38%. Lower is better.\nAbove avg (suppressed): <34% • Avg: 34–42% • Below avg (hittable): 42%+",
+    },
     "BatSpd":     ("Bat Speed\nAverage speed of the bat head (mph) through the hitting zone. Higher = more raw power potential.",),
     "SqUp%":      ("Squared-Up Rate\n% of swings where bat-ball contact is near the sweet spot. Higher = more solid contact.",),
     "Blast%":     ("Blast Rate\n% of swings that are 'blasts' — high bat speed + well-timed contact. Elite hard-contact metric.",),
     "Chase%":     ("Chase Rate\n% of pitches outside the strike zone that the batter swings at. Lower is better for batters. League avg ~29%.",),
-    "OBP":        ("On-Base Percentage\n(H + BB + HBP) ÷ (AB + BB + HBP + SF). League avg ~.320.",),
-    "SLG":        ("Slugging Percentage\nTotal Bases ÷ At-Bats. Weights extra-base hits. League avg ~.410.",),
+    "OBP":        {
+        "batter":  "On-Base Percentage\n(H + BB + HBP) ÷ (AB + BB + HBP + SF).\nLeague avg ~.320. Higher is better.\nAbove avg: .360+ • Avg: .310–.360 • Below avg: <.310",
+        "pitcher": "On-Base Percentage Against\n(H + BB + HBP) ÷ (AB + BB + HBP + SF).\nLeague avg ~.320. Lower is better for pitchers.\nAbove avg (stingy): ≤.305 • Avg: .305–.330 • Below avg (hittable): ≥.330",
+    },
+    "SLG":        {
+        "batter":  "Slugging Percentage\nTotal Bases ÷ At-Bats. Weights extra-base hits. League avg ~.410. Higher is better.",
+        "pitcher": "Slugging Against\nTotal Bases allowed ÷ At-Bats faced. League avg ~.410. Lower is better.",
+    },
     "BABIP":      ("Batting Average on Balls in Play\nAVG on balls put in play (excluding HR and K). League avg ~.300. Useful for luck/regression analysis.",),
     "xBA":        ("Expected Batting Average\nPredicted AVG based on exit velocity and launch angle. Filters out defense and luck.",),
     "xSLG":       ("Expected Slugging\nPredicted SLG based on Statcast contact quality.",),
@@ -3135,8 +3397,11 @@ STAT_TOOLTIPS = {
     "Soft%":      ("Soft Hit Rate\n% of batted balls at low exit velocity (weak contact). Higher is better for pitchers.",),
     "LD%":        ("Line Drive Rate\n% of batted balls that are line drives. High LD% (20%+) correlates with higher BABIP against the pitcher.",),
     "GB%":        ("Ground Ball Rate\n% of batted balls that are ground balls. Higher GB% limits extra-base hits.",),
-    "FB%":        ("Fly Ball Rate\n% of batted balls that are fly balls.",),
+
     "Contact%":   ("Contact Rate\n% of swings that make contact. Lower is better for pitchers. League avg ~78%.",),
+    "Z-Con%":     ("Zone Contact Rate\n% of swings on pitches inside the strike zone that result in contact. "
+                   "Lower is better for pitchers (batters missing in the zone).\n"
+                   "Above avg (tough): 78–83% • Avg: 83–87% • Below avg (hittable): 87–91%",),
     "Velo":       ("Average Pitch Velocity\nAverage release speed (mph) of all pitches thrown.",),
     "Top":        ("Top Velocity\nFastest pitch thrown (mph).",),
     "Whiff%":     ("Whiff Rate\n% of swings that result in a miss. Higher is better for pitchers. 25%+ is above average.",),
@@ -3154,6 +3419,18 @@ STAT_TOOLTIPS = {
     "SB Att":     ("Stolen Base Attempts\nTotal times a runner attempted to steal a base.",),
     "SB Allowed": ("Stolen Bases Allowed\nSteals allowed by this pitcher or catcher.",),
     "Pickoffs":   ("Pickoffs\nRunners picked off base by the pitcher.",),
+    "Pace/Runners On":("Pace \u2014 Runners On Base\nMedian time (seconds) between pitches with runners on base. "
+                   "Accounts for stretch / set position and holding runners.\n"
+                   "Above avg (quick): 16\u201318s \u2022 Avg: 18\u201321s \u2022 Below avg (slow): 21\u201325s",),
+    "2\u00b0 Lead Allowed": ("Secondary Lead Allowed (ft) \u2014 Lead Gained Against This Pitcher\n"
+                   "How many feet runners gain from primary \u2192 secondary lead during this pitcher\u2019s delivery (sec \u2212 pri).\n"
+                   "Lower = pitcher limits runners\u2019 momentum = harder to steal against.\n"
+                   "Above avg (good): \u22642.5 ft \u2022 Avg: 2.5\u20133.5 ft \u2022 Below avg (bad): \u22653.5 ft",),
+    "1\u00b0 Lead":   ("Primary Lead (ft)\nRunner\u2019s average distance from base at the pitcher\u2019s set position. Larger = more aggressive baserunner.\n"
+                   "Above avg: \u226512 ft \u2022 Avg: 10\u201312 ft \u2022 Below avg: \u226410 ft",),
+    "2\u00b0 Lead":   ("Lead Gained (2\u00b0 \u2212 1\u00b0) (ft)\nFeet the runner gains from primary lead to secondary lead during the delivery window.\n"
+                   "Larger = more aggressive jump toward next base.\n"
+                   "Above avg: \u22653.5 ft \u2022 Avg: 2.0\u20133.5 ft \u2022 Below avg: \u22642.0 ft",),
     "Stole 2nd":  ("Steals of 2nd\nSuccessful steals of second base.",),
     "Stole 3rd":  ("Steals of 3rd\nSuccessful steals of third base.",),
     "Sprint":     ("Sprint Speed\nStatcast sprint speed in ft/sec on competitive running plays. League avg ~27 ft/s. 29+ ft/s = elite.",),
@@ -3162,17 +3439,32 @@ STAT_TOOLTIPS = {
     "BOLTS":      ("Bolts\nNumber of runs where the runner reached 30+ ft/s sprint speed — Statcast's threshold for elite speed.",),
     "Bolt%":      ("Bolt Rate\n% of competitive runs that are 'Bolts' (30+ ft/s). Measures how consistently fast a runner is.",),
     "Comp Runs":  ("Competitive Runs\nTotal competitive running plays used to calculate sprint speed.",),
+    "Pop 2B":     ("Pop Time \u2014 2nd Base\nCatcher's median pop time (seconds) on stolen-base attempts at 2nd base: "
+                   "release + throw + catch. Lower = faster.\n"
+                   "Above avg: 1.90–1.95s • Avg: 1.95–2.05s • Below avg: 2.05–2.10s",),
+    "Pop 3B":     ("Pop Time \u2014 3rd Base\nCatcher's median pop time (seconds) on stolen-base attempts at 3rd base.\n"
+                   "Above avg: 1.75–1.82s • Avg: 1.82–1.90s • Below avg: 1.90–1.97s",),
+    "CSAA/Throw": ("Caught Stealing Above Average Per Throw\nStatcast metric: how many extra caught stealings per throw the catcher generates vs. expectation, controlling for runner speed and distance. Positive = above average.\nAbove avg: +0.07 to +0.14 • Avg: -0.06 to +0.06 • Below avg: -0.07 to -0.15",),
+    "Exchange":   ("Exchange Time\nTime (seconds) for the catcher to receive the pitch and begin the throw. "
+                   "Measured by Statcast on stolen-base attempts.\n"
+                   "Above avg (quick): 0.66–0.70s • Avg: 0.70–0.76s • Below avg (slow): 0.76–0.81s",),
     "XBT%":       ("Extra Bases Taken Rate\n% of opportunities where the runner advanced more than one base on a single or scored from second on a single. Higher is better.",),
     "OAA":        ("Outs Above Average\nStatcast defensive metric. Measures how many outs a fielder saves vs. a league-average fielder at their position. Positive = above average.",),
     "WAR":        ("Wins Above Replacement\nEstimated wins contributed above a replacement-level player. 2.0 = solid starter, 5.0+ = All-Star, 8.0+ = MVP caliber.",),
 }
 
-def _get_stat_tooltip(col: str) -> str:
-    """Return tooltip text for a column header, or empty string if none defined."""
+def _get_stat_tooltip(col: str, context: str = "") -> str:
+    """Return tooltip text for a column header, or empty string if none defined.
+
+    context: 'batter', 'pitcher', 'catcher', or '' for generic.
+    For stats with separate batter/pitcher text, the matching variant is returned.
+    """
     entry = STAT_TOOLTIPS.get(col)
-    if entry:
-        return entry[0]
-    return ""
+    if entry is None:
+        return ""
+    if isinstance(entry, dict):
+        return entry.get(context) or entry.get("default", "")
+    return entry[0]
 
 
 class _HeaderTooltipFilter(QObject):
@@ -3183,7 +3475,14 @@ class _HeaderTooltipFilter(QObject):
             section = header.logicalIndexAt(event.pos())
             table = header.parentWidget()
             if isinstance(table, StatsTable) and 0 <= section < len(table._cols):
-                tip = _get_stat_tooltip(table._cols[section])
+                cols = table._cols
+                if "PITCHER" in cols:
+                    context = "pitcher"
+                elif "CATCHER" in cols:
+                    context = "catcher"
+                else:
+                    context = "batter"
+                tip = _get_stat_tooltip(table._cols[section], context)
                 if tip:
                     gpos = event.globalPos()
                     # Show well above the header row so it never covers headers or table data
@@ -3243,6 +3542,16 @@ class _NameDelegate(QStyledItemDelegate):
 # ═══════════════════════════════════════════════════════════════════════════════
 # StatsTable
 # ═══════════════════════════════════════════════════════════════════════════════
+def _normalize_row(row, cols):
+    """Normalize a row to an ordered list aligned with cols.
+    Dict rows are mapped by column name (missing keys → "").
+    List/tuple rows are returned as-is (positional, existing behaviour).
+    """
+    if isinstance(row, dict):
+        return [row.get(col, "") for col in cols]
+    return list(row)
+
+
 class StatsTable(QTableWidget):
     def __init__(self, cols, data, hi_cols=None, name_col_wide=180, grade_map=None,
                  parent=None):
@@ -3251,16 +3560,16 @@ class StatsTable(QTableWidget):
         self._grade_map = grade_map or {}   # col_idx → "high_bad" | "high_good"
         self._hovered = -1
         self._cols = cols
-        self._data = [list(row) for row in data]  # keep original data for sorting
+        self._data = [_normalize_row(row, cols) for row in data]  # normalize dicts→lists; keep for sorting
         self._sort_col = -1
         self._sort_asc = True
         self._name_col_wide = name_col_wide
-        self._build(cols, data, name_col_wide)
+        self._build(cols, name_col_wide)
         self.horizontalHeader().sectionClicked.connect(self._on_header_click)
  
-    def _build(self, cols, data, name_col_wide):
+    def _build(self, cols, name_col_wide):
         self.setColumnCount(len(cols))
-        self.setRowCount(len(data))
+        self.setRowCount(len(self._data))
         self.setHorizontalHeaderLabels(cols)
         # Install event filter for above-cursor tooltips on header
         self._header_tip_filter = _HeaderTooltipFilter(self)
@@ -3308,7 +3617,7 @@ class StatsTable(QTableWidget):
                 _name_col = cols.index(_nc)
                 break
         self._name_col = _name_col
-        self._populate_rows(data, cols)
+        self._populate_rows(self._data, cols)
         if _name_col >= 0:
             self.setItemDelegateForColumn(_name_col, _NameDelegate(self))
 
@@ -3333,7 +3642,7 @@ class StatsTable(QTableWidget):
         # Expand table to show all rows (no internal vertical scrollbar)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         header_h = self.horizontalHeader().height()
-        total_h = header_h + (len(data) * ROW_H) + 2  # +2 for border
+        total_h = header_h + (len(self._data) * ROW_H) + 2  # +2 for border
         self.setFixedHeight(total_h)
 
     @staticmethod
@@ -3494,17 +3803,17 @@ class StatsTable(QTableWidget):
 
     def set_data(self, data):
         """Replace table data in-place without recreating the widget."""
-        self._data = [list(row) for row in data]
+        self._data = [_normalize_row(row, self._cols) for row in data]
         self._sort_col = -1
         self._sort_asc = True
         self._hovered = -1
         old_count = self.rowCount()
-        self.setRowCount(len(data))
-        self._populate_rows(data, self._cols)
+        self.setRowCount(len(self._data))
+        self._populate_rows(self._data, self._cols)
         self._update_header_labels()
-        if len(data) != old_count:
+        if len(self._data) != old_count:
             header_h = self.horizontalHeader().height()
-            total_h = header_h + (len(data) * ROW_H) + 2
+            total_h = header_h + (len(self._data) * ROW_H) + 2
             self.setFixedHeight(total_h)
 
     def apply_col_visibility(self, hidden_cols: set):
@@ -6750,6 +7059,204 @@ def build_home_page():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Team SB Bar Chart Widget
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TeamSBBarChart(QWidget):
+    """Top-10 team stolen-base rate bar chart with 3 filter modes."""
+
+    _FILTER_LABELS = ["Success Rate", "Attempt Rate", "Opportunity Rate"]
+    _BAR_H = 36
+    _LOGO_SIZE = 22
+
+    def __init__(self, data: dict, parent=None):
+        """
+        data : dict with keys 'success', 'attempt', 'opportunity'.
+               Each value is [(abbr, full_name, rate_float, detail_str), ...] top-10.
+        """
+        super().__init__(parent)
+        self._data = data
+        self._mode = 0  # 0=success, 1=attempt, 2=opportunity
+        self.setStyleSheet(f"background:{C['bg1']}; border:1px solid {C['bdr']}; border-radius:6px;")
+        self._vl = QVBoxLayout(self)
+        self._vl.setContentsMargins(0, 0, 0, 0)
+        self._vl.setSpacing(0)
+        self._build()
+
+    # ── section header ──────────────────────────────────────────────────────
+    def _build(self):
+        while self._vl.count():
+            item = self._vl.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        # Header row
+        hdr = QWidget()
+        hdr.setFixedHeight(40)
+        hdr.setStyleSheet(
+            f"background:{C['bg1']}; border-bottom:1px solid {C['bdr']}; border-radius:0px;")
+        hl = QHBoxLayout(hdr)
+        hl.setContentsMargins(12, 0, 12, 0)
+        hl.setSpacing(8)
+        hl.addWidget(mk_label("TEAM STOLEN BASE RANKINGS", color=C["t1"], size=11, bold=True))
+        hl.addStretch()
+        # Filter buttons
+        self._filter_btns = []
+        for i, lbl in enumerate(self._FILTER_LABELS):
+            btn = QPushButton(lbl)
+            btn.setCheckable(True)
+            btn.setChecked(i == self._mode)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.clicked.connect(lambda _, idx=i: self._switch(idx))
+            self._style_btn(btn, i == self._mode)
+            hl.addWidget(btn)
+            self._filter_btns.append(btn)
+        self._vl.addWidget(hdr)
+
+        # Body: stacked views per mode
+        self._stk = QStackedWidget()
+        self._stk.setStyleSheet("background:transparent;")
+        keys = ["success", "attempt", "opportunity"]
+        for key in keys:
+            rows = self._data.get(key, [])
+            self._stk.addWidget(self._build_bars(rows, key))
+        self._stk.setCurrentIndex(self._mode)
+        self._vl.addWidget(self._stk)
+
+    def _style_btn(self, btn, active):
+        bg = C["bg3"] if active else "transparent"
+        col = C["t1"] if active else C["t3"]
+        btn.setStyleSheet(f"""
+            QPushButton {{
+                background:{bg}; color:{col};
+                border:1px solid {C['bdrl']}; border-radius:3px;
+                padding:3px 10px; font-family:'Segoe UI';
+                font-size:10px;
+            }}
+            QPushButton:hover {{ background:{C['bg3']}; color:{C['t1']}; }}
+        """)
+
+    def _switch(self, idx):
+        self._mode = idx
+        for i, b in enumerate(self._filter_btns):
+            b.setChecked(i == idx)
+            self._style_btn(b, i == idx)
+        self._stk.setCurrentIndex(idx)
+
+    def _build_bars(self, rows, key):
+        """Build a single-mode bar list widget."""
+        container = QWidget()
+        container.setStyleSheet(f"background:{C['bg1']};")
+        vl = QVBoxLayout(container)
+        vl.setContentsMargins(12, 8, 12, 8)
+        vl.setSpacing(4)
+
+        if not rows:
+            vl.addWidget(mk_label("No data available", color=C["t3"], size=11, mono=True,
+                                  align=Qt.AlignmentFlag.AlignCenter))
+            vl.addStretch()
+            return container
+
+        # Determine max value for scaling bars
+        max_val = max(r[2] for r in rows) if rows else 1.0
+
+        # Choose label based on mode
+        if key == "opportunity":
+            def fmt_pct(v): return f"{v:.2f}/gm"
+        else:
+            def fmt_pct(v): return f"{v * 100:.1f}%"
+
+        for rank, (abbr, full_name, rate, detail) in enumerate(rows, 1):
+            row_w = QWidget()
+            row_w.setFixedHeight(self._BAR_H + 6)
+            row_w.setStyleSheet("background:transparent;")
+            rl = QHBoxLayout(row_w)
+            rl.setContentsMargins(0, 0, 0, 0)
+            rl.setSpacing(8)
+
+            # Rank
+            rank_lbl = mk_label(str(rank), color=C["t3"], size=10, mono=True)
+            rank_lbl.setFixedWidth(18)
+            rank_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            rl.addWidget(rank_lbl)
+
+            # Team logo
+            pm = get_team_pixmap(abbr, self._LOGO_SIZE)
+            logo_lbl = QLabel()
+            logo_lbl.setFixedSize(self._LOGO_SIZE, self._LOGO_SIZE)
+            logo_lbl.setStyleSheet("border:none; background:transparent;")
+            if pm:
+                logo_lbl.setPixmap(pm)
+                logo_lbl.setScaledContents(True)
+            else:
+                logo_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                logo_lbl.setText(abbr[:3])
+                logo_lbl.setStyleSheet(f"border:none; background:transparent; color:{C['t3']}; font-size:8px;")
+            rl.addWidget(logo_lbl)
+
+            # Team name block
+            name_w = QWidget()
+            name_w.setFixedWidth(155)
+            name_w.setStyleSheet("border:none; background:transparent;")
+            nl = QVBoxLayout(name_w)
+            nl.setContentsMargins(0, 0, 0, 0)
+            nl.setSpacing(0)
+            nl.addWidget(mk_label(full_name, color=C["t1"], size=11, bold=(rank <= 3)))
+            nl.addWidget(mk_label(f"{abbr}  ·  {detail}", color=C["t3"], size=9, mono=True))
+            rl.addWidget(name_w)
+
+            # Bar + percent
+            bar_frame = QWidget()
+            bar_frame.setStyleSheet("border:none; background:transparent;")
+            bl = QHBoxLayout(bar_frame)
+            bl.setContentsMargins(0, 0, 0, 0)
+            bl.setSpacing(6)
+
+            bar_outer = QFrame()
+            bar_outer.setFixedHeight(20)
+            bar_outer.setStyleSheet(
+                f"background:transparent; border-radius:5px;")
+            bar_inner_layout = QHBoxLayout(bar_outer)
+            bar_inner_layout.setContentsMargins(0, 0, 0, 0)
+            bar_inner_layout.setSpacing(0)
+
+            bar_fill = QFrame()
+            fill_frac = rate / max_val if max_val > 0 else 0
+            bar_fill.setStyleSheet(
+                f"background:{C['ora']}; border-radius:5px;")
+
+            bar_inner_layout.addWidget(bar_fill)
+            if fill_frac < 1.0:
+                spacer = QFrame()
+                spacer.setStyleSheet("background:transparent;")
+                bar_inner_layout.addWidget(spacer)
+                bar_fill.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+                spacer.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+                bar_inner_layout.setStretch(0, int(fill_frac * 1000))
+                bar_inner_layout.setStretch(1, int((1 - fill_frac) * 1000))
+            else:
+                bar_fill.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+            bl.addWidget(bar_outer, 1)
+
+            pct_lbl = mk_label(fmt_pct(rate), color=C["ora"], size=11, bold=True, mono=True)
+            pct_lbl.setFixedWidth(70)
+            pct_lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            bl.addWidget(pct_lbl)
+
+            rl.addWidget(bar_frame, 1)
+            vl.addWidget(row_w)
+
+        vl.addStretch()
+        return container
+
+    def sizeHint(self):
+        from PyQt6.QtCore import QSize
+        n = max(len(v) for v in self._data.values()) if self._data else 0
+        return QSize(700, 40 + (self._BAR_H + 6) * min(n, 10) + 20)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Leaderboard Card Widget
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -6840,13 +7347,14 @@ class LeaderboardCard(QFrame):
 
 
 def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None,
-                         stat_tables=None):
+                         stat_tables=None, extra_bottom=None):
     """Build a top-stats page with leaderboard cards.
 
-    leaderboards : list of (title, rows, fmt[, unit]) tuples for LeaderboardCard widgets
-    stat_table   : optional (section_title, badge, cols, data, hi_cols) for a table_section
-    stat_tables  : optional list of (label, section_title, badge, cols, data, hi_cols) for
-                   a filterable table group with a toggle bar
+    leaderboards  : list of (title, rows, fmt[, unit]) tuples for LeaderboardCard widgets
+    stat_table    : optional (section_title, badge, cols, data, hi_cols) for a table_section
+    stat_tables   : optional list of (label, section_title, badge, cols, data, hi_cols) for
+                    a filterable table group with a toggle bar
+    extra_bottom  : optional QWidget inserted after leaderboard cards and before stat tables
     """
     page = QWidget()
     page.setStyleSheet(f"background:{C['bg0']};")
@@ -6916,6 +7424,11 @@ def build_top_stats_page(title, subtitle, leaderboards=None, stat_table=None,
 
         sec = table_section(st_title, st_badge, st_cols, st_data, st_hi, name_col_wide=140)
         vl.addWidget(sec)
+        vl.addSpacing(20)
+
+    # ── optional extra widget (e.g. TeamSBBarChart) ──
+    if extra_bottom is not None:
+        vl.addWidget(extra_bottom)
         vl.addSpacing(20)
 
     vl.addStretch()
@@ -7066,6 +7579,17 @@ def _game_sort_key(g):
         time_val = _dt.strptime(t.strip(), '%I:%M %p').time()
     except Exception:
         time_val = None
+    # For TBD games, fall back to the raw UTC sort timestamp so that
+    # a doubleheader game 2 (TBD time) stays right after game 1.
+    if time_val is None:
+        sort_ts = g.get('sort_time_str') or ''
+        if sort_ts:
+            try:
+                from datetime import datetime as _dt
+                _dt_utc = _dt.fromisoformat(sort_ts.replace('Z', '+00:00'))
+                time_val = _dt_utc.astimezone().time()
+            except Exception:
+                pass
     # Use parsed time for chronological sort, fall back to end-of-day
     sort_time = time_val if time_val is not None else _time_max
     if is_live:
@@ -8377,6 +8901,8 @@ class SeamStatsApp(QMainWindow):
                     except Exception:
                         pass
                 pt, pitcher_pt = _DM.get_todays_player_info(self._games)
+                self._today_player_teams = pt
+                set_today_player_teams(pt)
                 if pt:
                     _fmt_avg = lambda v: f"{v:.3f}" if isinstance(v, float) else str(v)
                     _fmt_pct = lambda v: f"{v * 100:.1f}%" if isinstance(v, float) else str(v)
@@ -8436,6 +8962,13 @@ class SeamStatsApp(QMainWindow):
             except Exception:
                 log.exception("_fetch_lb")
 
+            # Team SB rate data for base running page bar chart
+            team_sb_rates = None
+            try:
+                team_sb_rates = _DM.get_team_sb_rates()
+            except Exception:
+                log.exception("_fetch_lb team_sb_rates")
+
             # HR Allowed table for pitching page (rolling 365-day window)
             hr_tbl = None
             try:
@@ -8443,7 +8976,7 @@ class SeamStatsApp(QMainWindow):
             except Exception:
                 log.exception("_fetch_lb hr_table")
 
-            self._lb_notifier.ready.emit((hit_lbs, pit_lbs, br_lbs, hr_tbl))
+            self._lb_notifier.ready.emit((hit_lbs, pit_lbs, br_lbs, hr_tbl, team_sb_rates))
 
         self._fetch_lb = _fetch_lb
         self._lb_fetched = False  # defer until user navigates to a leaderboard page
@@ -8739,6 +9272,9 @@ class SeamStatsApp(QMainWindow):
         for _fld in ('away_p_id', 'home_p_id'):
             if not new.get(_fld) and old.get(_fld):
                 merged[_fld] = old[_fld]
+        # Never let a poll with TBD overwrite a confirmed game time
+        if (new.get('time') or 'TBD') == 'TBD' and (old.get('time') or 'TBD') not in ('TBD', 'PPD', 'LIVE', 'FINAL'):
+            merged['time'] = old['time']
         return merged
 
     def _on_scores_fetched(self, games):
@@ -9035,6 +9571,7 @@ class SeamStatsApp(QMainWindow):
         try:
             hit_lbs, pit_lbs, br_lbs = result[:3]
             hr_tbl = result[3] if len(result) > 3 else None
+            team_sb_rates = result[4] if len(result) > 4 else None
             # If all empty, allow retry on next tab visit
             if not hit_lbs and not pit_lbs and not br_lbs:
                 self._lb_fetched = False
@@ -9052,6 +9589,11 @@ class SeamStatsApp(QMainWindow):
                      h_cols, h_data, h_hi, h_gm),
                 ]
 
+            # Build team SB bar chart for base running page
+            br_bar_chart = None
+            if team_sb_rates:
+                br_bar_chart = TeamSBBarChart(team_sb_rates)
+
             replacements = [
                 (self.IDX_HIT,   "Top Stats - Hitting",
                  "2026 season · all qualified hitters", hit_lbs, None),
@@ -9065,6 +9607,8 @@ class SeamStatsApp(QMainWindow):
                 kw = {}
                 if idx == self.IDX_PITCH and pit_stat_tables:
                     kw["stat_tables"] = pit_stat_tables
+                if idx == self.IDX_BR and br_bar_chart is not None:
+                    kw["extra_bottom"] = br_bar_chart
                 new_page = build_top_stats_page(title, subtitle,
                                                 leaderboards=lbs or None,
                                                 stat_table=st, **kw)

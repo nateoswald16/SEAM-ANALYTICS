@@ -5,9 +5,11 @@ Provides a search bar with a dropdown of matching players from the
 roster CSV.  Selecting a result opens the PlayerProfileDialog.
 """
 
+import bisect
 import os
 import csv as _csv
 import logging
+import threading
 import unicodedata
 from datetime import datetime
 
@@ -19,6 +21,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QObject
 from PyQt6.QtGui import QPixmap, QFont, QColor, QPainter, QPainterPath, QIcon, QImage
 
 import _app_paths
+import player_card as _pc
 from player_card import (
     C, HEADSHOT_DIR, HEADSHOT_URL, PLAYERS_CSV, _load_roster,
     _http, _pool, _placeholder_pixmap,
@@ -31,7 +34,7 @@ _FONT = "'Segoe UI','Inter',sans-serif"
 _THUMB_W, _THUMB_H = 32, 48    # thumbnail vertical rectangle (2:3)
 _THUMB_R = 6                    # thumbnail corner radius
 _MAX_RESULTS = 25               # cap visible matches
-_DEBOUNCE_MS = 150              # typing debounce
+_DEBOUNCE_MS = 200              # typing debounce
 
 
 class _ThumbSignal(QObject):
@@ -43,8 +46,15 @@ _thumb_signal = _ThumbSignal()
 # Track in-flight headshot download player IDs to avoid duplicate fetches
 _thumb_inflight: set[int] = set()
 
-# Pre-load the roster once for fast searching
+# In-memory thumbnail cache: player_id → already-clipped QPixmap
+_thumb_cache: dict[int, QPixmap] = {}
+_placeholder_thumb_pm: QPixmap | None = None  # singleton
+
+# Search index — built once from the roster, reused every keystroke
 _roster_list: list[dict] | None = None
+_search_index: list[tuple] | None = None   # (name_norm, team_norm, row)
+_name_keys: list[str] | None = None        # parallel to _search_index, for bisect
+_index_lock = threading.Lock()
 
 
 def _get_roster_list() -> list[dict]:
@@ -52,18 +62,23 @@ def _get_roster_list() -> list[dict]:
     global _roster_list
     if _roster_list is not None:
         return _roster_list
-    roster = _load_roster()                   # dict keyed by pid
+    roster = _load_roster()
     _roster_list = sorted(roster.values(), key=lambda r: r.get("name_full", ""))
     return _roster_list
 
 
 def _thumb_pixmap(player_id: int) -> QPixmap:
-    """Return a small rounded-rect thumbnail, kicking off async download if missing."""
+    """Return a small thumbnail; uses in-memory cache, async fetch if missing."""
+    if player_id in _thumb_cache:
+        return _thumb_cache[player_id]
+
     cache_path = os.path.join(HEADSHOT_DIR, f"{player_id}.png")
     if os.path.exists(cache_path):
         src = QPixmap(cache_path)
         if not src.isNull():
-            return _clip_thumb(src)
+            clipped = _clip_thumb(src)
+            _thumb_cache[player_id] = clipped
+            return clipped
 
     # Async fetch — return placeholder now, emit signal when ready
     if player_id in _thumb_inflight:
@@ -80,7 +95,9 @@ def _thumb_pixmap(player_id: int) -> QPixmap:
                 img.loadFromData(resp.content)
                 if not img.isNull():
                     pm = QPixmap.fromImage(img)
-                    _thumb_signal.ready.emit(player_id, _clip_thumb(pm))
+                    clipped = _clip_thumb(pm)
+                    _thumb_cache[player_id] = clipped
+                    _thumb_signal.ready.emit(player_id, clipped)
         except Exception:
             log.debug("thumb fetch failed for %s", player_id)
         finally:
@@ -110,7 +127,10 @@ def _clip_thumb(pm: QPixmap, w: int = _THUMB_W, h: int = _THUMB_H, r: int = _THU
 
 
 def _placeholder_thumb(w: int = _THUMB_W, h: int = _THUMB_H, r: int = _THUMB_R) -> QPixmap:
-    """Tiny dark rounded-rect placeholder."""
+    """Tiny dark rounded-rect placeholder — singleton, painted only once."""
+    global _placeholder_thumb_pm
+    if _placeholder_thumb_pm is not None:
+        return _placeholder_thumb_pm
     pm = QPixmap(w, h)
     pm.fill(QColor(0, 0, 0, 0))
     p = QPainter(pm)
@@ -119,6 +139,7 @@ def _placeholder_thumb(w: int = _THUMB_W, h: int = _THUMB_H, r: int = _THUMB_R) 
     p.setPen(QColor(C["bdr"]))
     p.drawRoundedRect(1, 1, w - 2, h - 2, r, r)
     p.end()
+    _placeholder_thumb_pm = pm
     return pm
 
 
@@ -128,20 +149,61 @@ def _strip_accents(text: str) -> str:
     return ''.join(ch for ch in nfkd if unicodedata.category(ch) != 'Mn')
 
 
+def _build_search_index() -> None:
+    """Build normalized (name, team, row) tuples + bisect key list. Thread-safe."""
+    global _search_index, _name_keys
+    with _index_lock:
+        if _search_index is not None:
+            return
+        roster = _get_roster_list()
+        idx, keys = [], []
+        for r in roster:
+            name_n = _strip_accents(r.get("name_full", "")).lower()
+            team_n = r.get("team", "").lower()
+            idx.append((name_n, team_n, r))
+            keys.append(name_n)
+        _search_index = idx
+        _name_keys = keys
+
+
+# Pre-warm on a background thread so first keystroke is instant
+_pool.submit(_build_search_index)
+
+
 def _search_roster(keyword: str) -> list[dict]:
-    """Return roster rows whose name or team matches *keyword* (accent-insensitive)."""
-    roster = _get_roster_list()
+    """Return roster rows matching *keyword* — accent-insensitive, bisect + linear."""
+    if _search_index is None:
+        _build_search_index()
     kw = _strip_accents(keyword).lower().strip()
     if not kw:
         return []
-    results = []
-    for row in roster:
-        name = _strip_accents(row.get("name_full", "")).lower()
-        team = row.get("team", "").lower()
-        if kw in name or kw in team:
+    results: list[dict] = []
+    seen: set = set()
+
+    # Fast path: bisect finds entries whose full name starts with kw (e.g. "mike t" → Mike Trout)
+    lo = bisect.bisect_left(_name_keys, kw)
+    for i in range(lo, len(_name_keys)):
+        if not _name_keys[i].startswith(kw):
+            break
+        row = _search_index[i][2]
+        pid = row.get("player_id")
+        if pid not in seen:
+            seen.add(pid)
+            results.append(row)
+            if len(results) >= _MAX_RESULTS:
+                return results
+
+    # Linear: mid-word name matches + team name matches
+    for name_n, team_n, row in _search_index:
+        pid = row.get("player_id")
+        if pid in seen:
+            continue
+        if kw in name_n or kw in team_n:
+            seen.add(pid)
             results.append(row)
             if len(results) >= _MAX_RESULTS:
                 break
+
     return results
 
 
@@ -149,14 +211,17 @@ def _search_roster(keyword: str) -> list[dict]:
 # Result row widget
 # ═════════════════════════════════════════════════════════════════════
 
-class _ResultRow(QFrame):
-    """Single clickable row in the search dropdown."""
-    clicked = pyqtSignal(dict)            # emits the CSV row dict
+_SEASON_STR = str(datetime.now().year)
 
-    def __init__(self, row: dict, parent=None):
+
+class _ResultRow(QFrame):
+    """Reusable row in the search dropdown. Call set_data() to populate in-place."""
+    clicked = pyqtSignal(dict)
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self._row = row
-        self._pid = int(row.get("player_id", 0))
+        self._row: dict = {}
+        self._pid: int = 0
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setFixedHeight(58)
@@ -176,51 +241,50 @@ class _ResultRow(QFrame):
         hl.setContentsMargins(10, 6, 10, 6)
         hl.setSpacing(10)
 
-        # Thumbnail
         self._thumb_lbl = QLabel()
         self._thumb_lbl.setFixedSize(_THUMB_W, _THUMB_H)
-        self._thumb_lbl.setPixmap(_thumb_pixmap(self._pid))
-        _thumb_signal.ready.connect(self._on_thumb_ready)
         hl.addWidget(self._thumb_lbl)
 
-        # Text block
         text_vl = QVBoxLayout()
         text_vl.setSpacing(2)
         text_vl.setContentsMargins(0, 0, 0, 0)
 
-        # Player name
-        name_lbl = QLabel(row.get("name_full", "Unknown"))
-        name_lbl.setStyleSheet(
+        self._name_lbl = QLabel()
+        self._name_lbl.setStyleSheet(
             f"color:{C['t1']}; background:transparent; border:none;"
             f"font-family:{_FONT}; font-size:13px; font-weight:600;")
-        text_vl.addWidget(name_lbl)
+        text_vl.addWidget(self._name_lbl)
 
-        # Subtitle: MLB | season | position | team
-        season = str(datetime.now().year)
-        pos = row.get("position", "")
-        team = row.get("team", "")
-        throws = row.get("throws", "")
-        hand = ""
-        pos_type = row.get("position_type", "")
-        if pos_type == "Pitcher":
-            hand = f"{throws}HP" if throws else ""
-        else:
-            hand = pos
-        parts = ["MLB", season]
-        if hand:
-            parts.append(hand)
-        if team:
-            parts.append(team)
-        sub_lbl = QLabel("  |  ".join(parts))
-        sub_lbl.setStyleSheet(
+        self._sub_lbl = QLabel()
+        self._sub_lbl.setStyleSheet(
             f"color:{C['t2']}; background:transparent; border:none;"
             f"font-family:{_FONT}; font-size:11px;")
-        text_vl.addWidget(sub_lbl)
+        text_vl.addWidget(self._sub_lbl)
 
         hl.addLayout(text_vl)
         hl.addStretch()
 
-    def _on_thumb_ready(self, pid: int, pm: QPixmap):
+        _thumb_signal.ready.connect(self._on_thumb_ready)
+
+    def set_data(self, row: dict) -> None:
+        """Update this row in-place with new player data (no widget re-creation)."""
+        self._row = row
+        self._pid = int(row.get("player_id", 0))
+        self._name_lbl.setText(row.get("name_full", "Unknown"))
+        pos = row.get("position", "")
+        team = row.get("team", "")
+        throws = row.get("throws", "")
+        pos_type = row.get("position_type", "")
+        hand = (f"{throws}HP" if throws else "") if pos_type == "Pitcher" else pos
+        parts = ["MLB", _SEASON_STR]
+        if hand:
+            parts.append(hand)
+        if team:
+            parts.append(team)
+        self._sub_lbl.setText("  |  ".join(parts))
+        self._thumb_lbl.setPixmap(_thumb_pixmap(self._pid))
+
+    def _on_thumb_ready(self, pid: int, pm: QPixmap) -> None:
         if pid == self._pid:
             self._thumb_lbl.setPixmap(pm)
 
@@ -376,22 +440,39 @@ class PlayerSearchWidget(QWidget):
         self._results_layout = QVBoxLayout(self._results_container)
         self._results_layout.setContentsMargins(0, 0, 0, 0)
         self._results_layout.setSpacing(0)
-        self._results_layout.addStretch()
         self._scroll.setWidget(self._results_container)
 
-        # ── Debounce timer ────────────────────────────────────────
+        # Pre-build row pool — reused every keystroke, no widget churn
+        self._row_pool: list[_ResultRow] = []
+        for _ in range(_MAX_RESULTS):
+            rw = _ResultRow()
+            rw.clicked.connect(self._on_result_clicked)
+            rw.setVisible(False)
+            self._results_layout.addWidget(rw)
+            self._row_pool.append(rw)
+        self._results_layout.addStretch()
+
+        # ── Debounce timer ──────────────────────────────────────────────
         self._timer = QTimer()
         self._timer.setSingleShot(True)
         self._timer.setInterval(_DEBOUNCE_MS)
         self._timer.timeout.connect(self._do_search)
 
-        # ── Connections ───────────────────────────────────────────
+        # ── State + Connections ─────────────────────────────────────────
+        self._last_query: str = ""
         self._input.textChanged.connect(self._on_text_changed)
 
     # ── Slots ─────────────────────────────────────────────────────
 
     def _on_text_changed(self, text: str):
         self._clear_btn.setVisible(bool(text))
+        kw = text.strip()
+        if kw == self._last_query:
+            return          # same query, skip redundant fire
+        if len(kw) < 2:
+            self._last_query = kw
+            self._hide_dropdown()
+            return
         self._timer.start()
 
     def _on_clear(self):
@@ -400,6 +481,7 @@ class PlayerSearchWidget(QWidget):
 
     def _do_search(self):
         kw = self._input.text().strip()
+        self._last_query = kw
         if len(kw) < 2:
             self._hide_dropdown()
             return
@@ -407,24 +489,17 @@ class PlayerSearchWidget(QWidget):
         self._populate(results)
 
     def _populate(self, results: list[dict]):
-        # Clear old results
-        layout = self._results_layout
-        while layout.count() > 1:            # keep trailing stretch
-            item = layout.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-        if not results:
+        n = len(results)
+        for i, rw in enumerate(self._row_pool):
+            if i < n:
+                rw.set_data(results[i])
+                rw.setVisible(True)
+            else:
+                rw.setVisible(False)
+        if n == 0:
             self._hide_dropdown()
-            return
-
-        for row in results:
-            rw = _ResultRow(row)
-            rw.clicked.connect(self._on_result_clicked)
-            layout.insertWidget(layout.count() - 1, rw)  # before stretch
-
-        self._show_dropdown(len(results))
+        else:
+            self._show_dropdown(n)
 
     def _show_dropdown(self, n: int):
         # Position below the input, matching width
@@ -459,6 +534,10 @@ class PlayerSearchWidget(QWidget):
 
         # Get schedule games from main window for venue resolution
         games = getattr(self.window(), '_games', None)
+
+        # Override stale CSV team with today's lineup team (ground truth)
+        if pid in _pc._today_player_teams:
+            team = _pc._today_player_teams[pid]
 
         show_player_profile({
             "id": pid,

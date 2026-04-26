@@ -336,6 +336,9 @@ def _create_calc_tables(cur):
         swstr_pct REAL,
         gb_pct REAL,
         fp_strike_pct REAL,
+        z_contact_pct REAL,
+        obp_against REAL,
+        fb_pct REAL,
         PRIMARY KEY(season, player_id, matchup, window)
     )
     ''')
@@ -606,7 +609,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
             denom = 198.27 - hc_y
             if denom == 0:
                 continue
-            raw_angle = _math.atan((hc_x - 125.42) / denom) * (180 / _math.pi) * 0.75
+            raw_angle = _math.atan((hc_x - 125.42) / denom) * (180 / _math.pi)
             adj_angle = raw_angle if stand == 'R' else -raw_angle
             if adj_angle < -17:
                 pulled_air_count += 1
@@ -690,7 +693,7 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
                     valid_dy = dy != 0
                     raw_angle = bbe_air.loc[valid_dy, 'hc_x'].copy()
                     raw_angle = (bbe_air.loc[valid_dy, 'hc_x'] - 125.42) / dy[valid_dy]
-                    raw_angle = raw_angle.apply(_math.atan) * (180 / _math.pi) * 0.75
+                    raw_angle = raw_angle.apply(_math.atan) * (180 / _math.pi)
                     adj_angle = raw_angle.copy()
                     lhb_mask = bbe_air.loc[valid_dy, 'stand'] == 'L'
                     adj_angle[lhb_mask] = -raw_angle[lhb_mask]
@@ -930,6 +933,11 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     # ── WHIP ────────────────────────────────────────────────────────────
     whip = round((bb + hits_allowed) / innings, 3) if innings and innings > 0 else None
 
+    # ── OBP Against ─────────────────────────────────────────────────────
+    # (H + BB + HBP) / (AB + BB + HBP + SF)
+    obp_denom = ab + bb + hbp_allowed + sf_allowed
+    obp_against = round((hits_allowed + bb + hbp_allowed) / obp_denom, 3) if obp_denom and obp_denom > 0 else None
+
     # ── Raw DB batted-ball stats (always available, covers all games) ────
     hard_pct = None
     xoba_against = None
@@ -937,8 +945,10 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     ld_pct = None
     soft_pct = None
     gb_pct = None
+    fb_pct = None
     swstr_pct = None
     fp_strike_pct = None
+    z_contact_pct = None
 
     raw_date_params: List = []
     raw_date_sql = ''
@@ -961,7 +971,8 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard,
             SUM(CASE WHEN bb_type = 'popup' THEN 1 ELSE 0 END) AS soft,
             SUM(CASE WHEN bb_type = 'line_drive' THEN 1 ELSE 0 END) AS ld,
-            SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) AS gb
+            SUM(CASE WHEN bb_type = 'ground_ball' THEN 1 ELSE 0 END) AS gb,
+            SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) AS fly_balls
         FROM plate_appearances
         WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
     """
@@ -974,6 +985,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             soft_pct = round((raw_bb[5] or 0) / raw_bbe, 3)
             ld_pct = round((raw_bb[6] or 0) / raw_bbe, 3)
             gb_pct = round((raw_bb[7] or 0) / raw_bbe, 3)
+            fb_pct = round((raw_bb[8] or 0) / raw_bbe, 3)
 
     # ── Raw DB xOBA (estimated_woba_using_speedangle) ────────────────────
     raw_xoba_sql = f"""
@@ -1044,6 +1056,7 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
                     barrel_pct = round(float((pf.loc[bip_mask, 'launch_speed_angle'] == 6).sum()) / n_bip, 3)
                 if 'bb_type' in pf.columns:
                     gb_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'ground_ball').sum()) / n_bip, 3)
+                    fb_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'fly_ball').sum()) / n_bip, 3)
         # xOBA (expected wOBA using Statcast speed+angle)
         if 'estimated_woba_using_speedangle' in pf.columns:
             xwoba = pf['estimated_woba_using_speedangle'].dropna()
@@ -1088,6 +1101,13 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
                 if len(zone_vals) > 0:
                     in_zone = int(((zone_vals >= 1) & (zone_vals <= 9)).sum())
                     zone_pct = round(in_zone / len(zone_vals), 3)
+                # Z-Contact% = contacts on in-zone swings / in-zone swings
+                if 'description' in pp.columns:
+                    in_zone_pitches = pp[pp['zone'].notna() & (pp['zone'] >= 1) & (pp['zone'] <= 9)]
+                    iz_swings = int(in_zone_pitches['description'].isin(swing_ev).sum())
+                    iz_contacts = int(in_zone_pitches['description'].isin(contact_ev).sum())
+                    if iz_swings > 0:
+                        z_contact_pct = round(iz_contacts / iz_swings, 3)
             if 'release_speed' in pp.columns:
                 velo = pp['release_speed'].dropna()
                 if len(velo) > 0:
@@ -1106,6 +1126,19 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
         swstr_row = cur_raw.execute(swstr_sql, raw_params).fetchone()
         if swstr_row and swstr_row[1] and swstr_row[1] > 0:
             swstr_pct = round((swstr_row[0] or 0) / swstr_row[1], 3)
+
+    # ── Z-Contact% raw DB fallback (plate_appearances.swing/contact/zone) ──
+    if z_contact_pct is None:
+        z_contact_sql = f"""
+            SELECT
+                SUM(CASE WHEN swing = 1 AND contact = 1 AND zone >= 1 AND zone <= 9 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN swing = 1 AND zone >= 1 AND zone <= 9 THEN 1 ELSE 0 END)
+            FROM plate_appearances
+            WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
+        """
+        z_row = cur_raw.execute(z_contact_sql, raw_params).fetchone()
+        if z_row and z_row[1] and z_row[1] > 0:
+            z_contact_pct = round((z_row[0] or 0) / z_row[1], 3)
 
     # ── First Pitch Strike% from sc_pitches (pitch-level Statcast) ────────
     # pitching_appearances.swing/zone are always NULL, so we use sc_pitches.
@@ -1155,8 +1188,9 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
             slg_against, hard_pct, xoba_against, babip_against,
             whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-            avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct,
+            z_contact_pct, obp_against, fb_pct
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ''', (
         season, player_id, player_name or '', matchup, window,
         pa, outs_recorded, innings, k, bb,
@@ -1165,7 +1199,8 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
         k_pct, bb_pct, k_per_9, bb_per_9, h_per_9, era, whiff_pct, pitches_thrown,
         slg_against, hard_pct, xoba_against, babip_against,
         whip, barrel_pct, ld_pct, soft_pct, contact_pct, zone_pct,
-        avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct
+        avg_velo, top_velo, swstr_pct, gb_pct, fp_strike_pct,
+        z_contact_pct, obp_against, fb_pct
     ))
 
 

@@ -58,6 +58,7 @@ DevUpdate.md
 app/backfill_*.py
 app/verify_2025.py
 app/rebuild_2026.py
+app/rebuild_all.py
 app/backfill_outs_er.py
 app/download_historical_statcast.py
 app/_diag_*.py
