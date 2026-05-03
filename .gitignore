@@ -63,6 +63,7 @@ app/backfill_outs_er.py
 app/download_historical_statcast.py
 app/_diag_*.py
 app/audit_stats_2025.py
+check_stats.py
 
 # ── API keys ──────────────────────────────────────────────────
 app/weatherapi_key.txt

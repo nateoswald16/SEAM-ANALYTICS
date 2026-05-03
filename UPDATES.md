@@ -4,6 +4,42 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.2.4 — 2026-05-03
+
+> [!WARNING]
+> **Database Rebuild Required for Existing Users**
+> Due to a bug in data fetching that would erase some pitcher data, please rebuild the database included in this update and run the manual daily update to ensure your database is now fully up to date with all fixes.
+
+### Bug Fixes
+
+**Fixed Pitcher Database Bug**
+- Missing first strike rate and swinging strike rate data now repopulated and fixes have been applied to daily updater
+
+### Data
+
+**Statcast Caching & Auto-Fetch**
+- Added `_ensure_statcast_cached()` pipeline function to auto-fetch missing Statcast data during calculated DB builds
+- Scans season date range for missing pickles; fetches gaps in 14-day chunks from Savant API
+- Deduplicates overlapping rows (last-in-wins) when appending incremental data
+- Daily update calls `fetch_and_cache_statcast_incremental()` to keep cache current for active season
+- Eliminates manual cache prep; DB builds now self-heal missing dates
+
+**Player Roster Fixes**
+- Fixed Gabriel Moreno team code: `AZ` → `ARI` (Arizona Diamondbacks correct abbreviation)
+- Fixed Austin Slater team: `MIA` → `NYM` (traded Marlins → Mets in offseason)
+
+**Statcast Mapping Enrichment**
+- Enhanced `pybaseball_to_schema_mapping.json`: `stand` field now also maps to `pitching_appearances` table for matchup-based filtering
+- Added `pitch_call` enrichment in `pitching_appearances` (mapped from Statcast `type`: S/B/X) for first-pitch-strike fallback
+- SwStr% fallback updated: uses explicit `pitch_call IN ('swinging_strike', 'swinging_strike_blocked')` instead of swing/contact flags
+- F-Strike% fallback added: queries first-pitch rows where `pitch_call IN ('S', 'X')` for improved accuracy when Statcast unavailable
+
+### Schema
+
+No schema version bumps. All changes are additive (new pickle cache system, new optional columns in enrichment).
+
+---
+
 ## v1.2.3 — 2026-04-26
 
 > [!WARNING]

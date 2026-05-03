@@ -125,6 +125,105 @@ def _get_opening_day(season: int, conn_raw: Optional[sqlite3.Connection] = None)
 _statcast_cache: Dict[int, Optional[pd.DataFrame]] = {}
 
 
+def _ensure_statcast_cached(season: int, start_date: Optional[str] = None, 
+                            end_date: Optional[str] = None) -> None:
+    """Auto-fetch and cache missing Statcast data for the entire season.
+    
+    Called before loading Statcast pickles. Always scans from Opening Day to season end
+    to detect and fill ANY gaps, not just the incremental date range.
+    If pickle files don't exist for missing dates, fetches from Savant and caches them.
+    
+    Args:
+        season: MLB season year
+        start_date: Ignored (always scans from Opening Day)
+        end_date: Ignored (always scans to season end)
+    """
+    from datetime import date, timedelta
+    from pybaseball import statcast
+    
+    # Season date ranges (from download_historical_statcast.py)
+    SEASON_RANGES = {
+        2021: ("2021-04-01", "2021-10-03"),
+        2022: ("2022-04-07", "2022-10-05"),
+        2023: ("2023-03-30", "2023-10-01"),
+        2024: ("2024-03-28", "2024-09-29"),
+        2025: ("2025-03-27", "2025-09-28"),
+        2026: ("2026-03-26", "2026-10-05"),
+    }
+    
+    # Get season boundaries
+    if season not in SEASON_RANGES:
+        return  # Unknown season
+    
+    season_start, season_end = SEASON_RANGES[season]
+    
+    # For current/active season, use min(season_end_date, today)
+    # For past seasons, use the season end date
+    today = date.today().isoformat()
+    if today < season_end:
+        scan_end = today  # Active season: scan to today
+    else:
+        scan_end = season_end  # Past season: use actual season end
+    
+    scan_start = season_start
+    
+    # Check which date ranges have pickles
+    pattern = os.path.join(STATCAST_CACHE, f'{season}-*_{season}-*.pkl')
+    existing_pickles = glob.glob(pattern)
+    
+    # Parse existing pickle date ranges
+    cached_ranges = set()
+    for pkl in existing_pickles:
+        basename = os.path.basename(pkl)
+        # Format: YYYY-MM-DD_YYYY-MM-DD.pkl
+        try:
+            parts = basename.replace('.pkl', '').split('_')
+            if len(parts) >= 2:
+                pkl_start = parts[0]
+                pkl_end = parts[1]
+                current = pkl_start
+                while current <= pkl_end:
+                    cached_ranges.add(current)
+                    current = (pd.Timestamp(current) + timedelta(days=1)).strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    
+    # Find missing dates in full season range
+    missing_dates = []
+    current = scan_start
+    while current <= scan_end:
+        if current not in cached_ranges:
+            missing_dates.append(current)
+        current = (pd.Timestamp(current) + timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    if not missing_dates:
+        return  # All dates cached
+    
+    print(f'  Auto-fetching {len(missing_dates)} missing Statcast date(s) for {season}...')
+    
+    # Fetch missing dates in chunks (Savant prefers ~2-week windows)
+    chunk_start = missing_dates[0]
+    chunk_size = 0
+    for i, mdate in enumerate(missing_dates):
+        chunk_size += 1
+        # Fetch every 14 days or at end of list
+        if chunk_size >= 14 or i == len(missing_dates) - 1:
+            chunk_end = mdate
+            try:
+                print(f'    Fetching {chunk_start} to {chunk_end}...')
+                df = statcast(chunk_start, chunk_end)
+                if df is not None and not df.empty:
+                    # Cache to pickle
+                    pkl_path = os.path.join(STATCAST_CACHE, f'{chunk_start}_{chunk_end}.pkl')
+                    df.to_pickle(pkl_path)
+                    print(f'    Cached {len(df):,} pitches → {os.path.basename(pkl_path)}')
+            except Exception as e:
+                print(f'    Warning: fetch failed ({e}), skipping')
+            
+            chunk_start = (pd.Timestamp(mdate) + timedelta(days=1)).strftime('%Y-%m-%d')
+            chunk_size = 0
+
+
 def _load_statcast_season(season: int, conn_raw: Optional[sqlite3.Connection] = None) -> Optional[pd.DataFrame]:
     """Load and merge ALL Statcast pickle files for *season*, returning only
     completed-PA rows (where ``events`` is set) within the regular-season
@@ -1115,10 +1214,11 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
                     top_velo = round(float(velo.max()), 1)
 
     # ── SwStr% fallback from pitching_appearances when pkl unavailable ────
+    # Note: fallback is limited without full Statcast—only counts explicitly marked swinging strikes
     if swstr_pct is None:
         swstr_sql = f"""
             SELECT
-                SUM(CASE WHEN swing = 1 AND contact = 0 THEN 1 ELSE 0 END),
+                SUM(CASE WHEN pitch_call IN ('swinging_strike', 'swinging_strike_blocked') THEN 1 ELSE 0 END),
                 COUNT(*)
             FROM pitching_appearances
             WHERE season = ? AND pitcher_id = ? {raw_matchup_sql} {raw_date_sql}
@@ -1156,6 +1256,19 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
         if len(fp) > 0:
             fp_strikes = fp[fp['type'].isin(['S', 'X'])]
             fp_strike_pct = round(len(fp_strikes) / len(fp), 3)
+    
+    # ── First Pitch Strike% fallback from pitching_appearances (enriched Statcast) ────
+    if fp_strike_pct is None:
+        fp_sql = f"""
+            SELECT
+                SUM(CASE WHEN pitch_call IN ('S', 'X') THEN 1 ELSE 0 END),
+                COUNT(*)
+            FROM pitching_appearances
+            WHERE season = ? AND pitcher_id = ? AND pitch_number = 1 {raw_matchup_sql} {raw_date_sql}
+        """
+        fp_row = cur_raw.execute(fp_sql, raw_params).fetchone()
+        if fp_row and fp_row[1] and fp_row[1] > 0:
+            fp_strike_pct = round((fp_row[0] or 0) / fp_row[1], 3)
 
     # ── Raw DB whiff fallback (when pkl is unavailable) ──────────────────
     if whiff_pct is None and raw_swings > 0:
@@ -1452,6 +1565,10 @@ def build_calculated_db_incremental(season: int, start_date: str, end_date: str,
     print(f'  Incremental rebuild for {season}: {len(batter_ids)} batters, {len(pitcher_ids)} pitchers, '
           f'{len(runner_ids)} runners, {len(br_pitcher_ids)} BR pitchers, {len(br_catcher_ids)} BR catchers')
 
+    # Auto-fetch and cache any missing Statcast data for this date range
+    print(f'  Ensuring Statcast cache is current for {start_date} to {end_date}...')
+    _ensure_statcast_cached(season, start_date, end_date)
+
     # Load Statcast data (needed for barrel/pull/ev/la)
     sc_df = _load_statcast_season(season, conn_raw=conn_raw)
     if sc_df is None:
@@ -1581,6 +1698,10 @@ def build_calculated_db(seasons: Optional[List[int]] = None):
         for tbl in _CALC_TABLES:
             cur_calc.execute(f'DELETE FROM {tbl} WHERE season = ?', (season,))
         conn_calc.commit()
+
+        # Auto-fetch and cache any missing Statcast data for this season
+        print(f'  Ensuring Statcast cache is current for {season}...')
+        _ensure_statcast_cached(season)
 
         # Load Statcast pickle for this season (detailed tracking data)
         sc_df = _load_statcast_season(season, conn_raw=conn_raw)

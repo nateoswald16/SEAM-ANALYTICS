@@ -55,7 +55,8 @@
     "mapped_to": "plate_appearances.game_type"
   },
   "stand": {
-    "mapped_to": "plate_appearances.stand"
+    "mapped_to": "plate_appearances.stand",
+    "also_mapped_to": "pitching_appearances.stand"
   },
   "p_throws": {
     "mapped_to": "plate_appearances.p_throws"

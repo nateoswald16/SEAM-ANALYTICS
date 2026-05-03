@@ -38,6 +38,7 @@ ROOT = _app_paths.APP_DIR
 DB_PATH = _app_paths.RAW_DB
 SCHEMA_FILE = _app_paths.SCHEMA_FILE
 MAPPING_FILE = _app_paths.MAPPING_FILE
+STATCAST_CACHE_DIR = _app_paths.STATCAST_CACHE_DIR
 
 SCHEDULE_URL = 'https://statsapi.mlb.com/api/v1/schedule'
 # use v1.1 feed path (schedule 'link' values reference /api/v1.1/)
@@ -817,6 +818,54 @@ def parse_stolen_events(feed: Dict[str, Any], season: int) -> List[Dict[str, Any
     return out
 
 
+def fetch_and_cache_statcast_incremental(start_date: str, end_date: str, season: int):
+    """Fetch Statcast for a date range and save/append to pickle file.
+    
+    Used by daily_update to keep Statcast cache current for the active season.
+    Returns the fetched DataFrame or None if no data.
+    """
+    print(f'Fetching Statcast for caching ({start_date} → {end_date})')
+    try:
+        df = statcast(start_date, end_date)
+        if df is None or df.empty:
+            print('  No Statcast rows fetched')
+            return None
+    except Exception as e:
+        print(f'  Warning: Statcast fetch failed: {e}')
+        return None
+
+    # Determine pickle path for this season
+    pkl_path = os.path.join(STATCAST_CACHE_DIR, f'{start_date}_{end_date}.pkl')
+    
+    # Try to load existing pickle for this date range
+    existing = None
+    if os.path.exists(pkl_path):
+        try:
+            existing = pd.read_pickle(pkl_path)
+        except Exception as e:
+            print(f'  Warning: could not load existing pickle: {e}')
+    
+    # Deduplicate: keep new data (last=False)
+    if existing is not None and not existing.empty:
+        combined = pd.concat([existing, df], ignore_index=True)
+        dedup_cols = ['game_pk', 'at_bat_number', 'pitch_number']
+        if all(c in combined.columns for c in dedup_cols):
+            before = len(combined)
+            combined = combined.drop_duplicates(subset=dedup_cols, keep='last')  # keep latest
+            dupes = before - len(combined)
+            if dupes:
+                print(f'  Deduplicated: removed {dupes} overlapping rows')
+        df = combined
+    
+    try:
+        df.to_pickle(pkl_path)
+        print(f'  Cached {len(df):,} pitches → {os.path.basename(pkl_path)}')
+    except Exception as e:
+        print(f'  Warning: failed to save pickle: {e}')
+    
+    return df
+
+
 def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: str):
     print('Fetching statcast for enrichment', start_date, end_date)
     df = statcast(start_date, end_date)
@@ -903,6 +952,16 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             _des = srow.get('des')
             if pd.notna(_des):
                 pa_update['des'] = _des
+        
+        # Map 'type' (S/B/X) to pitch_call for fallback F-Strike% / SwStr% calculation
+        ptype = srow.get('type')
+        if pd.notna(ptype):
+            pitch_row['pitch_call'] = ptype
+        
+        # Also map 'stand' to pitching_appearances for matchup-based filtering
+        pstand = srow.get('stand')
+        if pd.notna(pstand):
+            pitch_row['stand'] = pstand
 
         # Keep the feed's `at_bat_number` canonical; Statcast's original
         # 1-based value is stored in `statcast_at_bat_number` (mapping updated).
@@ -1536,6 +1595,8 @@ def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bo
     if progress_cb:
         progress_cb('statcast', 0, 1, None)
     enrich_with_statcast(conn, start_date, end_date)
+    # Cache fetched Statcast to pickle for incremental calculated-stats builds
+    fetch_and_cache_statcast_incremental(start_date, end_date, season)
     fetch_sprint_speeds(season, conn)
     fetch_runner_lead(season, conn)
     fetch_pitcher_tempo(season, conn)

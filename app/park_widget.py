@@ -416,6 +416,7 @@ _VENUE_TEMP_REF_OFFSET: dict[int, float] = {
     22:   +3.0,   # Dodger Stadium — LA heat
     4169: +3.0,   # LoanDepot Park — Miami heat
     1:    +2.0,   # Angel Stadium — Anaheim
+    2529: +4.0,   # Sutter Health Park — Sacramento
 }
 
 # Monthly neutral conditions per venue: {venue_id: {month: (temp_F, humid_pct)}}
@@ -550,7 +551,7 @@ _VENUE_ENDEMIC_WIND_CARRY: dict[int, float] = {
     1:     +14.0,  # Angel Stadium — warm/dry Anaheim + funnel geometry toward RF
     2889:  -15.0,  # Busch Stadium — St. Louis persistent NE prevailing headwind; 5-yr empirical -14.6 confirms
     7:     -14.0,  # Kauffman Stadium — open bowl, northerly prevailing wind; 5-yr empirical -13.7 confirms
-    2529:  -16.0,  # Sutter Health Park — Sacramento Delta westerly breeze; 5-yr empirical -14.9 confirms
+    2529:  +16.0,  # Sutter Health Park — Sacramento Delta westerly breeze; 5-yr empirical -14.9 confirms
     2681:  +10.0,  # Citizens Bank Park — warm Delaware Valley, out-blowing tendency
     2:      +8.0,  # Camden Yards — Chesapeake Bay thermals
     3:      -6.0,  # Fenway Park — Green Monster headwind rebound + south-facing

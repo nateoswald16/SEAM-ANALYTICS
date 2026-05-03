@@ -32,7 +32,6 @@ a = Analysis(
         # pybaseball (lazy imports)
         'pybaseball',
         'pybaseball.statcast',
-        'pybaseball.statcast_sprint_speed',
         'pybaseball.playerid_lookup',
         # pandas / numpy
         'pandas.io.html',

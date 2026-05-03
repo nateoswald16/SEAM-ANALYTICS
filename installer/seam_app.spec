@@ -54,7 +54,6 @@ a = Analysis(
         # ── pybaseball (lazy imports inside functions) ────────
         'pybaseball',
         'pybaseball.statcast',
-        'pybaseball.statcast_sprint_speed',
         'pybaseball.playerid_lookup',
         # ── pandas / numpy internals ─────────────────────────
         'pandas.io.html',
