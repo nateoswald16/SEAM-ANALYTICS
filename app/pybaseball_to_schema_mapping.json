@@ -68,7 +68,7 @@
     "mapped_to": "plate_appearances.away_team"
   },
   "type": {
-    "mapped_to": "plate_appearances.game_type"
+    "mapped_to": "plate_appearances.pitch_result_type"
   },
   "hit_location": {
     "mapped_to": "plate_appearances.hit_location"

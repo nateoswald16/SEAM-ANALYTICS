@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS plate_appearances (
   stand TEXT CHECK (stand IN ('L','R')),
   position TEXT,
   pitcher_name TEXT,
+  pitch_result_type TEXT, -- Statcast pitch result type (e.g. B=ball, S=strike, X=in-play.)
   p_throws TEXT CHECK (p_throws IN ('L','R')),
   pitch_type_primary TEXT,
   pitch_name TEXT,
@@ -96,6 +97,7 @@ CREATE TABLE IF NOT EXISTS plate_appearances (
   at_bat_number INTEGER,
   statcast_at_bat_number INTEGER,
   barrel INTEGER,
+  batted_ball INTEGER,
   barrel_intensity REAL,
   pull INTEGER,
   opposite_field INTEGER,

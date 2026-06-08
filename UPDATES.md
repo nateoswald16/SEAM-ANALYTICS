@@ -4,6 +4,36 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.3.0 — 2026-06-08
+
+> [!WARNING]
+> **Database Rebuild Required for Existing Users**
+> Due to a bug in data fetching that would erase some pitcher data, please rebuild the database included in this update and run the manual daily update to ensure your database is now fully up to date with all fixes.
+
+### Data Pipeline Fixes
+
+**Barrel%, BBE, and Statcast Enrichment Overhaul**
+- Fixed batted ball events being undercounted due to incorrect pa_id construction
+- Fixed game_type being overwritten by Statcast pitch result codes (B/S/X)
+- Fixed barrel% denominator using partially-tracked BBEs causing inflated values
+- Fixed fb_pct not being calculated for batters
+- Fixed PullAir% spray angle formula removing incorrect 0.75 scaling duplication
+- Added spray_angle pre-computation during Statcast enrichment
+- Added bb_type derivation from launch_angle when Statcast data unavailable
+
+**Daily Updater Performance**
+- Fixed full season pickle being loaded for single-day updates (307k → ~7k rows)
+- Fixed Statcast data being loaded twice per enrichment run
+- Added gap-aware date range detection so missed days load only relevant pickle files
+- Improved backfill detection to only flag BBEs missing exit velocity data
+
+**Mapping Fixes**
+- Fixed Statcast pitch type field incorrectly overwriting game_type
+- Fixed inning_topbot incorrectly overwriting numeric inning
+- Fixed ax (acceleration) incorrectly mapped to spin_axis producing negative values
+- Fixed ay (acceleration) incorrectly mapped to away_score
+- Added pitch_result_type column for Statcast pitch outcome (B/S/X)
+
 ## v1.2.4 — 2026-05-03
 
 > [!WARNING]

@@ -15,15 +15,19 @@ Usage:
   python build_raw_db.py --year 2022
 """
 import argparse
+import math
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
+import glob
 import json
 import os
+import pickle
 import re
 import sqlite3
 import time
 from typing import List, Dict, Any
+
 
 import pandas as pd
 import requests
@@ -106,6 +110,18 @@ def create_db(db_path: str = DB_PATH):
                 print('Added column statcast_at_bat_number to plate_appearances')
             except Exception as e:
                 print('Warning adding statcast_at_bat_number column:', e)
+        if 'batted_ball' not in existing:
+            try:
+                cur.execute("ALTER TABLE plate_appearances ADD COLUMN batted_ball INTEGER DEFAULT 0")
+                print('Added column batted_ball to plate_appearances')
+            except Exception as e:
+                print('Warning adding batted_ball column:', e)
+        if 'pitch_result_type' not in existing:
+            try:
+                cur.execute("ALTER TABLE plate_appearances ADD COLUMN pitch_result_type TEXT")
+                print('Added column pitch_result_type to plate_appearances')
+            except Exception as e:
+                print('Warning adding pitch_result_type column:', e)
         conn.commit()
     except Exception as e:
         print('Warning during migration checks:', e)
@@ -333,8 +349,28 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
         'Pickoff Caught Stealing 2B', 'Pickoff Caught Stealing 3B',
         'Pickoff Caught Stealing Home',
         'Caught Stealing 2B', 'Caught Stealing 3B', 'Caught Stealing Home',
-        'Balk', 'Game Advisory',
-        'Runner Out',   # rare: runner thrown out between plays
+        'Stolen Base 2B', 'Stolen Base 3B', 'Stolen Base Home',
+        'Defensive Indifference',
+        'Wild Pitch', 'Passed Ball',
+        'Balk', 'Game Advisory', 'Runner Out',
+        'Mound Visit',
+        'Error', 'Fielding Error',
+        'Runner Placed On Base',
+        'Ejection', 'Umpire Review',
+    })
+
+    # Whitelist of true plate appearance terminal events
+    _PA_EVENTS = frozenset({
+        'Single', 'Double', 'Triple', 'Home Run',
+        'Walk', 'Intent Walk', 'Hit By Pitch',
+        'Strikeout', 'Strikeout Double Play',
+        'Field Out', 'Groundout', 'Flyout', 'Lineout', 'Pop Out',
+        'Grounded Into Double Play', 'Double Play', 'Triple Play',
+        'Fielders Choice', 'Fielders Choice Out',
+        'Field Error', 'Force Out',
+        'Sac Fly', 'Sac Bunt', 'Sac Fly Double Play',
+        'Catcher Interf', 'Fan Interference',
+        'Inside-the-park Home Run',
     })
 
     for idx, play in enumerate(plays, start=1):
@@ -354,7 +390,11 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
                 if pid:
                     _non_pa_outs[pid] = _non_pa_outs.get(pid, 0) + skip_outs
             continue
-        at_bat_number = about.get('atBatIndex', idx)
+        # AFTER — skip the play entirely if atBatIndex is missing, 
+        # it's not a real PA
+        at_bat_number = about.get('atBatIndex')
+        if at_bat_number is None:
+            continue  # No valid at-bat index = not a true PA
         batter = matchup.get('batter', {})
         pitcher = matchup.get('pitcher', {})
         # attempt to derive pitcher's throwing hand from feed fields
@@ -482,21 +522,8 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
                 break
 
         # Compute barrel flag from game feed hitData
+        # DISABLED: Use only Statcast barrel value in enrichment
         feed_barrel = None
-        feed_ls = hit_data.get('launch_speed')
-        feed_la = hit_data.get('launch_angle')
-        if feed_ls is not None and feed_la is not None:
-            try:
-                ev_f, ang_f = float(feed_ls), float(feed_la)
-                is_barrel = False
-                if ev_f >= 98:
-                    extra = ev_f - 98
-                    la_lo = max(26 - extra * 2, 8)
-                    la_hi = min(30 + extra * 3, 50)
-                    is_barrel = la_lo <= ang_f <= la_hi
-                feed_barrel = 1 if is_barrel else 0
-            except Exception:
-                pass
 
         # Compute pull flag from game feed hitData
         feed_pull = None
@@ -511,6 +538,15 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
                     feed_pull = 1 if hx > 125.42 else 0
             except Exception:
                 pass
+
+        # Compute batted_ball flag: BBE = any ball put in play (excludes live fouls only)
+        # Official Statcast definition: batted ball that produces a result (fair balls, errors, foul outs)
+        # Exclude only live fouls (foul, foul_bunt) that continue the PA without terminal event
+        # Foul tips/pops that ARE caught are valid BBEs (they're strikeouts/outs — terminal events)
+        event = (result.get('event') or result.get('eventType') or '').lower()
+        _live_fouls = {'foul', 'foul_bunt'}  # Only exclude live fouls that don't end PA
+        hit_data = play.get('result', {}).get('hitData') or {}
+        batted_ball = 1 if (hit_data and event not in _live_fouls) else 0
 
         row = {
             'pa_id': pa_id,
@@ -530,7 +566,8 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'p_throws': p_throws,
             'is_vs_lefty': is_vs_lefty,
             'events': (result.get('event') or result.get('eventType')),
-            'description': result.get('description'),
+            'des': result.get('description'),
+            'description': None,
             'result': result.get('event'),
             'is_hit': 1 if (is_single or is_double or is_triple or is_hr) else 0,
             'is_home_run': is_hr,
@@ -546,15 +583,15 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'total_bases': total_bases,
             'is_sac_fly': is_sac_fly,
             'is_sac_bunt': is_sac_bunt,
-            'launch_speed': hit_data.get('launch_speed'),
-            'launch_angle': hit_data.get('launch_angle'),
+            'launch_speed': hit_data.get('launch_speed') if hit_data else None,
+            'launch_angle': hit_data.get('launch_angle') if hit_data else None,
             'spray_angle': None,
             'on_1b': None,
             'on_2b': None,
             'on_3b': None,
-            'bb_type': hit_data.get('bb_type'),
-            'hit_location': hit_data.get('hit_location'),
-            'hit_distance_sc': hit_data.get('hit_distance_sc'),
+            'bb_type': hit_data.get('bb_type') if hit_data else None,
+            'hit_location': hit_data.get('hit_location') if hit_data else None,
+            'hit_distance_sc': hit_data.get('hit_distance_sc') if hit_data else None,
             'at_bat_number': at_bat_number,
             'balls': last_count.get('balls'),
             'strikes': last_count.get('strikes'),
@@ -572,6 +609,7 @@ def parse_plays_to_pas(feed: Dict[str, Any], season: int) -> List[Dict[str, Any]
             'hc_x': hit_data.get('hc_x'),
             'hc_y': hit_data.get('hc_y'),
             'barrel': feed_barrel,
+            'batted_ball': batted_ball,
             'pull': feed_pull,
             'batter_is_home': (lambda a: 0 if (a.get('isTopInning') if a.get('isTopInning') is not None else a.get('halfInning', 'top').lower() == 'top') else 1)(about),
             'home_team': home,
@@ -865,22 +903,56 @@ def fetch_and_cache_statcast_incremental(start_date: str, end_date: str, season:
     
     return df
 
+def _load_statcast_all_pitches(season: int, start_date: str = None, end_date: str = None):
+    """Load cached Statcast pickle files for a season, filtered to date range if provided."""
+    import glob, pickle
+    cache_dir = _app_paths.STATCAST_CACHE_DIR
+    pattern = os.path.join(cache_dir, f'{season}-*_{season}-*.pkl')
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return None
+    frames = []
+    loaded_files = 0
+    for f in files:
+        basename = os.path.basename(f)
+        try:
+            if start_date and end_date:
+                parts = basename.replace('.pkl', '').split('_')
+                pkl_start, pkl_end = parts[0], parts[1]
+                if pkl_end < start_date or pkl_start > end_date:
+                    continue  # Pickle doesn't overlap requested range
+            with open(f, 'rb') as fh:
+                frames.append(pickle.load(fh))
+            loaded_files += 1
+        except Exception as e:
+            print(f'  Warning: failed to load pickle {basename}: {e}')
+    if not frames:
+        return None
+    df = pd.concat(frames, ignore_index=True)
+    # Filter rows to exact date range
+    if start_date and end_date and 'game_date' in df.columns:
+        df = df[(df['game_date'] >= start_date) & (df['game_date'] <= end_date)]
+    print(f'  Loaded {len(df):,} Statcast rows from {loaded_files} pickle(s) for {season}')
+    return df
 
-def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: str):
-    print('Fetching statcast for enrichment', start_date, end_date)
-    df = statcast(start_date, end_date)
+def enrich_with_statcast(conn, start_date: str, end_date: str, season: int = None):
+    import json
+    import time
+    # Load column mapping
+    mapping_path = _app_paths.MAPPING_FILE
+    with open(mapping_path, 'r') as f:
+        mapping = json.load(f)
+
+    print('Loading statcast from cache for enrichment', start_date, end_date)
+
+    _BATCH_SIZE = 500 # Number of rows to process before committing to DB
+    _uncommitted = 0 # Counter for uncommitted rows
+    pitch_inserts = [] # List of (pitch_row, pa_id) tuples to insert into pitching_appearances
+
+    df = _load_statcast_all_pitches(season, start_date, end_date)
     if df is None or df.empty:
-        print('No statcast rows; skipping enrichment')
+        print('No cached statcast data available — skipping enrichment')
         return
-    try:
-        with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
-            mapping = json.load(f)
-    except Exception:
-        mapping = {}
-
-    pitch_inserts = []
-    _uncommitted = 0
-    _BATCH_SIZE = 500
 
     def _maybe_commit():
         nonlocal _uncommitted
@@ -953,6 +1025,11 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
             if pd.notna(_des):
                 pa_update['des'] = _des
         
+        # Compute batted_ball flag from Statcast: any event with bb_type (hit trajectory data)
+        # This is the denominator for barrel% — all batted balls regardless of direction or result
+        bb_type = srow.get('bb_type')
+        pa_update['batted_ball'] = 1 if (pd.notna(bb_type) and bb_type != '') else 0
+        
         # Map 'type' (S/B/X) to pitch_call for fallback F-Strike% / SwStr% calculation
         ptype = srow.get('type')
         if pd.notna(ptype):
@@ -976,31 +1053,51 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
         elif pa_update.get('is_home_run'):
             pa_update.setdefault('total_bases', 4)
 
-        # Derive `barrel` (approx) and `pull` flags when Statcast does not provide them.
-        # Only compute from the result pitch (not fouls).
-        # Barrel: MLB barrel zone — EV ≥ 98 mph with LA range widening as EV increases.
+        # Derive `barrel` and `pull` flags when Statcast does not provide them.
+        # Only compute barrel for actual batted balls (bb_type IS NOT NULL or hit_into_play description).
+        # Barrel: If launch_speed_angle available (Statcast), use LSA==6; otherwise MLB barrel zone formula
         if is_result_pitch:
-            ls = srow.get('launch_speed')
-            la = srow.get('launch_angle')
+            # Derive bb_type from launch_angle if Statcast didn't provide it
+            if pa_update.get('bb_type') is None:
+                la = srow.get('launch_angle')
+                if la is not None and not pd.isna(la):
+                    if la < 10:
+                        pa_update['bb_type'] = 'ground_ball'
+                    elif la < 25:
+                        pa_update['bb_type'] = 'line_drive'
+                    elif la <= 50:
+                        pa_update['bb_type'] = 'fly_ball'
+                    else:
+                        pa_update['bb_type'] = 'popup'
+
+            # Only derive barrel if this is a batted ball
+            has_bb_type = pd.notna(pa_update.get('bb_type')) and pa_update.get('bb_type') != ''
             hcx = srow.get('hc_x')
-            try:
-                if 'barrel' not in pa_update:
-                    if pd.notna(ls) and pd.notna(la):
-                        try:
-                            ev, ang = float(ls), float(la)
-                            is_barrel = False
-                            if ev >= 98:
-                                # Base zone at 98 mph: 26-30°
-                                # Each +1 mph widens ~2° low, ~3° high
-                                extra = ev - 98
-                                la_lo = max(26 - extra * 2, 8)
-                                la_hi = min(30 + extra * 3, 50)
-                                is_barrel = la_lo <= ang <= la_hi
-                            pa_update['barrel'] = 1 if is_barrel else 0
-                        except Exception:
-                            pass
-            except Exception:
-                pass
+            # Barrel: Use Statcast's launch_speed_angle classification if available (LSA==6 is barrel)
+            if has_bb_type:
+                try:
+                    if 'barrel' not in pa_update:
+                        lsa = srow.get('launch_speed_angle')
+                        if pd.notna(lsa):
+                            pa_update['barrel'] = 1 if int(lsa) == 6 else 0
+                        else:
+                            # Fallback to MLB barrel zone formula if LSA not available
+                            ls = srow.get('launch_speed')
+                            la = srow.get('launch_angle')
+                            if pd.notna(ls) and pd.notna(la):
+                                try:
+                                    ev, ang = float(ls), float(la)
+                                    is_barrel = False
+                                    if ev >= 98:
+                                        extra = ev - 98
+                                        la_lo = max(26 - extra * 2, 8)
+                                        la_hi = min(30 + extra * 3, 50)
+                                        is_barrel = la_lo <= ang <= la_hi
+                                    pa_update['barrel'] = 1 if is_barrel else 0
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
 
             # Pull: handedness-aware heuristic using hit coordinate (`hc_x`) and batter stand
             try:
@@ -1017,6 +1114,17 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
                         pass
             except Exception:
                 pass
+
+                        # Compute and store spray_angle from hc_x and hc_y — ADD HERE
+            hcy = srow.get('hc_y')
+            if hcx is not None and hcy is not None and pd.notna(hcx) and pd.notna(hcy):
+                try:
+                    denom = 198.27 - float(hcy)
+                    if denom != 0:
+                        raw_angle = math.atan((float(hcx) - 125.42) / denom) * (180 / math.pi) * 0.75
+                        pa_update['spray_angle'] = round(raw_angle, 4)
+                except Exception:
+                    pass
 
         if pa_id and pa_update:
             # Try exact pa_id first
@@ -1069,12 +1177,12 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
 
                 # Fallback: match by short description snippet
                 if not matched:
-                    desc = srow.get('description') or srow.get('events') or ''
+                    desc = srow.get('des') or srow.get('events') or ''
                     if isinstance(desc, str) and desc.strip():
                         short = desc.strip()[:60]
                         try:
                             cur = conn.execute(
-                                "SELECT pa_id FROM plate_appearances WHERE game_id = ? AND batter_id = ? AND description LIKE ? LIMIT 1",
+                                "SELECT pa_id FROM plate_appearances WHERE game_id = ? AND batter_id = ? AND des LIKE ? LIMIT 1",
                                 (str(int(game_pk)), int(batter), f"%{short}%"),
                             )
                             r = cur.fetchone()
@@ -1144,6 +1252,11 @@ def enrich_with_statcast(conn: sqlite3.Connection, start_date: str, end_date: st
         conn.commit()
 
     print('Enrichment complete')
+    
+    # Ensure batted_ball is set for all rows with bb_type (hit trajectory data)
+    if season is not None:
+        conn.execute("UPDATE plate_appearances SET batted_ball = 1 WHERE batted_ball = 0 AND season = ? AND bb_type IS NOT NULL AND bb_type != ''", (season,))
+        conn.commit()
 
 
 def _insert_games(conn: sqlite3.Connection, games: List[Dict[str, Any]], season: int):
@@ -1594,9 +1707,8 @@ def run_pipeline(start_date: str, end_date: str, season: int, only_completed: bo
 
     if progress_cb:
         progress_cb('statcast', 0, 1, None)
-    enrich_with_statcast(conn, start_date, end_date)
-    # Cache fetched Statcast to pickle for incremental calculated-stats builds
     fetch_and_cache_statcast_incremental(start_date, end_date, season)
+    enrich_with_statcast(conn, start_date, end_date, season=season)
     fetch_sprint_speeds(season, conn)
     fetch_runner_lead(season, conn)
     fetch_pitcher_tempo(season, conn)

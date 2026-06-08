@@ -48,6 +48,10 @@ nul
 *.swp
 *.swo
 
+# ── Project-specific (local customization) ────────────────────
+CLAUDE.md
+.github/
+
 # ── Internal dev docs (not for repo) ─────────────────────────
 app/helper.md
 

@@ -662,8 +662,8 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
     # --- Raw DB batted-ball stats (always available, covers all games) ---
     raw_bb_sql = f"""
         SELECT
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed_angle = 6 THEN 1 ELSE 0 END) AS barrels,
+            SUM(CASE WHEN batted_ball = 1 THEN 1 ELSE 0 END) AS batted_balls,
+            SUM(CASE WHEN batted_ball = 1 AND barrel = 1 THEN 1 ELSE 0 END) AS barrels,
             SUM(CASE WHEN bb_type = 'fly_ball' THEN 1 ELSE 0 END) AS fly_balls,
             MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard
@@ -675,21 +675,20 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         raw_bbe = raw_bb[0] or 0
         if raw_bbe > 0:
             barrel_pct = round((raw_bb[1] or 0) / raw_bbe, 3)
-            fb_pct = round((raw_bb[2] or 0) / raw_bbe, 3)
             hard_hit_pct = round((raw_bb[4] or 0) / raw_bbe, 3)
+            fb_pct = round((raw_bb[2] or 0) / raw_bbe, 3)
         if raw_bb[3] is not None:
             max_ev = round(raw_bb[3], 1)
 
     # --- Raw DB EV50 and Pulled Air% — require per-row fetch ---
     raw_detail_sql = f"""
-        SELECT launch_speed, hc_x, hc_y, stand, bb_type
+        SELECT launch_speed, spray_angle, stand, bb_type
         FROM plate_appearances{matchup_join}
         WHERE season = ? AND batter_id = ? {matchup_sql} {date_sql}
           AND bb_type IS NOT NULL AND bb_type != ''
     """
     raw_detail_rows = cur_raw.execute(raw_detail_sql, params).fetchall()
     if raw_detail_rows:
-        import math as _math
         ev_vals_raw = sorted(
             [r[0] for r in raw_detail_rows if r[0] is not None],
             reverse=True
@@ -700,17 +699,13 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         total_bbe_raw = len(raw_detail_rows)
         pulled_air_count = 0
         for r in raw_detail_rows:
-            _ls, hc_x, hc_y, stand, bb_type = r
+            _ls, spray_angle, stand, bb_type = r
             if bb_type == 'ground_ball':
                 continue
-            if hc_x is None or hc_y is None or stand is None:
+            if spray_angle is None or stand is None:
                 continue
-            denom = 198.27 - hc_y
-            if denom == 0:
-                continue
-            raw_angle = _math.atan((hc_x - 125.42) / denom) * (180 / _math.pi)
-            adj_angle = raw_angle if stand == 'R' else -raw_angle
-            if adj_angle < -17:
+            adj_angle = spray_angle if stand == 'R' else -spray_angle
+            if adj_angle < -15:
                 pulled_air_count += 1
         if total_bbe_raw > 0:
             pulled_air_pct = round(pulled_air_count / total_bbe_raw, 3)
@@ -754,7 +749,11 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         if raw_bat[6] and raw_bat[6] > 0:
             chase_rate = round((raw_bat[5] or 0) / raw_bat[6], 3)
 
-    # --- Statcast enrichment: overrides raw DB when it has MORE data ---
+    # --- Statcast enrichment: ONLY for advanced metrics, NOT for core BBE/barrel ---
+    # The raw DB is now the authoritative source for barrel% with correct BBE definition.
+    # StatsCast is NEVER used as fallback for barrel_pct or hard_hit_pct to avoid contamination.
+    # StatsCast is used ONLY for advanced metrics (pulled_air_pct, ev50, etc.) when available
+    # and only if raw DB has sufficient data to validate.
     if sc_df is not None:
         pf = sc_df[sc_df['batter'] == player_id]
         # matchup filter
@@ -766,45 +765,45 @@ def _insert_batting_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connect
         if dates is not None:
             pf = pf[pf['game_date'].astype(str).isin(dates)]
 
-        # BBE subset for barrel/pull
-        bbe = pf[pf['bb_type'].notna()]
-        raw_bbe_count = (raw_bb[0] or 0) if raw_bb else 0
-        if len(bbe) > 0 and len(bbe) >= raw_bbe_count:
-            # Statcast covers all BBE — use its richer data
-            barrel_count = int((bbe['launch_speed_angle'] == 6).sum())
-            barrel_pct = round(barrel_count / len(bbe), 3)
-            # fb_pct: fly balls (bb_type='fly_ball') / total BBE
-            fb_pct = round(int((bbe['bb_type'] == 'fly_ball').sum()) / len(bbe), 3)
-            # ev50: average of top 50% exit velocities by BBE
-            ev_vals = bbe['launch_speed'].dropna().sort_values(ascending=False)
-            if len(ev_vals) > 0:
-                top_n = max(1, len(ev_vals) // 2)
-                ev50 = round(float(ev_vals.iloc[:top_n].mean()), 1)
-                max_ev = round(float(ev_vals.iloc[0]), 1)
-            # pulled_air_pct: airballs (not ground_ball) with spray angle < -17° / all BBE
-            # Uses per-row stand field to handle switch hitters correctly
-            if all(c in bbe.columns for c in ['hc_x', 'hc_y', 'stand']):
-                import math as _math
-                bbe_air = bbe[bbe['bb_type'] != 'ground_ball'].copy()
-                bbe_air = bbe_air.dropna(subset=['hc_x', 'hc_y', 'stand'])
-                if len(bbe_air) > 0:
-                    dy = 198.27 - bbe_air['hc_y']
-                    valid_dy = dy != 0
-                    raw_angle = bbe_air.loc[valid_dy, 'hc_x'].copy()
-                    raw_angle = (bbe_air.loc[valid_dy, 'hc_x'] - 125.42) / dy[valid_dy]
-                    raw_angle = raw_angle.apply(_math.atan) * (180 / _math.pi)
-                    adj_angle = raw_angle.copy()
-                    lhb_mask = bbe_air.loc[valid_dy, 'stand'] == 'L'
-                    adj_angle[lhb_mask] = -raw_angle[lhb_mask]
-                    pulled_air_pct = round(int((adj_angle < -17).sum()) / len(bbe), 3)
-            # Hard Hit% from pkl
-            ev_all = bbe['launch_speed'].dropna()
-            if len(ev_all) > 0:
-                hard_hit_pct = round(float((ev_all >= 95).sum()) / len(bbe), 3)
-            # NOTE: avg_bat_speed computed below from sc_pitches (all swings, top 90%)
-            # NOTE: squared_up_rate computed below from sc_pitches (pitch-level)
-            # using Statcast formula: EV >= 0.8*(1.23*bat_speed + 0.23*pitch_speed)
-            # with denominator = all contacts (BBE + fouls with tracked EV)
+        # Only process StatsCast for advanced metrics if raw DB has BBE data to validate against
+        raw_bb_count = (raw_bb[0] or 0) if raw_bb else 0
+        if raw_bb_count > 0:
+            # Batted balls subset: correct BBE filter for pitch-level Statcast data
+            # Only used for advanced metrics (ev50, pulled_air_pct, hard_hit%), NOT for barrel%
+            bb = pf[pf['bb_type'].notna() & pf['events'].notna()]
+            
+            # Only compute advanced metrics if StatsCast has data
+            if len(bb) > 0:
+                # ev50: average of top 50% exit velocities by batted balls
+                ev_vals = bb['launch_speed'].dropna().sort_values(ascending=False)
+                if len(ev_vals) > 0:
+                    top_n = max(1, len(ev_vals) // 2)
+                    ev50 = round(float(ev_vals.iloc[:top_n].mean()), 1)
+                    max_ev = round(float(ev_vals.iloc[0]), 1)
+                # pulled_air_pct: airballs (not ground_ball) with spray angle < -17° / all batted balls
+                # Uses per-row stand field to handle switch hitters correctly
+                if all(c in bb.columns for c in ['hc_x', 'hc_y', 'stand']):
+                    import math as _math
+                    bb_air = bb[bb['bb_type'] != 'ground_ball'].copy()
+                    bb_air = bb_air.dropna(subset=['hc_x', 'hc_y', 'stand'])
+                    if len(bb_air) > 0:
+                        dy = 198.27 - bb_air['hc_y']
+                        valid_dy = dy != 0
+                        raw_angle = bb_air.loc[valid_dy, 'hc_x'].copy()
+                        raw_angle = (bb_air.loc[valid_dy, 'hc_x'] - 125.42) / dy[valid_dy]
+                        raw_angle = raw_angle.apply(_math.atan) * (180 / _math.pi)
+                        adj_angle = raw_angle.copy()
+                        lhb_mask = bb_air.loc[valid_dy, 'stand'] == 'L'
+                        adj_angle[lhb_mask] = -raw_angle[lhb_mask]
+                        pulled_air_pct = round(int((adj_angle < -17).sum()) / len(bb), 3)
+                # Hard Hit% from StatsCast (unchanged - not part of this fix)
+                ev_all = bb['launch_speed'].dropna()
+                if len(ev_all) > 0:
+                    hard_hit_pct = round(float((ev_all >= 95).sum()) / len(bb), 3)
+                # NOTE: avg_bat_speed computed below from sc_pitches (all swings, top 90%)
+                # NOTE: squared_up_rate computed below from sc_pitches (pitch-level)
+                # using Statcast formula: EV >= 0.8*(1.23*bat_speed + 0.23*pitch_speed)
+                # with denominator = all contacts (BBE + fouls with tracked EV)
 
     # Chase rate + squared-up rate — both require pitch-level Statcast (sc_pitches)
     # Statcast zones: 1-9 in zone, 11-14 out of zone; chase = swing at out-of-zone pitch
@@ -1063,8 +1062,8 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
 
     raw_bb_sql = f"""
         SELECT
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' THEN 1 ELSE 0 END) AS bbe,
-            SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed_angle = 6 THEN 1 ELSE 0 END) AS barrels,
+            SUM(CASE WHEN batted_ball = 1 THEN 1 ELSE 0 END) AS batted_balls,
+            SUM(CASE WHEN batted_ball = 1 AND barrel = 1 THEN 1 ELSE 0 END) AS barrels,
             AVG(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS avg_ev,
             MAX(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL THEN launch_speed END) AS max_ev,
             SUM(CASE WHEN bb_type IS NOT NULL AND bb_type != '' AND launch_speed IS NOT NULL AND launch_speed >= 95 THEN 1 ELSE 0 END) AS hard,
@@ -1077,14 +1076,14 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
     """
     raw_bb = cur_raw.execute(raw_bb_sql, raw_params).fetchone()
     if raw_bb:
-        raw_bbe = raw_bb[0] or 0
-        if raw_bbe > 0:
-            barrel_pct = round((raw_bb[1] or 0) / raw_bbe, 3)
-            hard_pct = round((raw_bb[4] or 0) / raw_bbe, 3)
-            soft_pct = round((raw_bb[5] or 0) / raw_bbe, 3)
-            ld_pct = round((raw_bb[6] or 0) / raw_bbe, 3)
-            gb_pct = round((raw_bb[7] or 0) / raw_bbe, 3)
-            fb_pct = round((raw_bb[8] or 0) / raw_bbe, 3)
+        raw_bb_count = raw_bb[0] or 0
+        if raw_bb_count > 0:
+            barrel_pct = round((raw_bb[1] or 0) / raw_bb_count, 3)
+            hard_pct = round((raw_bb[4] or 0) / raw_bb_count, 3)
+            soft_pct = round((raw_bb[5] or 0) / raw_bb_count, 3)
+            ld_pct = round((raw_bb[6] or 0) / raw_bb_count, 3)
+            gb_pct = round((raw_bb[7] or 0) / raw_bb_count, 3)
+            fb_pct = round((raw_bb[8] or 0) / raw_bb_count, 3)
 
     # ── Raw DB xOBA (estimated_woba_using_speedangle) ────────────────────
     raw_xoba_sql = f"""
@@ -1140,22 +1139,22 @@ def _insert_pitching_agg(conn_raw: sqlite3.Connection, conn_calc: sqlite3.Connec
             pf = pf[pf['stand'] == 'R']
         if dates is not None:
             pf = pf[pf['game_date'].astype(str).isin(dates)]
-        # Balls in play = PAs with a batted-ball type (excludes fouls)
-        if 'bb_type' in pf.columns and 'launch_speed' in pf.columns:
-            bip_mask = pf['bb_type'].notna()
-            n_bip = int(bip_mask.sum())
-            raw_bbe_count = (raw_bb[0] or 0) if raw_bb else 0
-            if n_bip > 0 and n_bip >= raw_bbe_count:
-                ev = pf.loc[bip_mask, 'launch_speed']
-                hard_pct = round(float((ev >= 95).sum()) / n_bip, 3)
-                soft_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'popup').sum()) / n_bip, 3)
-                ld_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'line_drive').sum()) / n_bip, 3)
-                # Barrel%: launch_speed_angle == 6 is barrel classification
-                if 'launch_speed_angle' in pf.columns:
-                    barrel_pct = round(float((pf.loc[bip_mask, 'launch_speed_angle'] == 6).sum()) / n_bip, 3)
+        # Batted balls = PAs with batted_ball flag (hit_into_play events)
+        if 'batted_ball' in pf.columns and 'launch_speed' in pf.columns:
+            bb_mask = pf['batted_ball'] == 1
+            n_bb = int(bb_mask.sum())
+            raw_bb_count = (raw_bb[0] or 0) if raw_bb else 0
+            if n_bb > 0 and n_bb >= raw_bb_count:
+                ev = pf.loc[bb_mask, 'launch_speed']
+                hard_pct = round(float((ev >= 95).sum()) / n_bb, 3)
+                soft_pct = round(float((pf.loc[bb_mask, 'bb_type'] == 'popup').sum()) / n_bb, 3)
+                ld_pct = round(float((pf.loc[bb_mask, 'bb_type'] == 'line_drive').sum()) / n_bb, 3)
+                # Barrel%: barrel = 1 (from Statcast LSA==6 or MLB formula)
+                if 'barrel' in pf.columns:
+                    barrel_pct = round(float((pf.loc[bb_mask, 'barrel'] == 1).sum()) / n_bb, 3)
                 if 'bb_type' in pf.columns:
-                    gb_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'ground_ball').sum()) / n_bip, 3)
-                    fb_pct = round(float((pf.loc[bip_mask, 'bb_type'] == 'fly_ball').sum()) / n_bip, 3)
+                    gb_pct = round(float((pf.loc[bb_mask, 'bb_type'] == 'ground_ball').sum()) / n_bb, 3)
+                    fb_pct = round(float((pf.loc[bb_mask, 'bb_type'] == 'fly_ball').sum()) / n_bb, 3)
         # xOBA (expected wOBA using Statcast speed+angle)
         if 'estimated_woba_using_speedangle' in pf.columns:
             xwoba = pf['estimated_woba_using_speedangle'].dropna()
