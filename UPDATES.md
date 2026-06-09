@@ -4,6 +4,15 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.3.1 - 2026-06-09
+
+> [!WARNING]
+> **No Full Rebuild Is Required But For Most Accurate Data Please Manually Run The Daily Update Inside The App On First Launch**
+
+### Hotfix Daily Update Bugs
+
+**Fixed Endless Loop Enrichment Bug and PA's Not Populating Before Statcast Enrichment**
+
 ## v1.3.0 — 2026-06-08
 
 > [!WARNING]
