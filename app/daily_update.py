@@ -219,6 +219,20 @@ def main(argv: list[str] | None = None, gui_cb=None):
             """, (season_start, today_str, season_start))
 
             missing_dates = [r[0] for r in cur.fetchall()]
+
+            # Detect trailing gap using plate_appearances (not games table).
+            # games table has full-season schedule pre-loaded through 9/22,
+            # so MAX(game_date) from games is useless as a recency check.
+            # PAs only exist after actual ingestion — that's the true last-known date.
+            cur.execute("""
+                SELECT MAX(game_date) FROM plate_appearances WHERE game_date >= ?
+            """, (season_start,))
+            r = cur.fetchone()
+            max_pa_date = r[0] if r and r[0] else None
+            if max_pa_date and max_pa_date < today_str:
+                trailing_start = (date.fromisoformat(max_pa_date) + timedelta(days=1)).isoformat()
+                missing_dates = sorted(set(missing_dates) | {trailing_start, today_str})
+
             conn.close()
 
             if not missing_dates:
@@ -261,10 +275,13 @@ def main(argv: list[str] | None = None, gui_cb=None):
             # missing partial enrichment gaps (e.g. new pitcher on otherwise enriched date)
             # NEW query: find dates where ANY PA is still missing release_speed
             cur.execute("""
-                SELECT DISTINCT game_date FROM plate_appearances
+                SELECT game_date
+                FROM plate_appearances
                 WHERE game_date >= ?
-                AND batted_ball = 1
-                AND launch_speed IS NULL
+                  AND batted_ball = 1
+                GROUP BY game_date
+                HAVING CAST(SUM(CASE WHEN launch_speed IS NULL THEN 1 ELSE 0 END) AS REAL)
+                       / COUNT(*) > 0.10
                 ORDER BY 1
             """, (cutoff,))
             dates = [r[0] for r in cur.fetchall()]
@@ -278,7 +295,7 @@ def main(argv: list[str] | None = None, gui_cb=None):
         """Find and delete pickle files where the Statcast data is incomplete —
         meaning pitchers exist in plate_appearances for that date range who have
         no rows in the pickle. Covers gaps from any date, not just recent ones."""
-        import glob, pickle
+        import glob
         cache_dir = _app_paths.STATCAST_CACHE_DIR
         season = date.today().year
         pattern = os.path.join(cache_dir, f'{season}-*_{season}-*.pkl')
@@ -286,6 +303,22 @@ def main(argv: list[str] | None = None, gui_cb=None):
 
         conn = sqlite3.connect(_app_paths.RAW_DB)
         cur = conn.cursor()
+
+        # Derive season_start from the games table — same approach as gap detection
+        cur.execute("""
+            SELECT MIN(game_date) FROM games WHERE season = ? AND game_type = 'R'
+        """, (season,))
+        r = cur.fetchone()
+        season_start = r[0] if r and r[0] else (date.today() - timedelta(days=180)).isoformat()
+
+        # Build once before the loop — pitchers who have Statcast data anywhere this season.
+        # Pitchers with zero coverage season-wide are legitimately untracked;
+        # re-fetching their pickle will never fix them and causes cascade re-downloads.
+        cur.execute("""
+            SELECT DISTINCT pitcher_id FROM plate_appearances
+            WHERE release_speed IS NOT NULL AND game_date >= ?
+        """, (season_start,))
+        pitchers_with_any_statcast = {r[0] for r in cur.fetchall()}
 
         refreshed = []
         for pkl_path in sorted(glob.glob(pattern)):
@@ -300,7 +333,14 @@ def main(argv: list[str] | None = None, gui_cb=None):
             if pkl_end < cutoff:
                 continue
 
-            # Get pitcher IDs that have plate_appearances in this date range
+            # Skip pickles fetched within the last 48 hours — if NULLs remain after
+            # a fresh fetch they're legitimate Statcast misses, not a corrupt pickle.
+            import time
+            pkl_age_hours = (time.time() - os.path.getmtime(pkl_path)) / 3600
+            if pkl_age_hours < 48:
+                continue
+
+            # Pitchers in this date range who are missing release_speed
             cur.execute("""
                 SELECT DISTINCT pitcher_id FROM plate_appearances
                 WHERE game_date BETWEEN ? AND ?
@@ -309,20 +349,23 @@ def main(argv: list[str] | None = None, gui_cb=None):
             missing_pitcher_ids = {r[0] for r in cur.fetchall()}
 
             if not missing_pitcher_ids:
-                continue  # Pickle is complete for this range
+                continue
+
+            # Filter to only pitchers who have Statcast data elsewhere —
+            # confirms they're a real gap, not an untracked pitcher
+            missing_pitcher_ids = missing_pitcher_ids & pitchers_with_any_statcast
+
+            if not missing_pitcher_ids:
+                continue
 
             # Only flag pickles that have meaningful data already
-            # Avoids deleting brand-new or tiny pickles that just haven't
-            # been enriched yet vs genuinely incomplete ones
             try:
                 pkl_size_mb = os.path.getsize(pkl_path) / (1024 * 1024)
                 if pkl_size_mb < 1.0:
-                    continue  # Too small to be a meaningful complete pickle
+                    continue
             except Exception:
                 pass
 
-            # This pickle covers dates where some pitchers have NULL release_speed
-            # Delete it so _ensure_statcast_cached re-fetches it
             os.remove(pkl_path)
             print(f'  Deleted incomplete pickle: {basename} '
                 f'({len(missing_pitcher_ids)} pitcher(s) missing Statcast data)')
@@ -354,9 +397,6 @@ def main(argv: list[str] | None = None, gui_cb=None):
     gap_ranges = _get_incomplete_date_ranges(DB_PATH)
 
     if not gap_ranges:
-        fallback_start = today - timedelta(days=max(args.days_back, 1))
-        if fallback_start <= today:
-            gap_ranges = [(fallback_start.isoformat(), today.isoformat())]
         print(f"No missing games to ingest (DB is up to date through {today.isoformat()}).")
     else:
         ingested_new = True
