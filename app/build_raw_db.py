@@ -1028,7 +1028,8 @@ def enrich_with_statcast(conn, start_date: str, end_date: str, season: int = Non
         # Compute batted_ball flag from Statcast: any event with bb_type (hit trajectory data)
         # This is the denominator for barrel% — all batted balls regardless of direction or result
         bb_type = srow.get('bb_type')
-        pa_update['batted_ball'] = 1 if (pd.notna(bb_type) and bb_type != '') else 0
+        if pd.notna(bb_type) and bb_type != '':
+            pa_update['batted_ball'] = 1
         
         # Map 'type' (S/B/X) to pitch_call for fallback F-Strike% / SwStr% calculation
         ptype = srow.get('type')

@@ -4,6 +4,16 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.3.2 - 2026-06-17
+
+> [!WARNING]
+> **Database Rebuild Required for Existing Users**
+> Due to a bug in data fetching, please rebuild the database included in this update and repair the schedule task created to run only after 11am EST.
+
+### Bug Fixes
+
+**Ingestion bug where the indicator for statcast enrichment "batted_ball = 1" was being prematurely overwritten and written incorrectly to "batted_ball = 0" This was creating artifical gaps in statcast enrichment because it would fail the checks for finding unenriched PA's in the Raw Database.
+
 ## v1.3.1 - 2026-06-09
 
 > [!WARNING]
