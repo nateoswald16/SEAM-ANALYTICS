@@ -49,7 +49,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QHeaderView, QAbstractItemView, QComboBox,
     QGraphicsDropShadowEffect, QGraphicsOpacityEffect, QSizePolicy,
     QToolTip, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
-    QCheckBox,
+    QCheckBox, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QTimer, QRectF, QPointF, QPoint, pyqtSignal, QObject, QPropertyAnimation, QEasingCurve, QEvent, QThread, QSize, QSettings, QByteArray
 from PyQt6 import sip
@@ -3820,6 +3820,23 @@ class StatsTable(QTableWidget):
         """Show/hide columns by name. Always-visible columns are never hidden."""
         for c, name in enumerate(self._cols):
             self.setColumnHidden(c, name in hidden_cols and name not in _ALWAYS_VISIBLE_COLS)
+
+    def apply_col_order(self, order: list):
+        """Reorder non-pinned columns to match `order` (list of column names,
+        left-to-right). Pinned columns (in _ALWAYS_VISIBLE_COLS) always stay in
+        their original leading position and are never moved."""
+        header = self.horizontalHeader()
+        name_to_logical = {name: i for i, name in enumerate(self._cols)}
+        pinned = sum(1 for name in self._cols if name in _ALWAYS_VISIBLE_COLS)
+        target = pinned
+        for name in order:
+            logical = name_to_logical.get(name)
+            if logical is None:
+                continue
+            current = header.visualIndex(logical)
+            if current != target:
+                header.moveSection(current, target)
+            target += 1
  
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3828,16 +3845,37 @@ class StatsTable(QTableWidget):
 # Columns that are always shown and cannot be hidden
 _ALWAYS_VISIBLE_COLS = {"#", "POS", "PLAYER", "PITCHER", "CATCHER", "PA", "IP"}
 
-class _ColPickerPopup(QFrame):
-    """Floating popup with per-section column visibility checkboxes."""
-    changed = pyqtSignal(str, str, bool)  # section_key, col_name, visible
+def _fit_list_height(lw):
+    """Size a list widget's fixed height to exactly fit all its rows.
+    Uses Qt's real computed item geometry (doItemsLayout + visualItemRect)
+    rather than a sizeHintForRow() guess made before layout has run —
+    that guess doesn't reliably include stylesheet item padding and was
+    leaving the last row clipped, especially on long lists."""
+    lw.doItemsLayout()
+    if lw.count():
+        last_rect = lw.visualItemRect(lw.item(lw.count() - 1))
+        content_h = last_rect.bottom() + 1 if last_rect.isValid() and last_rect.bottom() > 0 \
+            else lw.sizeHintForRow(0) * lw.count()
+    else:
+        content_h = 0
+    lw.setFixedHeight(max(content_h + 6, 0))
 
-    _CB_SS = (
-        f"QCheckBox {{ color:{C['t1']}; font-family:'Segoe UI'; font-size:11px; "
-        f"background:transparent; spacing:6px; padding:1px 0; }}"
-        f"QCheckBox::indicator {{ width:13px; height:13px; border-radius:2px; }}"
-        f"QCheckBox::indicator:unchecked {{ border:1px solid {C['bdr']}; background:{C['bg1']}; }}"
-        f"QCheckBox::indicator:checked {{ border:1px solid {C['ora']}; background:{C['ora']}; }}"
+class _ColPickerPopup(QFrame):
+    """Floating popup with per-section column visibility + drag-to-reorder lists."""
+    changed = pyqtSignal(str, str, bool)  # section_key, col_name, visible
+    order_changed = pyqtSignal(str, list)  # section_key, new column-name order
+    reset_requested = pyqtSignal(list)  # section_keys to reset to default
+
+    _LW_SS = (
+        f"QListWidget {{ background:{C['bg2']}; border:none; outline:0; "
+        f"font-family:'Segoe UI'; font-size:11px; }}"
+        f"QListWidget::item {{ color:{C['t1']}; background:transparent; "
+        f"padding:2px 4px; border-radius:3px; }}"
+        f"QListWidget::item:hover {{ background:{C['bg3']}; }}"
+        f"QListWidget::item:selected {{ background:{C['bg3']}; color:{C['t1']}; }}"
+        f"QListWidget::indicator {{ width:13px; height:13px; border-radius:2px; }}"
+        f"QListWidget::indicator:unchecked {{ border:1px solid {C['bdr']}; background:{C['bg1']}; }}"
+        f"QListWidget::indicator:checked {{ border:1px solid {C['ora']}; background:{C['ora']}; }}"
     )
 
     def __init__(self, parent=None):
@@ -3864,7 +3902,24 @@ class _ColPickerPopup(QFrame):
         self._vl.setSpacing(3)
         self._sa.setWidget(self._inner)
         self._section_widgets: list = []
-        self._checkboxes: dict = {}  # (section_key, col) → QCheckBox
+        self._lists: dict = {}  # section_key → QListWidget
+        self._current_section_keys: list = []
+        self._tab_cols_cache: dict = {} # section_key → list of column names
+
+        self._reset_sep = QFrame()
+        self._reset_sep.setFixedHeight(1)
+        self._reset_sep.setStyleSheet(f"background:{C['bdr']};")
+        outer.addWidget(self._reset_sep)
+
+        self._reset_btn = QPushButton("Reset to Default")
+        self._reset_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._reset_btn.setStyleSheet(
+            f"QPushButton {{ color:{C['t2']}; background:transparent; border:none; "
+            f"font-family:'Segoe UI'; font-size:10px; font-weight:600; letter-spacing:0.5px; "
+            f"padding:7px 0; }}"
+            f"QPushButton:hover {{ color:{C['ora']}; }}")
+        self._reset_btn.clicked.connect(self._on_reset_clicked)
+        outer.addWidget(self._reset_btn)
 
     def populate(self, tab_idx: int, tab_cols: dict, col_prefs: dict):
         """Rebuild popup content for the given tab."""
@@ -3872,16 +3927,20 @@ class _ColPickerPopup(QFrame):
             self._vl.removeWidget(w)
             w.deleteLater()
         self._section_widgets.clear()
-        self._checkboxes.clear()
+        self._lists.clear()
 
         section_keys = _TAB_SECTION_KEYS[tab_idx] if tab_idx < len(_TAB_SECTION_KEYS) else []
         has_content = False
+        order_prefs = col_prefs.get('__order__', {})
+        rendered_keys = []
 
         for sk in section_keys:
             cols = tab_cols.get(sk)
             if not cols:
                 continue
             has_content = True
+            rendered_keys.append(sk)
+            self._tab_cols_cache[sk] = cols
             lbl = QLabel(_TAB_SECTION_LABELS.get(sk, sk).upper())
             lbl.setStyleSheet(
                 f"color:{C['t3']}; font-family:'Segoe UI'; font-size:9px; "
@@ -3890,17 +3949,39 @@ class _ColPickerPopup(QFrame):
             self._section_widgets.append(lbl)
 
             sec_prefs = col_prefs.get(sk, {})
-            for col in cols:
-                if col in _ALWAYS_VISIBLE_COLS:
-                    continue
-                visible = sec_prefs.get(col, True)
-                cb = QCheckBox(col)
-                cb.setChecked(visible)
-                cb.setStyleSheet(self._CB_SS)
-                cb.toggled.connect(lambda checked, s=sk, c=col: self.changed.emit(s, c, checked))
-                self._vl.addWidget(cb)
-                self._section_widgets.append(cb)
-                self._checkboxes[(sk, col)] = cb
+            reorderable = [c for c in cols if c not in _ALWAYS_VISIBLE_COLS]
+            saved_order = order_prefs.get(sk)
+            if saved_order:
+                known = [c for c in saved_order if c in reorderable]
+                unknown = [c for c in reorderable if c not in known]
+                display_order = known + unknown
+            else:
+                display_order = reorderable
+
+            lw = QListWidget()
+            lw.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+            lw.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+            lw.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            lw.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            lw.setStyleSheet(self._LW_SS)
+            lw.setSpacing(1)
+            lw.blockSignals(True)
+            for col in display_order:
+                item = QListWidgetItem(col)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable |
+                              Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+                item.setCheckState(Qt.CheckState.Checked if sec_prefs.get(col, True)
+                                   else Qt.CheckState.Unchecked)
+                lw.addItem(item)
+            lw.blockSignals(False)
+            _fit_list_height(lw)
+            lw.itemChanged.connect(
+                lambda item, s=sk: self.changed.emit(s, item.text(), item.checkState() == Qt.CheckState.Checked))
+            lw.model().rowsMoved.connect(
+                lambda *a, s=sk, w=lw: QTimer.singleShot(0, lambda: self._emit_order(s, w)))
+            self._vl.addWidget(lw)
+            self._section_widgets.append(lw)
+            self._lists[sk] = lw
 
             sep = QFrame()
             sep.setFixedHeight(1)
@@ -3916,10 +3997,55 @@ class _ColPickerPopup(QFrame):
             self._vl.addWidget(lbl)
             self._section_widgets.append(lbl)
 
+        self._current_section_keys = rendered_keys
+        self._reset_sep.setVisible(has_content)
+        self._reset_btn.setVisible(has_content)
+
         self._inner.adjustSize()
-        h = min(self._inner.sizeHint().height() + 20, 520)
+        footer_h = (self._reset_sep.sizeHint().height() +
+                    self._reset_btn.sizeHint().height()) if has_content else 0
+        screen = QApplication.primaryScreen()
+        max_total_h = int(screen.availableGeometry().height() * 0.85) if screen else 540
+        total_h = min(self._inner.sizeHint().height() + 20 + footer_h, max_total_h)
         w = max(self._inner.sizeHint().width() + 20, 190)
-        self.resize(w, h)
+        self._sa.setFixedHeight(max(total_h - footer_h, 80))
+        self.resize(w, total_h)
+
+    def _on_reset_clicked(self):
+        """Emit a reset request for every section shown in the current tab. Without rebuilding the UI."""
+        if not self._current_section_keys:
+            return
+        for sk in self._current_section_keys:
+            lw = self._lists.get(sk)
+            if not lw:
+                continue
+            default_cols = self._tab_cols_cache.get(sk, [])
+            default_order = [c for c in default_cols if c not in _ALWAYS_VISIBLE_COLS]
+            lw.blockSignals(True)
+            lw.clear()
+            for col in default_order:
+                item = QListWidgetItem(col)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsDragEnabled)
+                item.setCheckState(Qt.CheckState.Checked)
+                lw.addItem(item)
+            lw.blockSignals(False)
+            _fit_list_height(lw)
+        self.reset_requested.emit(list(self._current_section_keys))
+
+    def _emit_order(self, section_key, list_widget):
+        """Read back current row order from a list widget and emit it."""
+        try:
+            if _is_deleted(list_widget):
+                return
+            order = [list_widget.item(i).text() for i in range(list_widget.count())]
+            self.order_changed.emit(section_key, order)
+        except RuntimeError:
+            pass
+
+    def hideEvent(self, event):
+        """Record when this popup closes - including Qt's automatic close on an outside click"""
+        super().hideEvent(event)
+        self._last_hide_ts = dt.datetime.now().timestamp()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -5787,7 +5913,7 @@ class GameDetailPanel(QWidget):
 
         filt_hdr = QFrame()
         filt_hdr.setFixedHeight(44)
-        filt_hdr.setStyleSheet(f"background:{C['bg1']}; border:1px solid {C['bdr']}; border-radius:6px;")
+        filt_hdr.setStyleSheet(f"background:{C['bg1']}; border:1px solid {C['bdr']};")
         fhl = QHBoxLayout(filt_hdr)
         fhl.setContentsMargins(10, 0, 10, 0)
         fhl.setSpacing(8)
@@ -6176,9 +6302,13 @@ class GameDetailPanel(QWidget):
             if picker is None or _is_deleted(picker):
                 picker = _ColPickerPopup()
                 picker.changed.connect(self._on_col_pref_changed)
+                picker.order_changed.connect(self._on_col_order_changed)
+                picker.reset_requested.connect(self._on_col_reset)
                 self._col_picker = picker
             if picker.isVisible():
                 picker.hide()
+                return
+            if dt.datetime.now().timestamp() - getattr(picker, '_last_hide_ts', 0) < 0.2:
                 return
             tab_idx = getattr(self, '_current_subnav_idx', 0)
             picker.populate(tab_idx, getattr(self, '_tab_cols', {}), _COL_PREFS)
@@ -6210,8 +6340,29 @@ class GameDetailPanel(QWidget):
         _save_col_prefs(_COL_PREFS)
         self._apply_col_prefs_to_tab(getattr(self, '_current_subnav_idx', 0))
 
-    def _apply_col_prefs_to_tab(self, idx: int):
-        """Apply saved column visibility prefs to all tables in the given tab."""
+    def _on_col_order_changed(self, section_key: str, order: list):
+        """Save a changed column order and immediately apply to current tables."""
+        _COL_PREFS.setdefault('__order__', {})[section_key] = order
+        _save_col_prefs(_COL_PREFS)
+        self._apply_col_prefs_to_tab(getattr(self, '_current_subnav_idx', 0))
+
+    def _on_col_reset(self, section_keys: list):
+        """Reset visibility and order to defaults for the given sections."""
+        order_map = _COL_PREFS.get('__order__')
+        for sk in section_keys:
+            _COL_PREFS.pop(sk, None)
+            if order_map:
+                order_map.pop(sk, None)
+        _save_col_prefs(_COL_PREFS)
+        idx = getattr(self, '_current_subnav_idx', 0)
+        self._apply_col_prefs_to_tab(idx, reset_sections=set(section_keys))
+
+    def _apply_col_prefs_to_tab(self, idx: int, reset_sections: set = None):
+        """Apply saved column visibility/order prefs to all tables in the given
+        tab. If reset_sections is given, those section keys are forced back to
+        their original default column order regardless of saved prefs."""
+        reset_sections = reset_sections or set()
+
         def _apply(table, section_key):
             try:
                 if not table or _is_deleted(table):
@@ -6219,6 +6370,12 @@ class GameDetailPanel(QWidget):
                 prefs = _COL_PREFS.get(section_key, {})
                 hidden = {col for col, vis in prefs.items() if not vis}
                 table.apply_col_visibility(hidden)
+                if section_key in reset_sections:
+                    table.apply_col_order([c for c in table._cols if c not in _ALWAYS_VISIBLE_COLS])
+                else:
+                    order = _COL_PREFS.get('__order__', {}).get(section_key)
+                    if order:
+                        table.apply_col_order(order)
             except (RuntimeError, SystemError):
                 pass
 
@@ -7094,7 +7251,7 @@ class TeamSBBarChart(QWidget):
         hdr = QWidget()
         hdr.setFixedHeight(40)
         hdr.setStyleSheet(
-            f"background:{C['bg1']}; border-bottom:1px solid {C['bdr']}; border-radius:0px;")
+            f"background:{C['bg1']}; border-bottom:1px solid {C['bdr']}; border-radius:6px;")
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(12, 0, 12, 0)
         hl.setSpacing(8)

@@ -4,6 +4,16 @@ All notable changes to Seam Analytics are documented here.
 
 ---
 
+## v1.3.3 - 2026-06-20
+
+### Column Preference Picker Updates
+**Added the ability to drag the order of columns in the column visibility picker that changes the order in the lineup tables and saves your preferences just like the visibility toggle.**
+**Added the ability to reset to default showing all columns and reverting order to the the order defined in the code**
+**Fixed QTWidget quirk where once the column picker menu was opened clicking the button would close it and then immediately reopen the menu causing a "flicker" and endless loop of the menu being visable until the user clicked other area's of the window**
+
+### UI Updates
+**Fixed various UI quirks where borders were being rounded when not necessary or vice versa**
+
 ## v1.3.2 - 2026-06-17
 
 > [!WARNING]
